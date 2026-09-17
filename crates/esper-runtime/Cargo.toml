@@ -1,0 +1,35 @@
+[package]
+name = "esper-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Esper E0/E1 runtime: durable ReAct workflow over Waymaker, with host-only scripted model, fake device, independent verifier, and fault injector."
+license = "MIT"
+
+[features]
+default = ["host"]
+# The host feature enables std, the scripted doubles, the fault injector,
+# the Tokio-based async driver entry point, and the human-readable trace.
+# Without it the crate is `#![no_std]` and exposes only the allocation-free
+# engine core (journal trait, codecs, boundary loop) for firmware ports.
+host = ["dep:tokio"]
+
+[dependencies]
+# Workspace sibling: the decision decoder, budgets, monitor, and state machine.
+esper-core = { path = "../esper-core" }
+# Durable record/replay kernel (crates.io, per the E0/E1 dependency direction).
+waymaker-core = "0.1.0"
+# Waymaker Embassy facade (crates.io). Declared per SPEC section 2; the E0/E1
+# engine drives `waymaker-core`'s `ReplayCursor` directly because the slice's
+# crash-hook granularity (hooks between intent-commit and dispatch) needs
+# ownership of the boundary loop, which the Embassy `Ctx` facade does not
+# expose. The Embassy integration point is the E2 async model backend.
+waymaker-embassy = "0.1.0"
+thiserror = "2"
+# HOST-ONLY (E0/E1): async host driver entry point.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

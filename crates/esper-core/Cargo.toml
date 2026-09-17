@@ -1,0 +1,12 @@
+[package]
+name = "esper-core"
+version = "0.1.0"
+edition = "2021"
+description = "Esper E0/E1 harness core: state machine, decision decoder, budgets, monitor. no_std, allocation-free."
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true
