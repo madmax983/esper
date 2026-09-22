@@ -660,6 +660,7 @@ mod tests {
             sensors: vec![1, 3],
             allow_timer: true,
             allow_status: false,
+            context_budget_bytes: None,
         };
         let capabilities = build_capabilities(&seed).expect("in-range lists fill the sets");
         assert_eq!(&capabilities.read_pins[..2], &[0, 4]);
@@ -687,6 +688,7 @@ mod tests {
             sensors: Vec::new(),
             allow_timer: false,
             allow_status: false,
+            context_budget_bytes: None,
         };
         assert!(build_capabilities(&seed).is_err());
     }

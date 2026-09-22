@@ -134,6 +134,11 @@ pub struct SeedSpec {
     /// Whether the status tool is permitted (E2). Absent means
     /// denied — fail closed (SPEC §17.7).
     pub allow_status: bool,
+    /// The context budget in bytes that arms compaction/rollover
+    /// (SPEC §20.2, `should_compact` trigger). Absent or null means
+    /// the fixture does not exercise rollover: the runner maps it to
+    /// the runtime seed's unset default.
+    pub context_budget_bytes: Option<u64>,
 }
 
 /// The fake device section of a fixture.
@@ -577,6 +582,15 @@ fn parse_seed(cursor: &Cursor) -> Result<SeedSpec, FixtureError> {
         None => false,
         Some(flag) => flag.as_bool()?,
     };
+    // Optional: absent or explicit null means the fixture does not
+    // exercise rollover (SPEC §20). A present non-integer fails
+    // closed like every other schema violation.
+    let context_budget_bytes = match cursor.opt("context_budget_bytes") {
+        // HOST-ONLY (E0/E1)
+        None => None,
+        Some(value) if matches!(value.value, Value::Null) => None,
+        Some(value) => Some(value.as_u64()?),
+    };
     Ok(SeedSpec {
         workflow_version,
         model_turns: budget.field("model_turns")?.as_u16()?,
@@ -589,6 +603,7 @@ fn parse_seed(cursor: &Cursor) -> Result<SeedSpec, FixtureError> {
         sensors,
         allow_timer,
         allow_status,
+        context_budget_bytes,
     })
 }
 
@@ -1163,6 +1178,48 @@ mod tests {
         assert_eq!(fixture.id, "minimal");
         assert_eq!(fixture.expected.trace.len(), 2);
         assert_eq!(fixture.expected.invariants.len(), 1);
+    }
+
+    #[test]
+    fn context_budget_bytes_defaults_to_none() {
+        let fixture = parse_fixture(&fixture_with(FINISH_TRACE)).expect("minimal fixture");
+        assert_eq!(fixture.seed.context_budget_bytes, None);
+    }
+
+    #[test]
+    fn context_budget_bytes_parses_when_present() {
+        let base = fixture_with(FINISH_TRACE);
+        let with_budget = base.replace(
+            "\"workflow_version\": 1,",
+            "\"workflow_version\": 1, \"context_budget_bytes\": 2048,",
+        );
+        let fixture = parse_fixture(&with_budget).expect("fixture with context budget");
+        assert_eq!(fixture.seed.context_budget_bytes, Some(2048));
+    }
+
+    #[test]
+    fn context_budget_bytes_null_means_none() {
+        let base = fixture_with(FINISH_TRACE);
+        let with_null = base.replace(
+            "\"workflow_version\": 1,",
+            "\"workflow_version\": 1, \"context_budget_bytes\": null,",
+        );
+        let fixture = parse_fixture(&with_null).expect("fixture with null context budget");
+        assert_eq!(fixture.seed.context_budget_bytes, None);
+    }
+
+    #[test]
+    fn context_budget_bytes_rejects_a_string() {
+        let base = fixture_with(FINISH_TRACE);
+        let broken = base.replace(
+            "\"workflow_version\": 1,",
+            "\"workflow_version\": 1, \"context_budget_bytes\": \"lots\",",
+        );
+        let err = parse_fixture(&broken).expect_err("string context budget");
+        assert!(
+            err.to_string().contains("$.run_seed.context_budget_bytes"),
+            "got {err:?}"
+        );
     }
 
     #[test]
