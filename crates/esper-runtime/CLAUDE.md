@@ -1,4 +1,4 @@
-# `esper-runtime` — the durable ReAct runtime (E0/E1/E2/E3)
+# `esper-runtime` — the durable ReAct runtime (E0/E1/E2/E3/E4)
 
 ## What this crate is
 
@@ -16,12 +16,15 @@ human-input queue are host-only doubles; the engine, journal, and
 durability protocol are the real slice. E2: six typed tools from the
 static protocol registry; authorization before dispatch; independent
 read-back verification for every mutation; effect-ID dedup on all
-dispatches.
+dispatches. E4: context lifecycle — masking at the observation
+boundary, 80% rollover with `continue_as_new`, snapshot
+verification, per-segment journal ownership, and the
+`drive_segment` / `SegmentOutcome` / `RolloverHandoff` API.
 
 ## Where things live
 
 - `src/lib.rs` — crate root, driver entry points (`drive_run`,
-  `drive_run_async`).
+  `drive_run_async`, `drive_segment`).
 - `src/backend.rs` — the E3 model interface: `ModelBackend` trait,
   `ScriptedBackend` (host-only), `TinyBackend` (distillation
   stand-in), `PromptCtx` / `RepairHint` / `build_prompt`,
@@ -29,6 +32,8 @@ dispatches.
   `TokenUsage`, `DistillEntry`, `PROMPT_CAP` / `OUTPUT_CAP`,
   `TINY_PARAMS_BYTES`. Not host-gated; re-exported from the crate
   root (`ScriptedBackend` only under `cfg(feature = "host")`).
+  E4: `PriorCtx` (the folded-history summary) and the
+  `[stale:folded@epoch=N]` marker rendering.
 - `src/jev.rs` — the E3+jev `System One` adapter (host-only):
   `JevBackend` over the `JevTransport` trait, `MockTransport`
   (request-hash cassettes) / `LiveTransport` (deferred, no key),
@@ -40,23 +45,34 @@ dispatches.
   verify → account, with crash recovery as journal replay. E3: the
   `Infer` step drives a `&mut dyn ModelBackend`; the engine builds
   the prompt with `build_prompt` from journal-restored inputs so
-  record and replay see byte-identical prompts.
+  record and replay see byte-identical prompts. E4: `drive_segment`
+  (one driver lifetime), `SegmentOutcome` (Completed / Suspended /
+  Rollover), `RolloverHandoff` (snapshot + lineage + prompt bytes +
+  digest stream); the 80% rollover trigger in `do_gather`; the
+  failed-path guard in `do_authorize`; masking in `do_observe`.
 - `src/journal.rs` — `Frame` / `Journal`: the only durable state.
-  Everything else is derived by replay.
+  Everything else is derived by replay. E4: `ToolObservation`
+  carries `secret_digest`; `ModelDecision` carries `prompt_bytes`.
 - `src/seed.rs` — `RunSeed`: explicit budgets, capabilities, version.
   E3: `model_bundle: u64` and `inference: InferenceSettings`; the
   journal-binding snapshot is a 67-byte canonical encoding
   (SPEC §18.7) — recovery compares it byte for byte, so a reboot can
-  never swap the model or the prompt/output caps.
+  never swap the model or the prompt/output caps. E4: the snapshot
+  is 142 bytes, binding `context_budget_bytes` (the rollover
+  trigger) and the `parent` lineage; `child_seed` derives the
+  continuation with narrowed budgets.
 - `src/world.rs` — host doubles: `FakeDevice`, `FaultPlan`,
   `InputPlan`. (`ScriptedModel` was retired in the E3 rewiring; the
   scripted model backend now lives in `src/backend.rs`.)
 - `src/trace.rs` — `RunTrace`: the eval harness's evidence, derived
-  from the journal.
+  from the journal. E4: carries `secret_digests`, `prompt_bytes_used`,
+  and the segment `lineage`.
 - `src/error.rs` — `CrashPoint` (11 variants), `Halt`, `RuntimeError`.
 - `tests/trajectories.rs` — golden trajectories a–h (SPEC §14).
 - `tests/crash_matrix.rs` — one reboot per crash point.
 - `tests/invariants.rs` — the durability contract.
+- `tests/context_lifecycle.rs` — E4: masking, 80% rollover, lineage,
+  failed-path survival, reboot after rollover, corrupt snapshot.
 
 ## Authority order
 
@@ -88,6 +104,43 @@ One turn commits in this order, each step crash-injectable:
 `Ask` commits the decision, suspends durably, and resumes when typed
 input arrives — across reboots, because the journal is the only state
 that crosses a boot.
+
+## E4: context lifecycle (SPEC §20)
+
+**Masking** (SPEC §20.2): `do_observe` masks the tool outcome before
+it reaches the journal, the Waymaker cursor, `last_observation`, or
+the next prompt. The `MaskReport.secret_digest` is stored in the
+`ToolObservation` frame and accumulated in the trace's digest stream
+(one `u64` per observation, `0` for no secret). A reboot rebuilds
+the real digests from the frames — the raw secret bytes are gone by
+design, but the digest record survives.
+
+**Rollover** (SPEC §20.4): `do_gather` checks the 80% trigger when
+the seed carries `context_budget_bytes`. On trigger, the segment
+folds: summarize frames, compact with `DEFAULT_POLICY`, encode,
+read-back verify, `continue_as_new` (no-widen check), then return
+`SegmentOutcome::Rollover(trace, handoff)`. The handoff carries the
+verified snapshot, lineage, prompt bytes, and digest stream.
+
+**Continuation** (SPEC §20.6): `RolloverHandoff::child_seed` derives
+the child with narrowed budgets (never widened), shrunken context
+budget (`saturating_sub`), and the parent lineage. The child boots on
+a fresh journal with the handoff; the snapshot re-verifies on every
+boot. `drive_segment` enforces the pairing: a child seed requires a
+handoff, a root forbids one.
+
+**Failed paths** (SPEC §20.5): the fold carries ruled-out
+`(tool, args_digest)` pairs. `do_authorize` refuses an identical
+call before dispatch — the run degrades with
+`failed_path_ruled_out`, never re-proving the failure.
+
+**Prompt metering** (SPEC §20.4): each `ModelDecision` frame carries
+its prompt's byte length. The meter sums the journal on boot, so
+suspend/resume across `drive_segment` calls keeps the 80% trigger
+exact. A new segment (fresh journal) starts at zero.
+
+**Segment ownership**: `drive_run` chains segments; each child gets
+a fresh `Journal`. A segment never appends to its parent's frames.
 
 ## Crash model
 

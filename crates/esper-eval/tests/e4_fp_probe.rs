@@ -59,6 +59,7 @@ fn probe(input: &str) -> (MaskReport, String) {
 }
 
 #[test]
+#[allow(clippy::cast_precision_loss)]
 fn benign_corpus_false_positive_rate() {
     // HOST-ONLY (E0/E1)
     let mut flagged: Vec<&str> = Vec::new();

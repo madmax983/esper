@@ -59,6 +59,12 @@ pub enum Frame {
         input_tokens: u32,
         /// The measured output tokens for this turn (E3).
         output_tokens: u32,
+        /// The built prompt's byte length for this turn (E4, SPEC
+        /// §20.4). Summed across the journal, this rebuilds the
+        /// segment's prompt meter on boot — the meter is journal
+        /// state, so suspend/resume across driver calls keeps the 80%
+        /// trigger exact.
+        prompt_bytes: u64,
     },
     /// A tool intent committed: the durable promise to dispatch.
     /// Dispatch may run at least once under this intent's effect id;
@@ -94,6 +100,12 @@ pub enum Frame {
         /// The result bytes (empty for a transient failure).
         // HOST-ONLY (E0/E1)
         outcome: Vec<u8>,
+        /// The masking digest of the raw outcome (E4, SPEC §20.2):
+        /// `0` when the outcome carried no secret, else the FNV-1a
+        /// digest of the redacted span. Stored so a reboot rebuilds
+        /// the digest stream without the raw secret bytes, which the
+        /// masker removed before the journal.
+        secret_digest: u64,
     },
     /// An independent read-back committed (mutating tools only). The
     /// mutation is complete only when `passed` is true.

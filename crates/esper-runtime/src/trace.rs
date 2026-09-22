@@ -9,6 +9,7 @@
 //! // HOST-ONLY (E0/E1): the trace is heap-allocated and for the host
 //! eval harness. Firmware builds do not carry it.
 
+use esper_core::lineage::Lineage;
 use esper_core::state::TerminalStatus;
 
 use crate::error::RuntimeError;
@@ -116,6 +117,23 @@ pub struct RunTrace {
     input_tokens_used: u32,
     /// Measured output tokens across all committed decisions (E3).
     output_tokens_used: u32,
+    /// Per-observation secret digests (E4, SPEC §20.2): one FNV-1a64
+    /// over the redacted *secret* bytes of each committed
+    /// `ToolObservation`, in journal order. The journal carries only
+    /// masked bytes, so the digest is the host's only record that a
+    /// secret was present and which one — it can name the secret
+    /// without ever persisting it.
+    // HOST-ONLY (E4)
+    secret_digests: Vec<u64>,
+    /// Cumulative built-prompt bytes this segment (E4, SPEC §20.4):
+    /// the sum of every prompt's byte length handed to the model
+    /// backend. Recorded, never metered; the rollover trigger reads
+    /// it.
+    prompt_bytes_used: u64,
+    /// The continuation binding (E4, SPEC §20.6): `Some` when this
+    /// run continues a compacted parent. Mirrors the seed so the
+    /// evidence names the lineage without re-reading the journal.
+    lineage: Option<Lineage>,
 }
 
 impl RunTrace {
@@ -198,6 +216,49 @@ impl RunTrace {
         self.output_tokens_used
     }
 
+    /// Per-observation secret digests (E4, SPEC §20.2): one FNV-1a64
+    /// over the redacted *secret* bytes of each committed
+    /// `ToolObservation`, in journal order; `0` for an observation
+    /// that carried no secret. The journal holds only masked bytes,
+    /// so this is the host's only record that a secret was present
+    /// and which one — it names the secret without persisting it.
+    ///
+    /// // HOST-ONLY (E4)
+    #[must_use]
+    pub fn secret_digests(&self) -> &[u64] {
+        &self.secret_digests
+    }
+
+    /// Cumulative built-prompt bytes this segment (E4, SPEC §20.4):
+    /// the sum of every prompt's byte length handed to the model
+    /// backend. Recorded, never metered.
+    #[must_use]
+    pub const fn prompt_bytes_used(&self) -> u64 {
+        self.prompt_bytes_used
+    }
+
+    /// The continuation binding (E4, SPEC §20.6): `Some` when this
+    /// run continues a compacted parent.
+    #[must_use]
+    pub const fn lineage(&self) -> Option<Lineage> {
+        self.lineage
+    }
+
+    /// Attach the host-held E4 context after a journal replay: the
+    /// per-observation secret digests (aligned with the journal's
+    /// `ToolObservation` frames in order) and the cumulative
+    /// built-prompt bytes for this segment.
+    ///
+    /// The replay cannot recover these — masking removed the secret
+    /// bytes before they reached the journal, and prompt bytes were
+    /// never committed — so the driver holds them alongside the
+    /// journal and attaches them here. A second attach overwrites
+    /// the first; the driver attaches exactly once per segment.
+    pub(crate) fn attach_context(&mut self, secret_digests: Vec<u64>, prompt_bytes: u64) {
+        self.secret_digests = secret_digests;
+        self.prompt_bytes_used = prompt_bytes;
+    }
+
     /// How many tool intents committed.
     #[must_use]
     pub fn tool_requests(&self) -> usize {
@@ -240,6 +301,8 @@ struct Accumulator {
     input_tokens_used: u32,
     /// Measured output tokens across all committed decisions (E3).
     output_tokens_used: u32,
+    /// The continuation binding, mirrored from the seed (E4).
+    lineage: Option<Lineage>,
 }
 
 impl Accumulator {
@@ -255,6 +318,7 @@ impl Accumulator {
             model_bundle: seed.model_bundle,
             input_tokens_used: 0,
             output_tokens_used: 0,
+            lineage: seed.parent,
         }
     }
 
@@ -384,6 +448,12 @@ impl Accumulator {
             model_bundle: self.model_bundle,
             input_tokens_used: self.input_tokens_used,
             output_tokens_used: self.output_tokens_used,
+            // The journal carries only masked bytes, so the digest
+            // and prompt-byte context is attached by the driver after
+            // the replay; a bare `from_journal` leaves it empty.
+            secret_digests: Vec::new(),
+            prompt_bytes_used: 0,
+            lineage: self.lineage,
         })
     }
 }

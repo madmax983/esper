@@ -23,11 +23,18 @@
 //! the doubles.
 
 use esper_core::ResourceBudget;
+use esper_core::compact::{
+    CompactState, DEFAULT_POLICY, FrameSummary, VersionSet, compact, should_compact,
+};
 use esper_core::decision::{Decision, Level, ToolArgs, decode_line};
 use esper_core::error::{ErrorCode, RepairVariant};
-use esper_core::ids::{Digest, ToolId};
-use esper_core::monitor::{Monitor, MonitorVerdict, ProgressDelta, StepRecord};
+use esper_core::ids::{Digest, RunId, ToolId};
+use esper_core::lineage::{Lineage, continue_as_new};
+use esper_core::mask::{mask_bound, mask_report};
+use esper_core::monitor::{Monitor, MonitorVerdict, ProgressDelta, StepOutcome, StepRecord};
+use esper_core::records::RecordKind;
 use esper_core::registry::{authorize, lookup_by_id};
+use esper_core::snapshot::{decode, encode, encoded_len, verify};
 use esper_core::state::{Event, State, TerminalStatus, transition};
 use esper_protocol::PermissionClass;
 use waymaker_core::{
@@ -35,7 +42,8 @@ use waymaker_core::{
 };
 
 use crate::backend::{
-    BackendError, ModelBackend, OUTPUT_CAP, PROMPT_CAP, PromptCtx, RepairHint, build_prompt,
+    BackendError, ModelBackend, OUTPUT_CAP, PROMPT_CAP, PriorCtx, PromptCtx, RepairHint,
+    build_prompt,
 };
 use crate::error::{CrashPoint, Halt, RuntimeError};
 use crate::journal::{DecisionClass, Frame, Journal};
@@ -165,25 +173,107 @@ enum ResumePoint {
     End,
 }
 
-/// Drive one run to its terminal result (or to durable suspension).
+/// The verified handoff from a rolled-over segment to its child (E4, SPEC §20.6).
 ///
-/// The seed is validated, then the engine boots: it replays the
-/// journal into fresh budgets, monitor, effect allocator, Waymaker
-/// cursor, and state-machine position, and drives forward. An injected
-/// crash (the `crash` point) drops all in-memory state and reboots from
-/// the committed prefix — transparently, inside this call — with the
-/// crash point disarmed so it fires at most once. When the run
-/// suspends awaiting human input and none is queued, the suspension is
-/// durable: this returns a trace with [`RunTrace::suspended`] set, and
-/// a later call with the same journal and a queued input resumes the
-/// same run.
+/// Produced when a segment's cumulative prompt bytes reach 80% of its
+/// context budget. The parent fold is encoded, read-back verified, and
+/// bound to a [`Lineage`] with [`continue_as_new`] — which fails closed
+/// on any budget widening — before this handoff exists, so a handoff in
+/// hand is already proven consistent.
+#[derive(Debug, Clone)]
+pub struct RolloverHandoff {
+    /// The encoded parent fold, verified by read-back before the
+    /// rollover committed. The child's driver holds these bytes and
+    /// re-verifies them on every boot; corrupt bytes fail closed.
+    pub snapshot: Vec<u8>,
+    /// The lineage binding the child run to this segment: which run it
+    /// continues, at which frame, with which remaining budgets.
+    pub lineage: Lineage,
+    /// This segment's cumulative built-prompt bytes (E4, SPEC §20.4),
+    /// carried so the child's remaining context budget is exact.
+    pub prompt_bytes: u64,
+    /// This segment's masking digest stream (E4, SPEC §20.2), in
+    /// journal order: one digest per committed observation, `0` where
+    /// the observation carried no secret. The child inherits the
+    /// stream so the secret record survives the fold.
+    pub mask_digests: Vec<u64>,
+}
+
+impl RolloverHandoff {
+    /// Build the child run's seed from the parent's (E4, SPEC §20.6).
+    ///
+    /// The child inherits the parent's capabilities, workflow version,
+    /// model bundle, inference settings, and shrunken context budget;
+    /// it starts with the lineage's remaining budgets, which
+    /// [`continue_as_new`] already proved do not widen the parent's.
+    /// The child run id derives deterministically from the parent id
+    /// and the cut frame.
+    #[must_use]
+    pub fn child_seed(&self, parent: &RunSeed) -> RunSeed {
+        // HOST-ONLY (E4)
+        let remaining = self.lineage.budgets_remaining;
+        RunSeed {
+            id: RunId::new(
+                parent
+                    .id
+                    .get()
+                    .wrapping_add(u64::from(self.lineage.continued_at_frame))
+                    .wrapping_add(1),
+            ),
+            model_turns: remaining.model_turns,
+            mutations: remaining.mutations,
+            input_tokens: remaining.input_tokens,
+            output_tokens: remaining.output_tokens,
+            elapsed_ms: remaining.elapsed_ms,
+            capabilities: parent.capabilities,
+            workflow_version: parent.workflow_version,
+            model_bundle: parent.model_bundle,
+            inference: parent.inference,
+            context_budget_bytes: parent
+                .context_budget_bytes
+                .map(|budget| budget.saturating_sub(self.prompt_bytes)),
+            parent: Some(self.lineage),
+        }
+    }
+}
+
+/// What one driven segment produced (E4, SPEC §20.4).
+pub enum SegmentOutcome {
+    /// The run reached its terminal result.
+    Completed(RunTrace),
+    /// The run suspended awaiting human input (durable; resumable).
+    Suspended(RunTrace),
+    /// The segment hit 80% of its context budget and folded: the trace
+    /// covers this segment, and the handoff starts the child.
+    Rollover(RunTrace, RolloverHandoff),
+}
+
+/// Drive one segment of a run (E4, SPEC §20.4).
+///
+/// A segment is one driver lifetime: it boots from the journal (plus,
+/// for a continued run, the handoff's verified snapshot), drives the
+/// normative machine until the run completes, suspends, or reaches 80%
+/// of its context budget — at which point it folds the segment's
+/// history and returns [`SegmentOutcome::Rollover`] — and reports what
+/// happened. Most callers want [`drive_run`], which chains segments.
+///
+/// The seed is validated, then the engine boots: it replays the journal
+/// into fresh budgets, monitor, effect allocator, Waymaker cursor, and
+/// state-machine position, and drives forward. An injected crash (the
+/// `crash` point) drops all in-memory state and reboots from the
+/// committed prefix — transparently, inside this call — with the crash
+/// point disarmed so it fires at most once.
+///
+/// A continued run (`seed.parent.is_some()`) must present the handoff;
+/// a root run must not. A mismatch fails closed.
 ///
 /// # Errors
 ///
-/// Returns [`RuntimeError`] on a malformed seed, a corrupt or
-/// foreign journal, a world-double failure, or an engine bug. An
-/// injected crash never surfaces here: it reboots internally.
-pub fn drive_run(
+/// Returns [`RuntimeError`] on a malformed seed, a corrupt or foreign
+/// journal, a corrupt snapshot, a world-double failure, or an engine
+/// bug. An injected crash never surfaces here: it reboots internally.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_segment(
     seed: &RunSeed,
     journal: &mut Journal,
     model: &mut dyn ModelBackend,
@@ -191,9 +281,22 @@ pub fn drive_run(
     faults: &mut FaultPlan,
     inputs: &mut InputPlan,
     crash: Option<CrashPoint>,
-) -> Result<RunTrace, RuntimeError> {
-    // HOST-ONLY (E0/E1)
+    handoff: Option<RolloverHandoff>,
+) -> Result<SegmentOutcome, RuntimeError> {
+    // HOST-ONLY (E4)
     seed.validate().map_err(RuntimeError::SeedInvalid)?;
+    // The snapshot discipline: a child boot needs its verified parent
+    // bytes; a root boot must not carry any. Fail closed either way.
+    if handoff.is_some() != seed.parent.is_some() {
+        return Err(RuntimeError::JournalCorrupt);
+    }
+    // E4: the child inherits the parent's digest stream and prompt
+    // bytes through the handoff; a root starts both empty.
+    let inherited_digests = handoff
+        .as_ref()
+        .map(|handoff| handoff.mask_digests.clone())
+        .unwrap_or_default();
+    let snapshot = handoff.map(|handoff| handoff.snapshot);
     let run = WaymakerRunId(seed.id.get());
     let mut driver = Driver {
         seed,
@@ -208,7 +311,7 @@ pub fn drive_run(
         monitor: Monitor::new(),
         allocator: EffectIdAllocator::for_run(run),
         cursor: ReplayCursor::new(run),
-        seed_input: [0u8; 133],
+        seed_input: [0u8; 142],
         repair_used: 0,
         turns_used: 0,
         mutations_used: 0,
@@ -220,6 +323,14 @@ pub fn drive_run(
         pending_ask: None,
         pending_finish: None,
         ask_request_committed: false,
+        snapshot,
+        compact: None,
+        prompt_bytes: 0,
+        last_prompt_bytes: 0,
+        mask_digests: inherited_digests.clone(),
+        inherited_digests,
+        #[cfg(test)]
+        injected_outcome: None,
     };
     let mut boots = 0u32;
     loop {
@@ -234,9 +345,78 @@ pub fn drive_run(
             Halt::Error(error) => error,
         })?;
         match driver.main_loop() {
-            Ok(trace) => return Ok(trace),
+            Ok(outcome) => return Ok(outcome),
             Err(Halt::Error(error)) => return Err(error),
             Err(Halt::Crash(_)) => {}
+        }
+    }
+}
+
+/// Drive one run to its terminal result (or to durable suspension).
+///
+/// Chains [`drive_segment`] calls: when a segment folds at 80% of its
+/// context budget, the child's seed is derived from the handoff and the
+/// next segment starts — with the remaining budgets, never widened —
+/// until the run completes or suspends. See [`drive_segment`] for the
+/// boot and crash contract.
+///
+/// # Errors
+///
+/// Same as [`drive_segment`].
+pub fn drive_run(
+    seed: &RunSeed,
+    journal: &mut Journal,
+    model: &mut dyn ModelBackend,
+    device: &mut FakeDevice,
+    faults: &mut FaultPlan,
+    inputs: &mut InputPlan,
+    crash: Option<CrashPoint>,
+) -> Result<RunTrace, RuntimeError> {
+    // HOST-ONLY (E0/E1)
+    let mut current: RunSeed = *seed;
+    let mut handoff: Option<RolloverHandoff> = None;
+    // E4: each segment owns its journal. The first segment uses the
+    // caller's journal; every child gets a fresh one — a segment never
+    // appends to its parent's frames, whose `RunStarted` binds a
+    // different seed.
+    let mut child_journal = Journal::new();
+    let mut first = true;
+    loop {
+        // Reborrow the caller's journal on the first pass; afterwards
+        // the child journal owns the segment.
+        let result = if first {
+            first = false;
+            drive_segment(
+                &current,
+                &mut *journal,
+                model,
+                device,
+                faults,
+                inputs,
+                crash,
+                handoff,
+            )
+        } else {
+            drive_segment(
+                &current,
+                &mut child_journal,
+                model,
+                device,
+                faults,
+                inputs,
+                crash,
+                handoff,
+            )
+        };
+        match result? {
+            SegmentOutcome::Completed(trace) | SegmentOutcome::Suspended(trace) => {
+                return Ok(trace);
+            }
+            SegmentOutcome::Rollover(_, next) => {
+                current = next.child_seed(&current);
+                handoff = Some(next);
+                child_journal = Journal::new();
+            }
         }
     }
 }
@@ -292,7 +472,7 @@ struct Driver<'a> {
     cursor: ReplayCursor,
     /// The canonical seed bytes for the `RunStarted` record.
     // HOST-ONLY (E0/E1)
-    seed_input: [u8; 133],
+    seed_input: [u8; 142],
     /// Invalid lines committed this run.
     repair_used: u8,
     /// Model turns consumed this run.
@@ -325,6 +505,49 @@ struct Driver<'a> {
     pending_finish: Option<Vec<u8>>,
     /// Whether the approval request already committed.
     ask_request_committed: bool,
+    /// The parent fold's verified bytes (E4, SPEC §20.6): `Some` for a
+    /// continued run, `None` for a root run. Re-verified on every boot;
+    /// corrupt bytes fail closed before a single frame replays.
+    snapshot: Option<Vec<u8>>,
+    /// The decoded parent fold (E4, SPEC §20.5): `Some` for a continued
+    /// run after the snapshot verifies, `None` otherwise. Names the
+    /// ruled-out paths, the carried obligations, and the inherited
+    /// facts — the fold the child's PRIOR prompt line summarizes.
+    compact: Option<CompactState>,
+    /// Cumulative built-prompt bytes this driver lifetime (E4,
+    /// SPEC §20.4): every prompt's byte length handed to the model
+    /// The segment's cumulative built-prompt bytes (E4, SPEC §20.4):
+    /// every prompt the model backend saw, in bytes. The 80% rollover
+    /// trigger reads it. Journal-derived: each `ModelDecision` frame
+    /// carries its prompt's size, so a boot sums the journal to
+    /// rebuild the meter — suspend/resume across driver calls keeps
+    /// the trigger exact. A new segment (fresh journal) starts at zero.
+    prompt_bytes: u64,
+    /// The last built prompt's byte length (E4): set in `do_infer`,
+    /// committed into the `ModelDecision` frame. Per-boot state; a
+    /// crash between inference and commit drops it, which is correct —
+    /// the uncommitted prompt was never used.
+    last_prompt_bytes: u64,
+    /// Per-observation secret digests (E4, SPEC §20.2): one FNV-1a64
+    /// over the redacted *secret* bytes of each committed
+    /// `ToolObservation`, in journal order (`0` for an observation
+    /// The masking digest stream (E4, SPEC §20.2), in journal order:
+    /// one digest per committed observation (`0` for an observation
+    /// that carried no secret). Each frame carries its digest, so a
+    /// reboot rebuilds the real stream; the forward drive extends it.
+    mask_digests: Vec<u64>,
+    /// The digest stream inherited through the rollover handoff (E4):
+    /// the parent segment's digests, which the child's fresh journal
+    /// does not contain. Restored on every reboot before the replay
+    /// appends this segment's frame digests.
+    inherited_digests: Vec<u64>,
+    /// Test hook (E4): when set, the next `dispatch_intent` returns
+    /// these bytes verbatim instead of consulting the device. The
+    /// masking boundary in `do_observe` still applies, so tests can
+    /// prove a secret-bearing outcome is masked before it reaches the
+    /// journal, the prompt, or the Waymaker cursor.
+    #[cfg(test)]
+    injected_outcome: Option<Vec<u8>>,
 }
 
 impl Driver<'_> {
@@ -355,11 +578,28 @@ impl Driver<'_> {
         self.pending_ask = None;
         self.pending_finish = None;
         self.ask_request_committed = false;
+        // E4: the digest stream rebuilds from the inherited handoff
+        // digests (empty for a root) plus the replayed frame digests
+        // — each frame carries the digest its observation committed,
+        // so the real secret digests survive the reboot.
+        self.mask_digests = self.inherited_digests.clone();
         self.sm = State::Recover;
 
         // HOST-ONLY (E0/E1): the journal is cloned once per boot so
         // replay can mutate driver state while reading frames.
         let frames: Vec<Frame> = self.journal.frames().to_vec();
+        // E4 (SPEC §20.4): the prompt meter rebuilds from the journal —
+        // each `ModelDecision` carries its prompt's byte length. A
+        // fresh segment sums to zero; a resumed segment recovers its
+        // exact spend, so the 80% trigger stays exact across driver
+        // calls.
+        self.prompt_bytes = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::ModelDecision { prompt_bytes, .. } => Some(*prompt_bytes),
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add);
         let snapshot = match frames.first() {
             Some(Frame::RunStarted { seed }) => *seed,
             Some(_) | None => {
@@ -377,6 +617,14 @@ impl Driver<'_> {
         }
         if snapshot != self.seed.snapshot() {
             return Err(RuntimeError::SeedMismatch.into());
+        }
+        // E4 (SPEC §20.6): the snapshot discipline. A continued run
+        // re-verifies the parent fold's bytes on every boot — corrupt
+        // bytes fail closed before a single frame replays. A root run
+        // carries no snapshot (drive_segment enforces the pairing).
+        if let Some(bytes) = self.snapshot.as_ref() {
+            let state = decode(bytes).map_err(|error| Halt::Error(error.into()))?;
+            self.compact = Some(state);
         }
         self.seed_input = snapshot.input_bytes();
         let seed_input = self.seed_input;
@@ -445,6 +693,7 @@ impl Driver<'_> {
                 repair_index,
                 input_tokens,
                 output_tokens,
+                prompt_bytes: _,
             } => self.replay_decision(output, *class, *repair_index, *input_tokens, *output_tokens),
             Frame::ToolIntent {
                 seq,
@@ -458,7 +707,10 @@ impl Driver<'_> {
                 attempt,
                 transient,
                 outcome,
-            } => self.replay_observation(*seq, *attempt, *transient, outcome, steps),
+                secret_digest,
+            } => {
+                self.replay_observation(*seq, *attempt, *transient, outcome, *secret_digest, steps)
+            }
             Frame::Verification {
                 seq,
                 expected: _,
@@ -617,8 +869,15 @@ impl Driver<'_> {
         attempt: u32,
         transient: bool,
         outcome: &[u8],
+        secret_digest: u64,
         steps: &mut Vec<StepRecord>,
     ) -> Result<ResumePoint, RuntimeError> {
+        // E4: the digest stream rebuilds from the journal — each frame
+        // carries the digest its observation committed, so the real
+        // secret digests survive the reboot even though the raw secret
+        // bytes are gone by design. The forward drive extends the
+        // stream with fresh digests from here.
+        self.mask_digests.push(secret_digest);
         let (is_write, tool, digest) = {
             let intent = self
                 .pending_intent
@@ -714,17 +973,20 @@ impl Driver<'_> {
     }
     /// The forward pass: walk the normative machine to a terminal
     /// result or durable suspension.
-    fn main_loop(&mut self) -> Result<RunTrace, Halt> {
+    fn main_loop(&mut self) -> Result<SegmentOutcome, Halt> {
         loop {
             match self.sm {
-                State::Gather => self.do_gather()?,
+                State::Gather => {
+                    if let Some(outcome) = self.do_gather()? {
+                        return Ok(outcome);
+                    }
+                }
                 State::Infer => self.do_infer()?,
                 State::Repair => self.do_repair()?,
                 State::Authorize => self.do_authorize()?,
                 State::AwaitInput => {
                     if self.do_await_input()? {
-                        return RunTrace::from_journal(self.journal, self.seed)
-                            .map_err(Halt::Error);
+                        return Ok(SegmentOutcome::Suspended(self.finish_trace()?));
                     }
                 }
                 State::Observe => self.do_observe()?,
@@ -732,7 +994,7 @@ impl Driver<'_> {
                 State::Account => self.do_account()?,
                 State::Finalize => self.do_finalize()?,
                 State::End => {
-                    return RunTrace::from_journal(self.journal, self.seed).map_err(Halt::Error);
+                    return Ok(SegmentOutcome::Completed(self.finish_trace()?));
                 }
                 State::Recover | State::Degraded | State::SafeStop => {
                     return Err(RuntimeError::IllegalTransition.into());
@@ -741,8 +1003,37 @@ impl Driver<'_> {
         }
     }
 
-    /// `Gather`: the budget gate every step passes through.
-    fn do_gather(&mut self) -> Result<(), Halt> {
+    /// Build the segment's trace: replay the journal, then attach the
+    /// host-held E4 context (secret digests and prompt bytes) that the
+    /// replay cannot recover.
+    fn finish_trace(&self) -> Result<RunTrace, Halt> {
+        // HOST-ONLY (E4)
+        let mut trace = RunTrace::from_journal(self.journal, self.seed).map_err(Halt::Error)?;
+        trace.attach_context(self.mask_digests.clone(), self.prompt_bytes);
+        Ok(trace)
+    }
+
+    /// `Gather`: the budget gate every step passes through (E4: also the
+    /// context rollover trigger).
+    ///
+    /// Returns `Some` when this `Gather` ends the segment — either the
+    /// run folded at 80% of its context budget or the context budget
+    /// itself is exhausted — and `None` when the machine continues.
+    fn do_gather(&mut self) -> Result<Option<SegmentOutcome>, Halt> {
+        // E4 (SPEC §20.4): a zero context budget means the parent spent
+        // everything — the child cannot run. Check before the budget
+        // gate advances the state.
+        if self.seed.context_budget_bytes == Some(0) {
+            self.advance(Event::BudgetExhausted)?;
+            // HOST-ONLY (E4)
+            let summary = b"context budget exhausted; no rollover possible".to_vec();
+            self.enter_degraded(
+                TerminalStatus::BudgetExhausted,
+                b"context_budget_exhausted",
+                &summary,
+            )?;
+            return Ok(None);
+        }
         if let Some(unit) = self.budget.exhausted_unit() {
             self.advance(Event::BudgetExhausted)?;
             let name = unit.name();
@@ -753,7 +1044,320 @@ impl Driver<'_> {
         } else {
             self.advance(Event::BudgetsClear)?;
         }
-        Ok(())
+        // E4 (SPEC §20.4): the rollover check runs after the budget
+        // gate — an exhausted run ends; it never folds — and only when
+        // the seed carries a context budget.
+        if let Some(budget) = self.seed.context_budget_bytes
+            && should_compact(self.prompt_bytes, budget, &DEFAULT_POLICY)
+        {
+            return Ok(Some(self.do_rollover()?));
+        }
+        Ok(None)
+    }
+
+    /// `Gather`: fold this segment's history and produce the child
+    /// handoff (E4, SPEC §20.4-20.6).
+    ///
+    /// Summarizes the journal's frames, folds them into a fresh
+    /// [`CompactState`] with [`compact`], encodes and read-back
+    /// verifies the snapshot ([`encode`]/[`verify`]), and binds the
+    /// lineage with [`continue_as_new`]. Every step fails closed: a
+    /// failed fold ends the segment in `Halt::Error`, never in a
+    /// half-folded handoff.
+    fn do_rollover(&self) -> Result<SegmentOutcome, Halt> {
+        // HOST-ONLY (E4)
+        let summaries = self.summarize_frames();
+        let mut state = CompactState::new(
+            Digest::new(self.seed.id.get()),
+            self.budget,
+            self.version_set(),
+        );
+        compact(&summaries, &DEFAULT_POLICY, &mut state).map_err(RuntimeError::Core)?;
+        let mut bytes = vec![0u8; encoded_len(&state)];
+        let written = encode(&state, &mut bytes).map_err(RuntimeError::Core)?;
+        bytes.truncate(written);
+        // Read-back: the bytes on the wire must verify before the
+        // rollover commits. Verification order is the snapshot's own:
+        // truncated, version mismatch, checksum mismatch, corrupt.
+        verify(&bytes).map_err(RuntimeError::Core)?;
+        let lineage = Lineage {
+            parent_run: self.seed.id,
+            continued_at_frame: self.cut_frame(),
+            budgets_remaining: self.budget,
+            versions: self.version_set(),
+        };
+        // The no-widen check: the child must not exceed the budgets
+        // this segment proved.
+        let continued = continue_as_new(&state, &lineage).map_err(RuntimeError::Core)?;
+        let trace = self.finish_trace()?;
+        Ok(SegmentOutcome::Rollover(
+            trace,
+            RolloverHandoff {
+                snapshot: bytes,
+                lineage: continued.lineage,
+                prompt_bytes: self.prompt_bytes,
+                // E4: the digest stream crosses the fold with the
+                // segment's other durable state.
+                mask_digests: self.mask_digests.clone(),
+            },
+        ))
+    }
+
+    /// The version binding for this segment's fold and lineage (E4).
+    fn version_set(&self) -> VersionSet {
+        // HOST-ONLY (E4): the slice does not version the tool catalog
+        // or the compaction policy; zeros mark them unversioned rather
+        // than inventing versions.
+        VersionSet {
+            workflow: u32::from(self.seed.workflow_version),
+            model: Digest::new(self.seed.model_bundle),
+            catalog: Digest::new(0),
+            policy: Digest::new(0),
+        }
+    }
+
+    /// The frame position the rollover cuts at: the last committed
+    /// frame's index (E4, SPEC §20.6).
+    fn cut_frame(&self) -> u32 {
+        // HOST-ONLY (E4)
+        let len = self.journal.frames().len();
+        u32::try_from(len.saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+
+    /// Summarize every committed frame for the compaction fold (E4, SPEC §20.5).
+    ///
+    /// Mirrors the replay's step derivation: read observations become
+    /// `NewEvidence` facts, passed verifications become `StateChanged`,
+    /// failed verifications become ruled-out paths, and approval
+    /// requests become pending obligations until their decision
+    /// commits. Payloads are the journal's already-masked bytes —
+    /// masking happened before commit, so the fold never sees a raw
+    /// secret.
+    fn summarize_frames(&self) -> Vec<FrameSummary<'_>> {
+        // HOST-ONLY (E4)
+        let frames = self.journal.frames();
+        // An approval request is pending only when no decision follows
+        // it: find the last decision's position once.
+        let mut last_decision: Option<usize> = None;
+        for (index, frame) in frames.iter().enumerate() {
+            if matches!(frame, Frame::ApprovalDecision { .. }) {
+                last_decision = Some(index);
+            }
+        }
+        // (effect seq, tool, args digest, is write) for pairing
+        // observations and verifications with their intents.
+        let mut intents: Vec<(u32, u8, u64, bool)> = Vec::new();
+        let mut summaries: Vec<FrameSummary<'_>> = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            let seq = u32::try_from(index).unwrap_or(u32::MAX);
+            let summary = match frame {
+                Frame::RunStarted { .. } => FrameSummary {
+                    seq,
+                    kind: RecordKind::RunSeed,
+                    tool: ToolId::new(0),
+                    args_digest: Digest::new(0),
+                    outcome: StepOutcome::Ok,
+                    progress: ProgressDelta::NoProgress,
+                    payload: &[],
+                    pending_approval: false,
+                    pending_verification: false,
+                },
+                Frame::ModelDecision { output, .. } => FrameSummary {
+                    seq,
+                    kind: RecordKind::ModelDecision,
+                    tool: ToolId::new(0),
+                    args_digest: Digest::of_bytes(output),
+                    outcome: StepOutcome::Ok,
+                    progress: ProgressDelta::NoProgress,
+                    payload: &[],
+                    pending_approval: false,
+                    pending_verification: false,
+                },
+                Frame::ToolIntent {
+                    seq: effect,
+                    tool,
+                    digest,
+                    write,
+                    ..
+                } => {
+                    intents.push((*effect, *tool, *digest, *write));
+                    FrameSummary {
+                        seq,
+                        kind: RecordKind::ToolRequest,
+                        tool: ToolId::new(*tool),
+                        args_digest: Digest::new(*digest),
+                        outcome: StepOutcome::Ok,
+                        progress: ProgressDelta::NoProgress,
+                        payload: &[],
+                        pending_approval: false,
+                        pending_verification: false,
+                    }
+                }
+                Frame::ToolObservation {
+                    seq: effect,
+                    transient,
+                    outcome,
+                    ..
+                } => Self::summarize_observation(
+                    seq,
+                    *effect,
+                    *transient,
+                    outcome,
+                    &intents,
+                    frames,
+                    index,
+                ),
+                Frame::Verification {
+                    seq: effect,
+                    passed,
+                    ..
+                } => Self::summarize_verification(seq, *effect, *passed, &intents),
+                Frame::ApprovalRequest { prompt, .. } => Self::summarize_approval_request(
+                    seq,
+                    prompt,
+                    last_decision,
+                    index,
+                ),
+                Frame::ApprovalDecision { input } => Self::summarize_approval_decision(seq, input),
+                Frame::Terminal { .. } => FrameSummary {
+                    seq,
+                    kind: RecordKind::TerminalResult,
+                    tool: ToolId::new(0),
+                    args_digest: Digest::new(0),
+                    outcome: StepOutcome::Ok,
+                    progress: ProgressDelta::NoProgress,
+                    payload: &[],
+                    pending_approval: false,
+                    pending_verification: false,
+                },
+            };
+            summaries.push(summary);
+        }
+        summaries
+    }
+
+    /// Summarize one `ToolObservation` frame (E4, HOST-ONLY).
+    ///
+    /// Pairs the observation with its intent for the tool identity and
+    /// args digest; a non-transient write without a later verification
+    /// leaves `pending_verification` set — an obligation the fold must
+    /// carry.
+    fn summarize_observation<'a>(
+        seq: u32,
+        effect: u32,
+        transient: bool,
+        outcome: &'a [u8],
+        intents: &[(u32, u8, u64, bool)],
+        frames: &[Frame],
+        index: usize,
+    ) -> FrameSummary<'a> {
+        let (tool, digest, write) = intents
+            .iter()
+            .rev()
+            .find(|(s, _, _, _)| *s == effect)
+            .map_or((ToolId::new(0), Digest::new(0), false), |(_, t, d, w)| {
+                (ToolId::new(*t), Digest::new(*d), *w)
+            });
+        // A write observation without a later verification leaves the
+        // read-back open: an obligation the fold must carry.
+        let pending_verification = if !transient && write {
+            !frames.iter().skip(index + 1).any(|later| {
+                matches!(later, Frame::Verification { seq: s, .. } if *s == effect)
+            })
+        } else {
+            false
+        };
+        FrameSummary {
+            seq,
+            kind: RecordKind::ToolObservation,
+            tool,
+            args_digest: digest,
+            outcome: StepOutcome::Ok,
+            progress: if transient || write {
+                ProgressDelta::NoProgress
+            } else {
+                ProgressDelta::NewEvidence
+            },
+            payload: if transient { &[] } else { outcome },
+            pending_approval: false,
+            pending_verification,
+        }
+    }
+
+    /// Summarize one `Verification` frame (E4, HOST-ONLY).
+    ///
+    /// Pairs the verification with its intent for the tool identity
+    /// and args digest.
+    fn summarize_verification(
+        seq: u32,
+        effect: u32,
+        passed: bool,
+        intents: &[(u32, u8, u64, bool)],
+    ) -> FrameSummary<'static> {
+        let (tool, digest) = intents
+            .iter()
+            .rev()
+            .find(|(s, _, _, _)| *s == effect)
+            .map_or((ToolId::new(0), Digest::new(0)), |(_, t, d, _)| {
+                (ToolId::new(*t), Digest::new(*d))
+            });
+        FrameSummary {
+            seq,
+            kind: RecordKind::VerificationResult,
+            tool,
+            args_digest: digest,
+            outcome: if passed {
+                StepOutcome::Ok
+            } else {
+                StepOutcome::Failed(ErrorCode::VerificationFailed)
+            },
+            progress: if passed {
+                ProgressDelta::StateChanged
+            } else {
+                ProgressDelta::NoProgress
+            },
+            payload: &[],
+            pending_approval: false,
+            pending_verification: false,
+        }
+    }
+
+    /// Summarize one `ApprovalRequest` frame (E4, HOST-ONLY).
+    ///
+    /// The request is pending only when no decision follows it in the
+    /// journal.
+    fn summarize_approval_request(
+        seq: u32,
+        prompt: &[u8],
+        last_decision: Option<usize>,
+        index: usize,
+    ) -> FrameSummary<'_> {
+        FrameSummary {
+            seq,
+            kind: RecordKind::ApprovalRequest,
+            tool: ToolId::new(0),
+            args_digest: Digest::of_bytes(prompt),
+            outcome: StepOutcome::Ok,
+            progress: ProgressDelta::NoProgress,
+            payload: prompt,
+            pending_approval: last_decision.is_none_or(|d| index > d),
+            pending_verification: false,
+        }
+    }
+
+    /// Summarize one `ApprovalDecision` frame (E4, HOST-ONLY).
+    fn summarize_approval_decision(seq: u32, input: &[u8]) -> FrameSummary<'static> {
+        FrameSummary {
+            seq,
+            kind: RecordKind::ApprovalDecision,
+            tool: ToolId::new(0),
+            args_digest: Digest::of_bytes(input),
+            outcome: StepOutcome::Ok,
+            progress: ProgressDelta::InputReceived,
+            payload: &[],
+            pending_approval: false,
+            pending_verification: false,
+        }
     }
 
     /// `Infer`: build the prompt, take one model line, and commit the
@@ -772,14 +1376,20 @@ impl Driver<'_> {
             mutations_left: self.budget.mutations,
             last_observation: self.last_observation.as_deref(),
             repair: self.repair_hint(),
-            // E4 wiring lands with the rollover slice; root runs
-            // carry no folded history.
-            prior: None,
+            // E4: a continued run names the folded epoch; a root run
+            // carries no folded history.
+            prior: self.prior_ctx(),
         };
         let plen = build_prompt(
             &ctx,
             &mut pbuf[..usize::from(self.seed.inference.max_prompt_bytes)],
         );
+        // E4 (SPEC §20.4): every built prompt's byte length accumulates
+        // into the segment's meter; the 80% rollover trigger reads it.
+        // Recorded, never metered. The size is also stashed for the
+        // `ModelDecision` frame, so the meter rebuilds from the journal.
+        self.prompt_bytes = self.prompt_bytes.saturating_add(plen as u64);
+        self.last_prompt_bytes = plen as u64;
         // HOST-ONLY (E3)
         let mut obuf = [0u8; OUTPUT_CAP];
         let n = self
@@ -815,6 +1425,26 @@ impl Driver<'_> {
         })
     }
 
+    /// The folded-history marker for this segment's prompts (E4, SPEC §20.5).
+    ///
+    /// `Some` for a continued run whose snapshot verified: names the
+    /// compact epoch the segment folded at plus the inherited counts
+    /// (ruled-out paths, open obligations, facts). `None` for root
+    /// runs. The parent's raw bytes never enter the prompt — a
+    /// reference to folded history renders as the stale marker, never
+    /// as reconstructed content.
+    fn prior_ctx(&self) -> Option<PriorCtx> {
+        // HOST-ONLY (E4)
+        let lineage = self.seed.parent?;
+        let compact = self.compact.as_ref()?;
+        Some(PriorCtx {
+            epoch: lineage.continued_at_frame,
+            failed_paths: u8::try_from(compact.failed_paths().len()).unwrap_or(u8::MAX),
+            pending: u8::try_from(compact.pending().len()).unwrap_or(u8::MAX),
+            facts: u8::try_from(compact.facts().len()).unwrap_or(u8::MAX),
+        })
+    }
+
     /// The pre-commit half of `Infer`.
     fn infer_pre_commit(&mut self, line: &[u8]) -> Result<(), Halt> {
         self.fire(CrashPoint::ModelIntent)?;
@@ -845,6 +1475,7 @@ impl Driver<'_> {
                     repair_index: 0,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    prompt_bytes: self.last_prompt_bytes,
                 });
                 self.pending_call = Some(PendingCall {
                     tool,
@@ -861,6 +1492,7 @@ impl Driver<'_> {
                     repair_index: 0,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    prompt_bytes: self.last_prompt_bytes,
                 });
                 self.pending_ask = Some(PendingAsk { prompt, schema });
                 self.ask_request_committed = false;
@@ -873,6 +1505,7 @@ impl Driver<'_> {
                     repair_index: 0,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    prompt_bytes: self.last_prompt_bytes,
                 });
                 self.pending_finish = Some(summary);
                 self.advance(Event::DecodeFinish)?;
@@ -893,6 +1526,7 @@ impl Driver<'_> {
                     repair_index: self.repair_used,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    prompt_bytes: self.last_prompt_bytes,
                 });
                 self.advance(Event::DecodeMalformed)?;
             }
@@ -974,6 +1608,32 @@ impl Driver<'_> {
                 b"mutations_exhausted",
                 b"mutation budget exhausted",
             );
+        }
+        // E4 (SPEC §20.5): never re-dispatch a path the parent fold
+        // ruled out. The compact state's failed paths are (tool, args
+        // digest) pairs that already failed: an identical call is
+        // refused before it burns a turn, and the run degrades with a
+        // machine-readable reason instead of re-proving the failure.
+        if let Some(compact) = self.compact.as_ref() {
+            let digest = Digest::new(call.digest);
+            let ruled_out = compact
+                .failed_paths()
+                .iter()
+                .any(|path| path.tool == ToolId::new(call.tool) && path.args_digest == digest);
+            if ruled_out {
+                self.advance(Event::Denied)?;
+                // HOST-ONLY (E4)
+                let summary = format!(
+                    "parent fold ruled out tool {} with args digest {:x}",
+                    call.tool, call.digest
+                )
+                .into_bytes();
+                return self.enter_degraded(
+                    TerminalStatus::Stuck,
+                    b"failed_path_ruled_out",
+                    &summary,
+                );
+            }
         }
         let effect = self.allocator.allocate().map_err(RuntimeError::Waymaker)?;
         let seq = effect.seq;
@@ -1093,7 +1753,13 @@ impl Driver<'_> {
                 transient: true,
                 // HOST-ONLY (E0/E1)
                 outcome: Vec::new(),
+                // E4: an empty transient outcome carries no secret.
+                secret_digest: 0,
             });
+            // E4: the digest stream stays aligned with the journal's
+            // observations; an empty transient outcome carries no
+            // secret.
+            self.mask_digests.push(0);
             // No Waymaker record: the transient attempt is not an
             // effect boundary; the cursor sees only the scheduled
             // effect and its terminal outcome.
@@ -1104,14 +1770,23 @@ impl Driver<'_> {
         // HOST-ONLY (E0/E1)
         let outcome = self.dispatch_intent(&intent).map_err(map_world)?;
         self.fire(CrashPoint::AfterPhysicalBeforeObservation)?;
-        let record_outcome = outcome.clone();
+        // E4 (SPEC §20.2): mask before the observation is used
+        // anywhere — the journal, the cursor, and the next prompt must
+        // never see raw secret bytes. The digest is the host's only
+        // record of which secret was present.
+        let (masked, digest) = mask_observation(&outcome).map_err(Halt::Error)?;
+        self.mask_digests.push(digest);
+        let record_outcome = masked.clone();
         // Remember the outcome for the next inference prompt (E3).
-        self.last_observation = Some(cap_observation(&outcome));
+        self.last_observation = Some(cap_observation(&masked));
         self.journal.push(Frame::ToolObservation {
             seq: intent.seq.0,
             attempt: intent.attempt,
             transient: false,
-            outcome,
+            outcome: masked,
+            // E4: the digest travels with the observation so a reboot
+            // rebuilds the stream without the raw secret bytes.
+            secret_digest: digest,
         });
         self.advance_cursor(RecordRef::EffectCompleted {
             seq: intent.seq,
@@ -1137,6 +1812,12 @@ impl Driver<'_> {
     /// Dispatch the committed intent against the fake device, routing
     /// by the typed arguments (SPEC §17.6).
     fn dispatch_intent(&mut self, intent: &PendingIntent) -> Result<Vec<u8>, WorldError> {
+        // E4 test hook: the masking boundary in `do_observe` still
+        // applies to the injected bytes.
+        #[cfg(test)]
+        if let Some(outcome) = self.injected_outcome.take() {
+            return Ok(outcome);
+        }
         let seq = intent.seq;
         let digest = intent.digest;
         match intent.tool_args {
@@ -1585,6 +2266,21 @@ fn cap_observation(outcome: &[u8]) -> Vec<u8> {
     outcome[..cap].to_vec()
 }
 
+/// Mask one observation's outcome (E4, SPEC §20.2).
+///
+/// Returns the masked bytes and the FNV-1a64 digest over the redacted
+/// *secret* bytes (`0` when the outcome carried no secret). The journal
+/// and the prompt only ever see the masked bytes; the digest is the
+/// host's only record of which secret was present — it names the
+/// secret without persisting it.
+fn mask_observation(raw: &[u8]) -> Result<(Vec<u8>, u64), RuntimeError> {
+    // HOST-ONLY (E4)
+    let mut masked = vec![0u8; mask_bound(raw.len())];
+    let report = mask_report(raw, &mut masked)?;
+    masked.truncate(report.output_len);
+    Ok((masked, report.secret_digest))
+}
+
 /// FNV-1a over 32 bits, for the Waymaker `input_crc` digest.
 ///
 /// The journal's canonical intent bytes are hashed at commit and at
@@ -1794,5 +2490,120 @@ mod tests {
         assert_eq!(parse_u64_digits(b"18446744073709551616"), None);
         assert_eq!(parse_u64_digits(b""), None);
         assert_eq!(parse_u64_digits(b"12a"), None);
+    }
+
+    /// E4 (SPEC §20.1-20.2): a secret-bearing tool outcome is masked at
+    /// the `do_observe` boundary — the journal frame, the driver's
+    /// `last_observation` (which the next prompt's LAST line renders),
+    /// and the Waymaker cursor all see only the masked bytes, while the
+    /// trace records the secret digest.
+    #[test]
+    fn masking_boundary_redacts_secret_and_pii_before_journal_and_prompt() {
+        use super::{
+            Driver, EffectIdAllocator, ReplayCursor, SegmentOutcome, WaymakerRunId, mask_bound,
+            mask_report,
+        };
+        use crate::backend::{InferenceSettings, ModelBackend, ScriptedBackend};
+        use crate::journal::Journal;
+        use crate::seed::RunSeed;
+        use crate::world::{FakeDevice, FaultPlan, InputPlan};
+        use esper_core::monitor::Monitor;
+
+        // A read whose device outcome carries a secret and PII.
+        let raw = b"token=sk-live-abc123def456xyz; notify nurse@example.com";
+        let mut backend = ScriptedBackend::new(
+            vec![
+                b"CALL gpio_pin_read {\"pin\": 4}".to_vec(),
+                b"FINISH {\"status\": \"completed\", \"summary\": \"done\"}".to_vec(),
+            ],
+            InferenceSettings::default_settings(),
+        );
+        let seed = RunSeed {
+            model_bundle: backend.bundle_id().0,
+            ..RunSeed::default_slice()
+        };
+        let mut journal = Journal::new();
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut inputs = InputPlan::new(Vec::new());
+        let run = WaymakerRunId(seed.id.get());
+        let mut driver = Driver {
+            seed: &seed,
+            journal: &mut journal,
+            model: &mut backend,
+            device: &mut device,
+            faults: &mut faults,
+            inputs: &mut inputs,
+            crash: None,
+            sm: super::State::Recover,
+            budget: seed.starting_budget(),
+            monitor: Monitor::new(),
+            allocator: EffectIdAllocator::for_run(run),
+            cursor: ReplayCursor::new(run),
+            seed_input: [0u8; 142],
+            repair_used: 0,
+            turns_used: 0,
+            mutations_used: 0,
+            last_observation: None,
+            last_repair_variant: None,
+            pending_call: None,
+            pending_intent: None,
+            pending_step: None,
+            pending_ask: None,
+            pending_finish: None,
+            ask_request_committed: false,
+            snapshot: None,
+            compact: None,
+            prompt_bytes: 0,
+            last_prompt_bytes: 0,
+            mask_digests: Vec::new(),
+            inherited_digests: Vec::new(),
+            injected_outcome: Some(raw.to_vec()),
+        };
+        driver.reboot().expect("reboot failed");
+        let outcome = driver.main_loop().expect("drive failed");
+        let SegmentOutcome::Completed(trace) = outcome else {
+            panic!("expected the run to complete, got a suspend or rollover");
+        };
+
+        // The expected masked form, from the real masker.
+        let mut buf = vec![0u8; mask_bound(raw.len())];
+        let report = mask_report(raw, &mut buf).expect("mask failed");
+        let expected = &buf[..report.output_len];
+        let text = core::str::from_utf8(expected).expect("masked bytes are ASCII");
+        assert!(
+            text.contains("[redacted:secret#1]"),
+            "secret marker: {text}"
+        );
+        assert!(text.contains("[redacted:pii#2]"), "pii marker: {text}");
+        assert!(!text.contains("sk-live"), "raw secret leaked: {text}");
+        assert!(
+            !text.contains("nurse@example.com"),
+            "raw pii leaked: {text}"
+        );
+
+        // The journal frame carries exactly the masked bytes.
+        let committed = driver
+            .journal
+            .frames()
+            .iter()
+            .find_map(|frame| match frame {
+                super::Frame::ToolObservation { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("no observation committed");
+        assert_eq!(committed, expected, "journal holds masked bytes only");
+
+        // The next prompt's LAST line renders the same masked bytes.
+        assert_eq!(
+            driver.last_observation.as_deref(),
+            Some(expected),
+            "prompt input holds masked bytes only"
+        );
+
+        // The trace records the secret digest — the host's only record
+        // of which secret was present — aligned with the observation.
+        assert_ne!(report.secret_digest, 0, "secret digest is nonzero");
+        assert_eq!(trace.secret_digests(), &[report.secret_digest]);
     }
 }

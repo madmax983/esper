@@ -110,13 +110,18 @@ pub struct SeedSnapshot {
     pub model_bundle: u64,
     /// The inference buffer policy the journal is bound to (E3).
     pub inference: InferenceSettings,
+    /// The context-byte rollover trigger (E4, SPEC §20.4): `Some(b)`
+    /// arms the 80% compaction trigger; `None` disables rollover.
+    /// Part of run identity: a continuation carries the remaining
+    /// budget, never a widened one.
+    pub context_budget_bytes: Option<u64>,
     /// The continuation binding the journal is bound to (E4,
     /// SPEC §20.6); `None` for root runs.
     pub parent: Option<Lineage>,
 }
 
 impl SeedSnapshot {
-    /// The canonical 133-byte encoding carried as the Waymaker
+    /// The canonical 142-byte encoding carried as the Waymaker
     /// `RunStarted` record's input. Fixed layout, little-endian; the
     /// replay cursor compares it byte for byte.
     ///
@@ -126,11 +131,13 @@ impl SeedSnapshot {
     /// `write_pins` (8), `write_count` (1), `sensors` (4),
     /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1),
     /// `model_bundle` (8), `inference` (4: `max_prompt_bytes`,
-    /// `max_output_bytes`), parent tag (1), parent lineage (65).
+    /// `max_output_bytes`), parent tag (1), parent lineage (65),
+    /// context-budget tag (1), context-budget value (8).
     /// Every identity-bearing field of the seed is bound, including
-    /// the continuation binding: a child seed's snapshot differs
-    /// from its parent's, and two children continued at different
-    /// frames differ from each other.
+    /// the rollover trigger and the continuation binding: a child
+    /// seed's snapshot differs from its parent's, two children
+    /// continued at different frames differ from each other, and a
+    /// seed with a context budget differs from one without.
     ///
     /// The lineage encoding is `parent_run` (8),
     /// `continued_at_frame` (4), `budgets_remaining` (25:
@@ -138,10 +145,12 @@ impl SeedSnapshot {
     /// `elapsed_ms` (8), `radio_bytes` (4), `mutations` (2),
     /// `consecutive_errors` (1)), `versions` (28: `workflow` (4),
     /// `model` (8), `catalog` (8), `policy` (8)). A `None` parent
-    /// encodes the tag `0` with 65 zero bytes.
+    /// encodes the tag `0` with 65 zero bytes. The context budget
+    /// encodes the tag `0` with 8 zero bytes for `None`, else tag `1`
+    /// and the little-endian value.
     #[must_use]
-    pub const fn input_bytes(&self) -> [u8; 133] {
-        let mut out = [0u8; 133];
+    pub const fn input_bytes(&self) -> [u8; 142] {
+        let mut out = [0u8; 142];
         let id = self.id.to_le_bytes();
         let elapsed = self.elapsed_ms.to_le_bytes();
         let input_tokens = self.input_tokens.to_le_bytes();
@@ -180,16 +189,24 @@ impl SeedSnapshot {
         out[53] = self.allow_timer as u8;
         out[54] = self.allow_status as u8;
         out[67] = self.parent.is_some() as u8;
-        match self.parent {
-            Some(lineage) => {
-                let encoded = lineage_bytes(&lineage);
-                let mut k = 0;
-                while k < 65 {
-                    out[68 + k] = encoded[k];
-                    k += 1;
-                }
+        if let Some(lineage) = self.parent {
+            let encoded = lineage_bytes(&lineage);
+            let mut k = 0;
+            while k < 65 {
+                out[68 + k] = encoded[k];
+                k += 1;
             }
-            None => {}
+        }
+        // E4: the context-budget trigger is identity. Tag 1 carries
+        // the little-endian value; tag 0 leaves eight zero bytes.
+        out[133] = self.context_budget_bytes.is_some() as u8;
+        if let Some(budget) = self.context_budget_bytes {
+            let bytes = budget.to_le_bytes();
+            let mut k = 0;
+            while k < 8 {
+                out[134 + k] = bytes[k];
+                k += 1;
+            }
         }
         out
     }
@@ -322,6 +339,7 @@ impl RunSeed {
             allow_status: self.capabilities.allow_status,
             model_bundle: self.model_bundle,
             inference: self.inference,
+            context_budget_bytes: self.context_budget_bytes,
             parent: self.parent,
         }
     }
@@ -397,13 +415,13 @@ mod tests {
     }
 
     /// Every identity-bearing field of the seed is bound in the
-    /// 133-byte canonical encoding: changing any one of them changes
+    /// 142-byte canonical encoding: changing any one of them changes
     /// the bytes the Waymaker `RunStarted` record carries.
     #[test]
     fn input_bytes_binds_every_field() {
         let base = RunSeed::default_slice().snapshot();
         let base_bytes = base.input_bytes();
-        assert_eq!(base_bytes.len(), 133);
+        assert_eq!(base_bytes.len(), 142);
 
         let variants = [
             SeedSnapshot { id: 1, ..base },
@@ -480,6 +498,14 @@ mod tests {
             },
             SeedSnapshot {
                 parent: Some(test_lineage(13)),
+                ..base
+            },
+            SeedSnapshot {
+                context_budget_bytes: Some(1024),
+                ..base
+            },
+            SeedSnapshot {
+                context_budget_bytes: Some(2048),
                 ..base
             },
         ];

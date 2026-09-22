@@ -679,8 +679,8 @@ impl core::fmt::Write for PromptWriter<'_> {
 mod tests {
     use super::{
         BackendError, DistillEntry, InferenceSettings, ModelBackend, OUTPUT_CAP, OUTPUT_CAP_U16,
-        PROMPT_CAP, PROMPT_CAP_U16, PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend,
-        build_prompt, fingerprint_prompt, fnv1a64, write_stale_marker,
+        PROMPT_CAP, PROMPT_CAP_U16, PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES,
+        TinyBackend, build_prompt, fingerprint_prompt, fnv1a64, write_stale_marker,
     };
 
     // The 4096-byte target-board allowance for the distilled table,

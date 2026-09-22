@@ -2200,3 +2200,73 @@ no reboot test yet (the runtime owns journal rollover), no
 measured false-positive rate, no firmware size numbers for the
 new modules — those arrive with the runtime integration and the
 eval crew.
+
+### 20.8 Runtime wiring (E4)
+
+The runtime integrates the E4 context lifecycle (masking,
+compaction, snapshot verification, `continue_as_new`) into the
+durable ReAct loop. The public API is `drive_segment` (one driver
+lifetime), `SegmentOutcome` (`Completed` / `Suspended` /
+`Rollover`), and `RolloverHandoff` (the verified parent fold).
+`drive_run` chains segments; each child owns a fresh journal.
+
+**Seed identity.** The 142-byte canonical seed snapshot binds
+`context_budget_bytes` (the rollover trigger) as a tagged
+`Option<u64>` alongside the parent lineage. A seed with a budget
+differs from one without; a child differs from its parent; two
+children folded at different frames differ from each other.
+Recovery compares the snapshot byte for byte — a reboot can never
+widen the budget or swap the model.
+
+**Masking.** `do_observe` masks the tool outcome before it reaches
+the journal, the Waymaker cursor, `last_observation`, or the next
+prompt. Each `ToolObservation` frame carries its `secret_digest`
+(`0` for no secret); the trace accumulates one digest per
+observation in journal order. A reboot rebuilds the real digest
+stream from the frames — the raw secret bytes are gone by design,
+but the host's digest record survives.
+
+**Rollover.** `do_gather` fires the 80% trigger when the seed
+carries a context budget. The fold summarizes frames, compacts with
+`DEFAULT_POLICY`, encodes, read-back verifies, and runs
+`continue_as_new` (the no-widen proof) before returning
+`SegmentOutcome::Rollover`. The handoff carries the verified
+snapshot bytes, the lineage (parent run, cut frame, remaining
+budgets, versions), the segment's prompt bytes, and the digest
+stream.
+
+**Continuation.** `RolloverHandoff::child_seed` derives the child
+with narrowed budgets, a shrunken context budget
+(`saturating_sub` — the parent's spend never widens the child), and
+the parent lineage. The child boots on a fresh journal; the
+snapshot re-verifies on every boot, and corrupt bytes fail closed
+before a single frame replays. `drive_segment` enforces the
+pairing: a child seed requires a handoff; a root forbids one.
+
+**Failed paths.** The fold carries ruled-out `(tool, args_digest)`
+pairs. `do_authorize` refuses an identical call before it burns a
+turn or touches hardware — the run degrades with
+`failed_path_ruled_out` instead of re-proving the failure.
+
+**Prompt metering.** Each `ModelDecision` frame carries its
+prompt's byte length. The meter sums the journal on boot, so
+suspend/resume across `drive_segment` calls keeps the 80% trigger
+exact. A new segment starts at zero; the child's budget is the
+parent's minus the parent's spend.
+
+**Reference posture.** A continued prompt never carries raw
+folded bytes: any reference to a compacted frame's payload renders
+as `[stale:folded@epoch=N]`, naming the fold epoch. The `PriorCtx`
+summarizes the inherited fold (failed/pending/fact counts) for the
+child's prompt. The full three-case resolver (compacted payload →
+stale marker; compact identity → `CompactState` lookup; active-tail
+payload → masked bytes; never invent content) is specified but not
+yet implemented as a unified function — the current wiring covers
+the PRIOR summary and the stale marker.
+
+**What E4 does not claim.** The masking scope is tool observations
+only; model-emitted secrets in decisions are not yet redacted at
+ingestion. Multi-rollover chains (grandchild segments) are
+untested. The eval crew's staged fixtures (`w`, `x`) exercise the
+runtime through the harness; the byte-measurement rows in §20.7
+await the integrated run.

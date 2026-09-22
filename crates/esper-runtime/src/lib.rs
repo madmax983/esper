@@ -64,7 +64,7 @@ pub use esper_core::registry::Capabilities;
 pub use seed::{ESPER_WORKFLOW_KIND, RunSeed, WORKFLOW_VERSION};
 
 #[cfg(feature = "host")]
-pub use engine::{drive_run, drive_run_async};
+pub use engine::{RolloverHandoff, SegmentOutcome, drive_run, drive_run_async, drive_segment};
 #[cfg(feature = "host")]
 pub use journal::{Frame, Journal};
 #[cfg(feature = "host")]
