@@ -208,7 +208,7 @@ pub fn drive_run(
         monitor: Monitor::new(),
         allocator: EffectIdAllocator::for_run(run),
         cursor: ReplayCursor::new(run),
-        seed_input: [0u8; 67],
+        seed_input: [0u8; 133],
         repair_used: 0,
         turns_used: 0,
         mutations_used: 0,
@@ -292,7 +292,7 @@ struct Driver<'a> {
     cursor: ReplayCursor,
     /// The canonical seed bytes for the `RunStarted` record.
     // HOST-ONLY (E0/E1)
-    seed_input: [u8; 67],
+    seed_input: [u8; 133],
     /// Invalid lines committed this run.
     repair_used: u8,
     /// Model turns consumed this run.
@@ -772,6 +772,9 @@ impl Driver<'_> {
             mutations_left: self.budget.mutations,
             last_observation: self.last_observation.as_deref(),
             repair: self.repair_hint(),
+            // E4 wiring lands with the rollover slice; root runs
+            // carry no folded history.
+            prior: None,
         };
         let plen = build_prompt(
             &ctx,

@@ -47,7 +47,7 @@ pub use backend::ScriptedBackend;
 // vocabulary it names is public so cassettes stay authorable.
 pub use backend::{
     BackendError, BundleId, DistillEntry, InferenceSettings, ModelBackend, OUTPUT_CAP, PROMPT_CAP,
-    PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend, TokenUsage, build_prompt,
+    PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend, TokenUsage, build_prompt,
     fingerprint_prompt, fnv1a64,
 };
 #[cfg(feature = "host")]

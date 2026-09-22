@@ -477,6 +477,44 @@ pub struct PromptCtx<'a> {
     pub last_observation: Option<&'a [u8]>,
     /// The repair hint, when an invalid line already burned a turn.
     pub repair: Option<RepairHint>,
+    /// The folded-history marker, when this run continues a
+    /// compacted parent (E4, SPEC §20.5). `None` for root runs.
+    pub prior: Option<PriorCtx>,
+}
+
+/// The folded-history marker for a continued run's prompt (E4,
+/// SPEC §20.5).
+///
+/// When a run continues after a rollover, its prompt carries one
+/// fixed line naming the compact epoch the parent's history was
+/// folded into, plus the compact-state counts the child inherits.
+/// The parent's raw bytes are gone by construction: any reference
+/// to a compacted frame resolves to the stale marker, never to the
+/// original payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorCtx {
+    /// The compact epoch (`continued_at_frame`) the parent folded at.
+    pub epoch: u32,
+    /// Ruled-out paths inherited from the parent fold.
+    pub failed_paths: u8,
+    /// Open obligations inherited from the parent fold.
+    pub pending: u8,
+    /// Retained facts inherited from the parent fold.
+    pub facts: u8,
+}
+
+/// Render the stale-reference marker `[stale:folded@epoch=N]`
+/// into `out`, returning the bytes written (E4, SPEC §20.5).
+///
+/// The marker is what any reference to a compacted frame's payload
+/// resolves to: it names the compact epoch the frame was folded
+/// into and carries no original bytes, so content is never
+/// invented. The caller must provide at least 31 bytes.
+pub(crate) fn write_stale_marker(epoch: u32, out: &mut [u8]) -> usize {
+    use core::fmt::Write as _;
+    let mut writer = PromptWriter::new(out);
+    let _ = write!(writer, "[stale:folded@epoch={epoch}]");
+    writer.pos()
 }
 
 /// The grammar one-liner the REPAIR line carries: the decision grammar
@@ -501,6 +539,7 @@ const TRUNCATED_MARKER: &str = "[truncated]\n";
 /// TOOLS
 /// <render_signature of each of the 6 catalog tools>
 /// STATE turns=<n> muts=<n>
+/// PRIOR [stale:folded@epoch=<e>] failed=<n> pending=<n> facts=<n>
 /// REPAIR <attempt>:<variant> <grammar one-liner>
 /// LAST <observation bytes>
 /// EMIT one decision line.
@@ -509,18 +548,24 @@ const TRUNCATED_MARKER: &str = "[truncated]\n";
 /// The TOOLS block names every tool the model may call, rendered by
 /// `esper_protocol::render_signature` from the single contract source
 /// (SPEC §17.3) — the model sees the signatures, never a bare tool
-/// list. The REPAIR line appears only after an invalid line burned a
+/// list. The PRIOR line appears only in a continued run (after a
+/// rollover): it carries the stale marker of §20.5 — the compact
+/// epoch the parent's history was folded into — plus the inherited
+/// failed-path, pending-obligation, and fact counts. The parent's
+/// raw bytes never appear in a continued prompt: any reference to a
+/// compacted frame resolves to the marker, never to the original
+/// payload. The REPAIR line appears only after an invalid line burned a
 /// turn, and carries the attempt, the §4.4 variant, and the grammar
 /// one-liner again. The LAST line appears only after a tool reported,
 /// and carries the observation bytes raw (already bounded machine
 /// JSON, capped at 128 bytes by the engine).
 ///
-/// Truncation rule: the TOOLS block, the STATE line, the REPAIR line,
-/// and the EMIT trailer are fixed — they are never truncated. Only
-/// the LAST observation tail may truncate, and then it ends with
-/// `[truncated]`. The framing around the signatures is abbreviated
-/// (`turns=`/`muts=`) so the fixed prompt — signatures plus framing —
-/// always fits `PROMPT_CAP`; a unit test pins this budget, so
+/// Truncation rule: the TOOLS block, the STATE line, the PRIOR line,
+/// the REPAIR line, and the EMIT trailer are fixed — they are never
+/// truncated. Only the LAST observation tail may truncate, and then
+/// it ends with `[truncated]`. The framing around the signatures is
+/// abbreviated (`turns=`/`muts=`) so the fixed prompt — signatures plus
+/// framing — always fits `PROMPT_CAP`; a unit test pins this budget, so
 /// signature growth fails loudly instead of silently squeezing the
 /// observation. (A narrowed `max_prompt_bytes` truncates
 /// deterministically head-first, the same saturation discipline as
@@ -541,6 +586,18 @@ pub fn build_prompt(ctx: &PromptCtx, out: &mut [u8]) -> usize {
         "STATE turns={} muts={}",
         ctx.turns_left, ctx.mutations_left
     );
+    if let Some(prior) = ctx.prior {
+        // The folded-history marker: fixed line, never truncated.
+        let _ = writer.write_str("PRIOR ");
+        let mut marker = [0u8; 32];
+        let marker_len = write_stale_marker(prior.epoch, &mut marker);
+        let _ = writer.write_bytes(marker.get(..marker_len).unwrap_or(&[]));
+        let _ = writeln!(
+            writer,
+            " failed={} pending={} facts={}",
+            prior.failed_paths, prior.pending, prior.facts
+        );
+    }
     if let Some(hint) = ctx.repair {
         let _ = writeln!(
             writer,
@@ -622,8 +679,8 @@ impl core::fmt::Write for PromptWriter<'_> {
 mod tests {
     use super::{
         BackendError, DistillEntry, InferenceSettings, ModelBackend, OUTPUT_CAP, OUTPUT_CAP_U16,
-        PROMPT_CAP, PROMPT_CAP_U16, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend,
-        build_prompt, fingerprint_prompt, fnv1a64,
+        PROMPT_CAP, PROMPT_CAP_U16, PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend,
+        build_prompt, fingerprint_prompt, fnv1a64, write_stale_marker,
     };
 
     // The 4096-byte target-board allowance for the distilled table,
@@ -690,6 +747,7 @@ mod tests {
             mutations_left: 4,
             last_observation: None,
             repair: None,
+            prior: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -725,6 +783,7 @@ mod tests {
                 attempt: 1,
                 variant: "malformed",
             }),
+            prior: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -743,6 +802,7 @@ mod tests {
             mutations_left: 3,
             last_observation: Some(b"{\"pin\":4,\"level\":\"low\"}"),
             repair: None,
+            prior: None,
         };
         let n = build_prompt(&ctx, &mut out);
         let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
@@ -751,6 +811,54 @@ mod tests {
             "the LAST line carries the observation bytes raw"
         );
         assert!(text.ends_with("EMIT one decision line.\n"));
+    }
+
+    #[test]
+    fn build_prompt_renders_the_prior_line_for_continued_runs() {
+        // HOST-ONLY (E3)
+        let mut out = [0u8; PROMPT_CAP];
+        // A root run carries no PRIOR line.
+        let root = PromptCtx {
+            turns_left: 9,
+            mutations_left: 3,
+            last_observation: None,
+            repair: None,
+            prior: None,
+        };
+        let n = build_prompt(&root, &mut out);
+        let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
+        assert!(!text.contains("PRIOR"), "root runs have no PRIOR line");
+        // A continued run names the compact epoch as a stale marker
+        // and carries the inherited counts; the parent's raw bytes
+        // never appear.
+        let child = PromptCtx {
+            turns_left: 9,
+            mutations_left: 3,
+            last_observation: None,
+            repair: None,
+            prior: Some(PriorCtx {
+                epoch: 12,
+                failed_paths: 1,
+                pending: 0,
+                facts: 2,
+            }),
+        };
+        let n = build_prompt(&child, &mut out);
+        let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
+        assert!(
+            text.contains("PRIOR [stale:folded@epoch=12] failed=1 pending=0 facts=2\n"),
+            "the PRIOR line names the epoch and the inherited counts, got: {text}"
+        );
+        assert!(text.ends_with("EMIT one decision line.\n"));
+    }
+
+    #[test]
+    fn stale_marker_names_the_epoch_and_carries_no_payload() {
+        let mut out = [0u8; 32];
+        let n = write_stale_marker(0, &mut out);
+        assert_eq!(&out[..n], b"[stale:folded@epoch=0]");
+        let n = write_stale_marker(4_294_967_295, &mut out);
+        assert_eq!(&out[..n], b"[stale:folded@epoch=4294967295]");
     }
 
     /// The hard rule: the six signature lines are never truncated.
@@ -769,6 +877,7 @@ mod tests {
             mutations_left: 4,
             last_observation: None,
             repair: None,
+            prior: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -801,6 +910,7 @@ mod tests {
                 attempt: u8::MAX,
                 variant: "invalid_args",
             }),
+            prior: None,
         };
         let n = build_prompt(&ctx, &mut out);
         assert!(
@@ -828,6 +938,7 @@ mod tests {
             mutations_left: 4,
             last_observation: Some(&observation),
             repair: None,
+            prior: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
