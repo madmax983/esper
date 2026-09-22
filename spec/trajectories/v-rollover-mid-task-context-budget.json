@@ -1,1 +1,93 @@
-{"crash_plan":[],"device":{"faults":[],"pins":{"4":{"direction":"out","level":"low"},"5":{"direction":"out","level":"low"},"6":{"direction":"out","level":"low"}}},"expected":{"budget_remaining":{"model_turns":0,"mutations":0},"forbidden":[],"invariants":["single_logical_terminal","budgets_never_widen"],"terminal_status":"Completed","trace":[]},"id":"rollover-mid-task-context-budget","input_events":[],"narrative":"STAGED (not a golden fixture yet): a long successful script with a small context_budget_bytes (512). Context crosses 80% of the budget mid-script, so the runtime must compact and continue_as_new mid-task and still finish. Proves long tasks survive journal rollover.","run_seed":{"budget":{"consecutive_errors":3,"elapsed_ms":60000,"input_tokens":12000,"model_turns":39,"mutations":18,"output_tokens":1000,"radio_bytes":0},"capabilities":{"read_pins":[4,5,6],"write_pins":[4,5,6]},"context_budget_bytes":512,"workflow_version":1},"script":["CALL gpio_pin_read {\"pin\": 4}","CALL gpio_pin_read {\"pin\": 5}","CALL gpio_pin_read {\"pin\": 6}","CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}","CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}","CALL gpio_pin_write {\"pin\": 6, \"level\": \"high\"}","CALL gpio_pin_read {\"pin\": 4}","CALL gpio_pin_write {\"pin\": 4, \"level\": \"low\"}","CALL gpio_pin_write {\"pin\": 5, \"level\": \"low\"}","CALL gpio_pin_write {\"pin\": 6, \"level\": \"low\"}","CALL gpio_pin_read {\"pin\": 5}","CALL gpio_pin_read {\"pin\": 6}","FINISH {\"status\": \"completed\", \"summary\": \"cycled pins 4-6 high then low, verified\"}"],"spec_version":1,"staging_note":"STAGED: expected.trace is TBD pending the runtime crew's rollover commit and the \u00a720.8 trace shape (what a continue_as_new looks like in the trace). The script itself is proven: it is the m-long-success measurement trajectory, which drives green (38 frames, 1163 payload bytes, rollover trigger at ~410 bytes lands mid-script). budget_remaining is TBD: the continuation must not widen budgets (ADR 10), but whether the rollover consumes model turns is runtime behavior. To finalize: move to spec/trajectories/v-rollover-mid-task-context-budget.json, run through the runner, verify each trace event per the SPEC contract, then set expectations.","title":"STAGED: rollover mid-task on a small context budget"}
+{
+  "crash_plan": [],
+  "device": {
+    "faults": [],
+    "pins": {
+      "4": {
+        "direction": "out",
+        "level": "low"
+      },
+      "5": {
+        "direction": "out",
+        "level": "low"
+      },
+      "6": {
+        "direction": "out",
+        "level": "low"
+      }
+    }
+  },
+  "expected": {
+    "budget_remaining": {
+      "model_turns": 26,
+      "mutations": 12
+    },
+    "forbidden": [],
+    "invariants": [
+      "single_logical_terminal",
+      "budgets_never_widen"
+    ],
+    "terminal_status": "Completed",
+    "trace": [
+      {
+        "kind": "ModelDecision",
+        "class": "Finish",
+        "finish": {
+          "status": "completed",
+          "summary": "cycled pins 4-6 high then low, verified"
+        }
+      },
+      {
+        "kind": "TerminalResult",
+        "status": "Completed",
+        "reason": "model_finished",
+        "summary": "cycled pins 4-6 high then low, verified"
+      }
+    ]
+  },
+  "id": "rollover-mid-task-context-budget",
+  "input_events": [],
+  "narrative": "A long successful script (13 decisions: 6 reads, 6 writes, 1 finish) with a small context_budget_bytes (512). Context crosses 80% of the budget mid-script, so the runtime compacts and continues as new mid-task across multiple generations, then finishes. Started with 39 model turns / 18 mutations; 13 turns and 6 mutations were consumed; 26 turns / 12 mutations remain. The returned trace carries only the terminal segment's two events (the Finish decision and the Completed terminal); earlier generations' events are folded into the compact snapshot, not replayed in the trace. The device write ledger (6 records: pins 4-6 high then low) proves all six writes dispatched exactly once across the rollover chain.",
+  "run_seed": {
+    "budget": {
+      "consecutive_errors": 3,
+      "elapsed_ms": 60000,
+      "input_tokens": 12000,
+      "model_turns": 39,
+      "mutations": 18,
+      "output_tokens": 1000,
+      "radio_bytes": 0
+    },
+    "capabilities": {
+      "read_pins": [
+        4,
+        5,
+        6
+      ],
+      "write_pins": [
+        4,
+        5,
+        6
+      ]
+    },
+    "context_budget_bytes": 512,
+    "workflow_version": 1
+  },
+  "script": [
+    "CALL gpio_pin_read {\"pin\": 4}",
+    "CALL gpio_pin_read {\"pin\": 5}",
+    "CALL gpio_pin_read {\"pin\": 6}",
+    "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+    "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
+    "CALL gpio_pin_write {\"pin\": 6, \"level\": \"high\"}",
+    "CALL gpio_pin_read {\"pin\": 4}",
+    "CALL gpio_pin_write {\"pin\": 4, \"level\": \"low\"}",
+    "CALL gpio_pin_write {\"pin\": 5, \"level\": \"low\"}",
+    "CALL gpio_pin_write {\"pin\": 6, \"level\": \"low\"}",
+    "CALL gpio_pin_read {\"pin\": 5}",
+    "CALL gpio_pin_read {\"pin\": 6}",
+    "FINISH {\"status\": \"completed\", \"summary\": \"cycled pins 4-6 high then low, verified\"}"
+  ],
+  "spec_version": 1,
+  "title": "rollover mid-task on a small context budget"
+}

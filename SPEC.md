@@ -2221,8 +2221,8 @@ trajectory:
 | Full-history context bytes | sum of frame payload bytes before compaction | long-success: 1163 B (38 frames); failure-heavy: 513 B (14 frames); secret-bearing: 407 B (9 frames) |
 | Masked-tail context bytes | bytes after `mask_bytes` over the folded region | long-success: 194 B; failure-heavy: 223 B; secret-bearing: 199 B |
 | Compact-state bytes | `snapshot::encoded_len` of the resulting state | long-success: 269 B; failure-heavy: 223 B; secret-bearing: 165 B |
-| Failed-path repeats after rollover | count of retried `(tool, args_digest)` in `failed_paths()` | — (pending runtime rollover; fixture `x` staged) |
-| Lost obligations after rollover | `pending()` items unresolved at the new run's first ask gate | — (pending runtime rollover; fixture `w` staged) |
+| Failed-path repeats after rollover | count of retried `(tool, args_digest)` in `failed_paths()` | 0 — fixture `x`: the pin-5 re-attempt was refused (`failed_path_ruled_out`); device ledger holds exactly 1 pin-5 write record across 2 rollovers + 1 reboot |
+| Lost obligations after rollover | `pending()` items unresolved at the new run's first ask gate | 0 — fixture `w`: the pending Ask survived rollover + reboot; the rebooted child consumed the queued approval input and completed |
 | Masking false-positive rate | redacted spans over benign-shape inputs, human-judged | 10% — 2 of 20 benign inputs redacted (`{"uptime_ms": 1234567}`, an ISO date) |
 
 Note on the byte tiers: `compact < masked-tail` is
@@ -2245,10 +2245,15 @@ harness — three representative trajectories with printed table
 rows, the false-positive probe, and the negative tests — lives in
 `crates/esper-eval` (`src/measure.rs`, `tests/e4_measure.rs`,
 `tests/e4_fp_probe.rs`, `tests/e4_negative.rs`). What E4 does *not* claim:
-no reboot test yet (the runtime owns journal rollover), no
-measured false-positive rate, no firmware size numbers for the
+no measured false-positive rate, no firmware size numbers for the
 new modules — those arrive with the runtime integration and the
-eval crew.
+eval crew. The four rollover fixtures (`v`, `w`, `x`, `y`) are
+finalized and green: `v` proves a 13-decision task survives multiple
+mid-task rollovers; `w` proves a pending Ask survives rollover plus
+a crash at `AwaitInput`; `x` proves a ruled-out write is refused
+(not redispatched) after two rollovers; `y` is a boundary fixture
+proving the masking scope ends at tool observations (model-emitted
+text is not redacted).
 
 ### 20.8 Runtime wiring (E4)
 
@@ -2299,8 +2304,12 @@ before a single frame replays. `drive_segment` enforces the
 pairing: a child seed requires a handoff; a root forbids one.
 
 **Failed paths.** The fold carries ruled-out `(tool, args_digest)`
-pairs. `do_authorize` refuses an identical call before it burns a
-turn or touches hardware — the run degrades with
+pairs cumulatively across generations: a child merges its segment's
+frames into the parent's compact state (not a fresh state), so the
+second rollover does not drop the first fold's negative info.
+`do_authorize` refuses an identical call before it burns a mutation
+or touches hardware — the decision turn is consumed, but no
+`ToolRequest` is committed and the run degrades with
 `failed_path_ruled_out` instead of re-proving the failure.
 
 **Prompt metering.** Each `ModelDecision` frame carries its
@@ -2322,7 +2331,7 @@ the PRIOR summary and the stale marker.
 
 **What E4 does not claim.** The masking scope is tool observations
 only; model-emitted secrets in decisions are not yet redacted at
-ingestion. Multi-rollover chains (grandchild segments) are
-untested. The eval crew's staged fixtures (`w`, `x`) exercise the
-runtime through the harness; the byte-measurement rows in §20.7
-await the integrated run.
+ingestion (fixture `y` proves this boundary). Multi-rollover chains
+are tested: fixture `v` runs a 13-decision task across multiple
+generations, and fixture `x` proves the cumulative fold carries
+failed paths across two rollovers plus a reboot.

@@ -1075,11 +1075,19 @@ impl Driver<'_> {
     fn do_rollover(&self) -> Result<SegmentOutcome, Halt> {
         // HOST-ONLY (E4)
         let summaries = self.summarize_frames();
-        let mut state = CompactState::new(
-            Digest::new(self.seed.id.get()),
-            self.budget,
-            self.version_set(),
-        );
+        // E4 (SPEC §20.8): the fold is cumulative across generations.
+        // A child merges its segment's frames into the parent's compact
+        // state so ruled-out paths, obligations, and facts survive
+        // multiple rollovers; a root segment starts fresh. Without the
+        // inheritance, the second rollover would drop the first fold's
+        // negative info and re-dispatch a ruled-out path.
+        let mut state = self.compact.unwrap_or_else(|| {
+            CompactState::new(
+                Digest::new(self.seed.id.get()),
+                self.budget,
+                self.version_set(),
+            )
+        });
         compact(&summaries, &DEFAULT_POLICY, &mut state).map_err(RuntimeError::Core)?;
         let mut bytes = vec![0u8; encoded_len(&state)];
         let written = encode(&state, &mut bytes).map_err(RuntimeError::Core)?;
