@@ -27,7 +27,6 @@ pub mod fixture;
 pub mod json;
 pub mod measure;
 pub mod runner;
-
 pub use esper_runtime::RunSeed;
 pub use fixture::{Fixture, FixtureError, parse_fixture};
 pub use measure::{ContextMeasurement, measure_fixture_context, measure_journal};

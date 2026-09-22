@@ -12,7 +12,7 @@ use esper_runtime::{
     CrashPoint, FakeDevice, FaultPlan, InferenceSettings, InputPlan, Journal, ModelBackend,
     RunSeed, ScriptedBackend, TraceEvent, drive_run,
 };
-use waymaker_core::EffectSeq;
+use waymaker_core::{EffectId, EffectSeq, RunId as WaymakerRunId};
 
 /// Build the scripted backend for one run.
 fn backend(script: Vec<&str>) -> ScriptedBackend {
@@ -299,13 +299,16 @@ fn status_full_payload_is_canonical() {
 #[test]
 fn gpio_write_redelivery_executes_one_physical_write() {
     let mut device = FakeDevice::new();
-    let seq = EffectSeq(1);
+    let id = EffectId {
+        run: WaymakerRunId(7),
+        seq: EffectSeq(1),
+    };
     let digest = 99u64;
     let first = device
-        .dispatch_write(pin(4), true, seq, digest)
+        .dispatch_write(pin(4), true, id, digest)
         .expect("first dispatch");
     let second = device
-        .dispatch_write(pin(4), true, seq, digest)
+        .dispatch_write(pin(4), true, id, digest)
         .expect("redelivery");
     assert_eq!(first, second);
     assert_eq!(device.physical_writes(), 1);

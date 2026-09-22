@@ -165,14 +165,15 @@ fn rollover_at_80_percent_folds_and_continues_as_child() {
         "the handoff carries the segment meter"
     );
 
-    // The child seed narrows everything: remaining budgets, shrunken
-    // context budget, parent linkage.
+    // The child seed narrows the consumables (remaining budgets, never
+    // widened) and links the parent; the context budget is per-segment
+    // capacity, so the child inherits the full budget, not the dregs.
     let child = handoff.child_seed(&seed);
     assert!(child.parent.is_some(), "the child names its parent");
     assert_eq!(
         child.context_budget_bytes,
-        Some(10000u64.saturating_sub(trace.prompt_bytes_used())),
-        "the child's context budget shrinks by the parent's spend"
+        Some(10000),
+        "the child's context budget is the same per-segment capacity"
     );
     assert_eq!(
         child.model_turns,
@@ -420,4 +421,70 @@ fn corrupt_snapshot_fails_closed_before_boot() {
         result.is_err(),
         "a corrupt snapshot must fail closed, not boot"
     );
+}
+
+/// Multi-rollover chains: every generation restarts its sequence space
+/// on a fresh journal, but the device deduplicates on the full
+/// `(run, seq)` effect identity — so a child's dispatches never collide
+/// with its parent's in the shared device. Before the E4 fix the second
+/// generation's first tool call died with `ReplayDiverged` (a
+/// `WorldError::EffectArgsMismatch` underneath: same bare sequence,
+/// different argument digest). The chain below rolls over repeatedly,
+/// each child dispatching real tool calls against the same device, and
+/// finishes with its lineage intact.
+#[test]
+fn multi_rollover_chain_dispatches_without_effect_identity_collision() {
+    let mut lines: Vec<&str> = vec!["CALL gpio_pin_read {\"pin\": 4}"; 20];
+    lines.push("FINISH {\"status\": \"completed\", \"summary\": \"chain done\"}");
+    let mut backend = make_backend(lines);
+    let mut device = FakeDevice::new();
+    let mut faults = FaultPlan::new();
+    let mut inputs = InputPlan::new(Vec::new());
+
+    let mut seed = RunSeed {
+        context_budget_bytes: Some(1000),
+        model_turns: 60,
+        ..seed(&backend, 7)
+    };
+    let mut handoff: Option<esper_runtime::RolloverHandoff> = None;
+    let mut rollovers = 0u32;
+    let trace = loop {
+        let mut journal = Journal::new();
+        let outcome = drive_segment(
+            &seed,
+            &mut journal,
+            &mut backend,
+            &mut device,
+            &mut faults,
+            &mut inputs,
+            None,
+            handoff.take(),
+        )
+        .expect("every chained segment must boot and dispatch");
+        match outcome {
+            SegmentOutcome::Rollover(_, next) => {
+                rollovers += 1;
+                assert!(
+                    rollovers < 30,
+                    "the chain should finish, not roll over forever"
+                );
+                let child = next.child_seed(&seed);
+                assert_eq!(
+                    child.parent.expect("child names its parent").parent_run,
+                    seed.id,
+                    "lineage links every generation to its parent"
+                );
+                seed = child;
+                handoff = Some(next);
+            }
+            SegmentOutcome::Completed(trace) => break trace,
+            SegmentOutcome::Suspended(_) => panic!("the script never asks"),
+        }
+    };
+
+    assert!(
+        rollovers >= 2,
+        "the chain must roll over at least twice to exercise the fix"
+    );
+    assert_eq!(trace.terminal_status(), Some(TerminalStatus::Completed));
 }

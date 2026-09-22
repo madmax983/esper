@@ -38,7 +38,8 @@ use esper_core::snapshot::{decode, encode, encoded_len, verify};
 use esper_core::state::{Event, State, TerminalStatus, transition};
 use esper_protocol::PermissionClass;
 use waymaker_core::{
-    ActivityKind, EffectIdAllocator, EffectSeq, RecordRef, ReplayCursor, RunId as WaymakerRunId,
+    ActivityKind, EffectId, EffectIdAllocator, EffectSeq, RecordRef, ReplayCursor,
+    RunId as WaymakerRunId,
 };
 
 use crate::backend::{
@@ -189,8 +190,11 @@ pub struct RolloverHandoff {
     /// The lineage binding the child run to this segment: which run it
     /// continues, at which frame, with which remaining budgets.
     pub lineage: Lineage,
-    /// This segment's cumulative built-prompt bytes (E4, SPEC §20.4),
-    /// carried so the child's remaining context budget is exact.
+    /// This segment's cumulative built-prompt bytes (E4, SPEC §20.4):
+    /// the fold's prompt spend, recorded in the trace as observability.
+    /// The child's context budget is per-segment capacity and inherits
+    /// the parent's full budget (see [`RolloverHandoff::child_seed`]);
+    /// this meter is not subtracted from it.
     pub prompt_bytes: u64,
     /// This segment's masking digest stream (E4, SPEC §20.2), in
     /// journal order: one digest per committed observation, `0` where
@@ -203,11 +207,17 @@ impl RolloverHandoff {
     /// Build the child run's seed from the parent's (E4, SPEC §20.6).
     ///
     /// The child inherits the parent's capabilities, workflow version,
-    /// model bundle, inference settings, and shrunken context budget;
-    /// it starts with the lineage's remaining budgets, which
-    /// [`continue_as_new`] already proved do not widen the parent's.
-    /// The child run id derives deterministically from the parent id
-    /// and the cut frame.
+    /// model bundle, inference settings, and context budget; it starts
+    /// with the lineage's remaining budgets, which [`continue_as_new`]
+    /// already proved do not widen the parent's. The context budget is
+    /// per-segment capacity, not a consumable: each segment starts from
+    /// the compact state plus the verbatim tail (small by construction)
+    /// and may accumulate prompts up to the budget again. Inheriting the
+    /// remainder instead would shrink every generation's window toward
+    /// zero and make tasks longer than the budget uncompletable; the
+    /// same capacity is not a widening, and total work stays bounded by
+    /// the strictly decreasing consumable budgets. The child run id
+    /// derives deterministically from the parent id and the cut frame.
     #[must_use]
     pub fn child_seed(&self, parent: &RunSeed) -> RunSeed {
         // HOST-ONLY (E4)
@@ -229,9 +239,7 @@ impl RolloverHandoff {
             workflow_version: parent.workflow_version,
             model_bundle: parent.model_bundle,
             inference: parent.inference,
-            context_budget_bytes: parent
-                .context_budget_bytes
-                .map(|budget| budget.saturating_sub(self.prompt_bytes)),
+            context_budget_bytes: parent.context_budget_bytes,
             parent: Some(self.lineage),
         }
     }
@@ -1199,25 +1207,16 @@ impl Driver<'_> {
                     outcome,
                     ..
                 } => Self::summarize_observation(
-                    seq,
-                    *effect,
-                    *transient,
-                    outcome,
-                    &intents,
-                    frames,
-                    index,
+                    seq, *effect, *transient, outcome, &intents, frames, index,
                 ),
                 Frame::Verification {
                     seq: effect,
                     passed,
                     ..
                 } => Self::summarize_verification(seq, *effect, *passed, &intents),
-                Frame::ApprovalRequest { prompt, .. } => Self::summarize_approval_request(
-                    seq,
-                    prompt,
-                    last_decision,
-                    index,
-                ),
+                Frame::ApprovalRequest { prompt, .. } => {
+                    Self::summarize_approval_request(seq, prompt, last_decision, index)
+                }
                 Frame::ApprovalDecision { input } => Self::summarize_approval_decision(seq, input),
                 Frame::Terminal { .. } => FrameSummary {
                     seq,
@@ -1261,9 +1260,10 @@ impl Driver<'_> {
         // A write observation without a later verification leaves the
         // read-back open: an obligation the fold must carry.
         let pending_verification = if !transient && write {
-            !frames.iter().skip(index + 1).any(|later| {
-                matches!(later, Frame::Verification { seq: s, .. } if *s == effect)
-            })
+            !frames
+                .iter()
+                .skip(index + 1)
+                .any(|later| matches!(later, Frame::Verification { seq: s, .. } if *s == effect))
         } else {
             false
         };
@@ -1820,19 +1820,27 @@ impl Driver<'_> {
         }
         let seq = intent.seq;
         let digest = intent.digest;
+        // E4: the device deduplicates redelivery on the full effect
+        // identity (run, seq). The run id differs per segment, so a
+        // continued run's restarted sequence space can never collide
+        // with its parent's in the shared device.
+        let id = EffectId {
+            run: WaymakerRunId(self.seed.id.get()),
+            seq,
+        };
         match intent.tool_args {
-            ToolArgs::GpioPinRead { pin } => self.device.dispatch_read(pin, seq, digest),
+            ToolArgs::GpioPinRead { pin } => self.device.dispatch_read(pin, id, digest),
             ToolArgs::GpioPinWrite { pin, level } => {
                 self.device
-                    .dispatch_write(pin, level == Level::High, seq, digest)
+                    .dispatch_write(pin, level == Level::High, id, digest)
             }
             ToolArgs::SensorSampleRead { sensor } => {
-                self.device.dispatch_sensor_read(sensor, seq, digest)
+                self.device.dispatch_sensor_read(sensor, id, digest)
             }
-            ToolArgs::TimerUptimeRead => self.device.dispatch_uptime_read(seq, digest),
-            ToolArgs::TimerDelayWait { ms } => self.device.dispatch_delay_wait(ms, seq, digest),
+            ToolArgs::TimerUptimeRead => self.device.dispatch_uptime_read(id, digest),
+            ToolArgs::TimerDelayWait { ms } => self.device.dispatch_delay_wait(ms, id, digest),
             ToolArgs::DeviceStatusReport { detail } => {
-                self.device.dispatch_status_report(detail, seq, digest)
+                self.device.dispatch_status_report(detail, id, digest)
             }
         }
     }

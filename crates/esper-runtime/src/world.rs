@@ -19,9 +19,10 @@
 //! in-memory state (budgets, monitor, allocator, cursor) is rebuilt
 //! from the journal on recovery.
 //!
-//! Effect identity uses Waymaker's [`EffectSeq`]: the device
-//! deduplicates redelivery on the committed sequence, so a redelivered
-//! intent can never double-execute.
+//! Effect identity uses Waymaker's [`EffectId`]: the device
+//! deduplicates redelivery on the full (run, sequence) identity, so a
+//! redelivered intent can never double-execute — and a continued run's
+//! restarted sequence space can never collide with its parent's.
 //!
 //! // HOST-ONLY (E0/E1): heap-allocated doubles for the host test
 //! harness. The firmware port (E2) replaces these with the real model
@@ -29,7 +30,7 @@
 
 use esper_core::decision::Level;
 use esper_core::ids::Pin;
-use waymaker_core::EffectSeq;
+use waymaker_core::EffectId;
 
 use esper_core::decision::StatusDetail;
 
@@ -173,8 +174,12 @@ pub struct WriteRecord {
 /// A committed effect outcome, for redelivery deduplication.
 #[derive(Debug, Clone)]
 struct EffectRecord {
-    /// The stable effect identity.
-    seq: EffectSeq,
+    /// The stable effect identity: the run that minted it and its
+    /// sequence in that run's history. Keying on the full identity
+    /// (not the bare sequence) keeps continued runs — which restart
+    /// their sequence space on a fresh journal — from colliding in
+    /// the shared device's redelivery cache (E4).
+    id: EffectId,
     /// The digest of the committed intent's arguments.
     digest: u64,
     /// The outcome bytes to replay on redelivery.
@@ -185,7 +190,7 @@ struct EffectRecord {
 /// The fake device: GPIO, sensors, and a virtual clock with idempotent
 /// redelivery.
 ///
-/// Dispatch is keyed by ([`EffectSeq`], argument digest): a redelivered
+/// Dispatch is keyed by ([`EffectId`], argument digest): a redelivered
 /// intent replays its committed outcome without touching the device,
 /// and a redelivery whose arguments disagree with the committed intent
 /// is refused. At-least-once dispatch is therefore safe (SPEC ADR:
@@ -258,16 +263,16 @@ impl FakeDevice {
     pub fn dispatch_read(
         &mut self,
         pin: Pin,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let outcome = pin_level_json(pin.get(), self.pins[pin.get() as usize].1);
         // HOST-ONLY (E0/E1)
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -287,10 +292,10 @@ impl FakeDevice {
         &mut self,
         pin: Pin,
         level_high: bool,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let index = pin.get() as usize;
@@ -301,11 +306,11 @@ impl FakeDevice {
         self.ledger.push(WriteRecord {
             pin: pin.get(),
             level_high,
-            seq: seq.0,
+            seq: id.seq.0,
         });
         let outcome = pin_level_json(pin.get(), level_high);
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -342,17 +347,17 @@ impl FakeDevice {
     pub fn dispatch_sensor_read(
         &mut self,
         sensor: u8,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let value = sensor_value(sensor).ok_or(WorldError::UnknownResource)?;
         let outcome = sensor_json(sensor, value);
         // HOST-ONLY (E0/E1)
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -368,16 +373,16 @@ impl FakeDevice {
     /// id arrives with different arguments than the committed intent.
     pub fn dispatch_uptime_read(
         &mut self,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let outcome = uptime_json(self.clock_ms);
         // HOST-ONLY (E0/E1)
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -400,10 +405,10 @@ impl FakeDevice {
     pub fn dispatch_delay_wait(
         &mut self,
         ms: u16,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let t0 = self.clock_ms;
@@ -412,7 +417,7 @@ impl FakeDevice {
         let outcome = delay_json(target - t0, target);
         // HOST-ONLY (E0/E1)
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -429,10 +434,10 @@ impl FakeDevice {
     pub fn dispatch_status_report(
         &mut self,
         detail: StatusDetail,
-        seq: EffectSeq,
+        id: EffectId,
         digest: u64,
     ) -> Result<Vec<u8>, WorldError> {
-        if let Some(cached) = self.effect_outcome(seq, digest)? {
+        if let Some(cached) = self.effect_outcome(id, digest)? {
             return Ok(cached);
         }
         let outcome = match detail {
@@ -445,7 +450,7 @@ impl FakeDevice {
         };
         // HOST-ONLY (E0/E1)
         self.effects.push(EffectRecord {
-            seq,
+            id,
             digest,
             outcome: outcome.clone(),
         });
@@ -495,10 +500,10 @@ impl FakeDevice {
     }
 
     /// Look up a committed outcome for redelivery deduplication.
-    fn effect_outcome(&self, seq: EffectSeq, digest: u64) -> Result<Option<Vec<u8>>, WorldError> {
+    fn effect_outcome(&self, id: EffectId, digest: u64) -> Result<Option<Vec<u8>>, WorldError> {
         // HOST-ONLY (E0/E1)
         for record in &self.effects {
-            if record.seq == seq {
+            if record.id == id {
                 if record.digest != digest {
                     return Err(WorldError::EffectArgsMismatch);
                 }
@@ -584,9 +589,19 @@ fn status_full_json(uptime_ms: u32, dir: [u8; 8], level: [u8; 8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{status_full_json, status_summary_json};
-    use waymaker_core::EffectSeq;
+    use waymaker_core::{EffectId, EffectSeq, RunId};
 
     use super::FakeDevice;
+
+    /// A test effect identity on a fixed run: the device keys its
+    /// redelivery cache on the full `(run, seq)` identity (E4), so
+    /// tests name the run explicitly.
+    fn eid(run: u64, seq: u32) -> EffectId {
+        EffectId {
+            run: RunId(run),
+            seq: EffectSeq(seq),
+        }
+    }
 
     #[test]
     fn status_full_stays_within_128_bytes() {
@@ -624,27 +639,34 @@ mod tests {
     #[test]
     fn delay_redelivery_advances_the_clock_exactly_once() {
         let mut device = FakeDevice::new();
-        let seq = EffectSeq(1);
+        let id = eid(7, 1);
         let first = device
-            .dispatch_delay_wait(250, seq, 7)
+            .dispatch_delay_wait(250, id, 7)
             .expect("first dispatch");
-        let second = device.dispatch_delay_wait(250, seq, 7).expect("redelivery");
+        let second = device.dispatch_delay_wait(250, id, 7).expect("redelivery");
         assert_eq!(first, second);
         assert_eq!(device.clock_read(), 250);
         // A redelivery with different arguments is refused, not applied.
-        assert!(device.dispatch_delay_wait(100, seq, 8).is_err());
+        assert!(device.dispatch_delay_wait(100, id, 8).is_err());
         assert_eq!(device.clock_read(), 250);
+        // E4: the same sequence from a DIFFERENT run is a different
+        // effect, not a redelivery — continued runs restart their
+        // sequence space on a fresh journal. (The outcome bytes differ
+        // because the payload names the clock; the point is the
+        // dispatch is accepted, not refused as an args mismatch.)
+        device
+            .dispatch_delay_wait(250, eid(11, 1), 9)
+            .expect("other run's seq 1 dispatches cleanly");
+        assert_eq!(device.clock_read(), 500);
     }
 
     #[test]
     fn uptime_read_does_not_touch_the_clock() {
         let mut device = FakeDevice::new();
         device
-            .dispatch_delay_wait(250, EffectSeq(1), 1)
+            .dispatch_delay_wait(250, eid(7, 1), 1)
             .expect("delay");
-        let outcome = device
-            .dispatch_uptime_read(EffectSeq(2), 2)
-            .expect("uptime");
+        let outcome = device.dispatch_uptime_read(eid(7, 2), 2).expect("uptime");
         assert_eq!(outcome, b"{\"uptime_ms\":250}");
         assert_eq!(device.clock_read(), 250);
     }
@@ -654,7 +676,7 @@ mod tests {
         let mut device = FakeDevice::new();
         for (sensor, value) in [(0u8, 210u16), (1, 315), (2, 1800), (3, 42)] {
             let outcome = device
-                .dispatch_sensor_read(sensor, EffectSeq(u32::from(sensor) + 1), u64::from(sensor))
+                .dispatch_sensor_read(sensor, eid(7, u32::from(sensor) + 1), u64::from(sensor))
                 .expect("sensor read");
             assert_eq!(
                 outcome,

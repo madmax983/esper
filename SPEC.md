@@ -2236,9 +2236,15 @@ budgets, versions), the segment's prompt bytes, and the digest
 stream.
 
 **Continuation.** `RolloverHandoff::child_seed` derives the child
-with narrowed budgets, a shrunken context budget
-(`saturating_sub` — the parent's spend never widens the child), and
-the parent lineage. The child boots on a fresh journal; the
+with narrowed consumable budgets (the lineage's remaining, never
+widened), the parent's full context budget as per-segment capacity,
+and the parent lineage. The same capacity is not a widening: each
+segment starts from the compact state plus the verbatim tail (small
+by construction) and may accumulate prompts up to the budget again;
+inheriting the remainder instead would shrink every generation's
+window toward zero and make tasks longer than the budget
+uncompletable. Total work stays bounded by the strictly decreasing
+consumable budgets. The child boots on a fresh journal; the
 snapshot re-verifies on every boot, and corrupt bytes fail closed
 before a single frame replays. `drive_segment` enforces the
 pairing: a child seed requires a handoff; a root forbids one.
@@ -2251,8 +2257,9 @@ turn or touches hardware — the run degrades with
 **Prompt metering.** Each `ModelDecision` frame carries its
 prompt's byte length. The meter sums the journal on boot, so
 suspend/resume across `drive_segment` calls keeps the 80% trigger
-exact. A new segment starts at zero; the child's budget is the
-parent's minus the parent's spend.
+exact. A new segment starts at zero; the child's context budget is
+the seed's stated budget — per-segment capacity, not the parent's
+remainder.
 
 **Reference posture.** A continued prompt never carries raw
 folded bytes: any reference to a compacted frame's payload renders
