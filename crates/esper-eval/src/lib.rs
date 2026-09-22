@@ -29,4 +29,7 @@ pub mod runner;
 
 pub use esper_runtime::RunSeed;
 pub use fixture::{Fixture, FixtureError, parse_fixture};
-pub use runner::{FixtureReport, run_fixture, run_fixture_file};
+pub use runner::{
+    BackendKind, FixtureReport, run_fixture, run_fixture_file, run_fixture_file_with,
+    run_fixture_with,
+};

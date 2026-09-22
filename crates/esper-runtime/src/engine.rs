@@ -34,11 +34,14 @@ use waymaker_core::{
     ActivityKind, EffectIdAllocator, EffectSeq, RecordRef, ReplayCursor, RunId as WaymakerRunId,
 };
 
+use crate::backend::{
+    BackendError, ModelBackend, OUTPUT_CAP, PROMPT_CAP, PromptCtx, RepairHint, build_prompt,
+};
 use crate::error::{CrashPoint, Halt, RuntimeError};
 use crate::journal::{DecisionClass, Frame, Journal};
 use crate::seed::{ESPER_WORKFLOW_KIND, RunSeed};
 use crate::trace::RunTrace;
-use crate::world::{FakeDevice, FaultPlan, InputPlan, ScriptedModel, WorldError};
+use crate::world::{FakeDevice, FaultPlan, InputPlan, WorldError};
 
 /// Boots before the driver gives up instead of rebooting forever.
 ///
@@ -183,7 +186,7 @@ enum ResumePoint {
 pub fn drive_run(
     seed: &RunSeed,
     journal: &mut Journal,
-    model: &mut ScriptedModel,
+    model: &mut dyn ModelBackend,
     device: &mut FakeDevice,
     faults: &mut FaultPlan,
     inputs: &mut InputPlan,
@@ -205,10 +208,12 @@ pub fn drive_run(
         monitor: Monitor::new(),
         allocator: EffectIdAllocator::for_run(run),
         cursor: ReplayCursor::new(run),
-        seed_input: [0u8; 55],
+        seed_input: [0u8; 67],
         repair_used: 0,
         turns_used: 0,
         mutations_used: 0,
+        last_observation: None,
+        last_repair_variant: None,
         pending_call: None,
         pending_intent: None,
         pending_step: None,
@@ -249,7 +254,7 @@ pub fn drive_run(
 pub async fn drive_run_async(
     seed: &RunSeed,
     journal: &mut Journal,
-    model: &mut ScriptedModel,
+    model: &mut dyn ModelBackend,
     device: &mut FakeDevice,
     faults: &mut FaultPlan,
     inputs: &mut InputPlan,
@@ -266,7 +271,7 @@ struct Driver<'a> {
     /// The caller-owned journal (survives crashes).
     journal: &'a mut Journal,
     /// The model backend.
-    model: &'a mut ScriptedModel,
+    model: &'a mut dyn ModelBackend,
     /// The device (survives crashes).
     device: &'a mut FakeDevice,
     /// The fault plan (survives crashes).
@@ -287,13 +292,26 @@ struct Driver<'a> {
     cursor: ReplayCursor,
     /// The canonical seed bytes for the `RunStarted` record.
     // HOST-ONLY (E0/E1)
-    seed_input: [u8; 55],
+    seed_input: [u8; 67],
     /// Invalid lines committed this run.
     repair_used: u8,
     /// Model turns consumed this run.
     turns_used: u32,
     /// Mutations consumed this run.
     mutations_used: u32,
+    /// The last committed observation's outcome bytes, capped at 128
+    /// (E3). Rendered into the inference prompt; restored from the
+    /// journal on replay so post-reboot prompts are byte-identical —
+    /// load-bearing for the tiny backend's prompt→line lookup.
+    // HOST-ONLY (E3)
+    last_observation: Option<Vec<u8>>,
+    /// The repair variant of the last invalid line: `"malformed"` or
+    /// `"invalid_args"` (E3). Rendered into the inference prompt's
+    /// repair hint. Set on every committed invalid line — forward and
+    /// replay — and left stale otherwise; the hint is only read while
+    /// `repair_used > 0`, so a stale value never attaches to a fresh
+    /// inference.
+    last_repair_variant: Option<&'static str>,
     /// A committed call awaiting authorization.
     pending_call: Option<PendingCall>,
     /// A committed intent awaiting its terminal outcome.
@@ -329,6 +347,8 @@ impl Driver<'_> {
         self.repair_used = 0;
         self.turns_used = 0;
         self.mutations_used = 0;
+        self.last_observation = None;
+        self.last_repair_variant = None;
         self.pending_call = None;
         self.pending_intent = None;
         self.pending_step = None;
@@ -423,7 +443,9 @@ impl Driver<'_> {
                 output,
                 class,
                 repair_index,
-            } => self.replay_decision(output, *class, *repair_index),
+                input_tokens,
+                output_tokens,
+            } => self.replay_decision(output, *class, *repair_index, *input_tokens, *output_tokens),
             Frame::ToolIntent {
                 seq,
                 tool,
@@ -477,6 +499,8 @@ impl Driver<'_> {
         output: &[u8],
         class: DecisionClass,
         repair_index: u8,
+        _input_tokens: u32,
+        _output_tokens: u32,
     ) -> Result<ResumePoint, RuntimeError> {
         self.budget
             .consume_turn()
@@ -516,14 +540,17 @@ impl Driver<'_> {
                 Ok(ResumePoint::Finalize)
             }
             Classified::Invalid(variant) => {
-                let expected = match variant {
-                    RepairVariant::Malformed => DecisionClass::Malformed,
-                    RepairVariant::InvalidArgs => DecisionClass::InvalidArgs,
+                let (expected, name) = match variant {
+                    RepairVariant::Malformed => (DecisionClass::Malformed, "malformed"),
+                    RepairVariant::InvalidArgs => (DecisionClass::InvalidArgs, "invalid_args"),
                 };
                 if class != expected {
                     return Err(RuntimeError::JournalCorrupt);
                 }
                 self.repair_used += 1;
+                // Restore the variant for the next prompt's repair
+                // hint, so post-reboot prompts are byte-identical.
+                self.last_repair_variant = Some(name);
                 if self.repair_used != repair_index {
                     return Err(RuntimeError::JournalCorrupt);
                 }
@@ -606,6 +633,10 @@ impl Driver<'_> {
                 // derives the pre-dispatch clock reading from it.
                 // HOST-ONLY (E0/E1)
                 intent.outcome = Some(outcome.to_vec());
+                // Remember the outcome for the next inference prompt.
+                // Restored from the journal, so post-reboot prompts
+                // are byte-identical (E3).
+                self.last_observation = Some(cap_observation(outcome));
             }
             (intent.write, intent.tool, intent.digest)
         };
@@ -725,21 +756,60 @@ impl Driver<'_> {
         Ok(())
     }
 
-    /// `Infer`: take one model line and commit the decision.
+    /// `Infer`: build the prompt, take one model line, and commit the
+    /// decision.
     ///
     /// The pre-commit region (model emission through the decision
     /// commit) unemits the line on a crash, so the next boot sees it
     /// again: an uncommitted decision is never lost and never applied.
+    /// The tiny backend's `unemit` is a no-op by design — its lookup is
+    /// pure, so the re-issued prompt returns the same line.
     fn do_infer(&mut self) -> Result<(), Halt> {
-        let line = self
+        // HOST-ONLY (E3)
+        let mut pbuf = [0u8; PROMPT_CAP];
+        let ctx = PromptCtx {
+            turns_left: self.budget.model_turns,
+            mutations_left: self.budget.mutations,
+            last_observation: self.last_observation.as_deref(),
+            repair: self.repair_hint(),
+        };
+        let plen = build_prompt(
+            &ctx,
+            &mut pbuf[..usize::from(self.seed.inference.max_prompt_bytes)],
+        );
+        // HOST-ONLY (E3)
+        let mut obuf = [0u8; OUTPUT_CAP];
+        let n = self
             .model
-            .next_line()
-            .ok_or(RuntimeError::World("model script exhausted"))?;
+            .infer(
+                &pbuf[..plen],
+                &mut obuf[..usize::from(self.seed.inference.max_output_bytes)],
+            )
+            .map_err(map_backend)?;
+        // HOST-ONLY (E3)
+        let line = obuf[..n].to_vec();
         let outcome = self.infer_pre_commit(&line);
         if matches!(outcome, Err(Halt::Crash(_))) {
             self.model.unemit();
         }
         outcome
+    }
+
+    /// The repair hint for the next inference, when an invalid line
+    /// already burned a turn.
+    ///
+    /// The attempt is the one-based repair index already committed;
+    /// the variant is the last invalid line's class (`"malformed"` or
+    /// `"invalid_args"`). `None` while no invalid line has committed
+    /// yet — or while the variant was never recorded, which only the
+    /// first boot after a journal predating E3 could see.
+    fn repair_hint(&self) -> Option<RepairHint> {
+        // `checked_sub` is the gate: no invalid line yet, no hint.
+        self.repair_used.checked_sub(1)?;
+        Some(RepairHint {
+            attempt: self.repair_used,
+            variant: self.last_repair_variant?,
+        })
     }
 
     /// The pre-commit half of `Infer`.
@@ -754,6 +824,10 @@ impl Driver<'_> {
             .consume_turn()
             .map_err(|_| RuntimeError::JournalCorrupt)?;
         self.turns_used += 1;
+        // Measured, not metered: the backend reports what this
+        // inference saw, and the frame carries it as evidence
+        // (SPEC §18).
+        let usage = self.model.last_usage();
         match classified {
             Classified::Call {
                 tool,
@@ -766,6 +840,8 @@ impl Driver<'_> {
                     output: line.to_vec(),
                     class: DecisionClass::Call,
                     repair_index: 0,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
                 });
                 self.pending_call = Some(PendingCall {
                     tool,
@@ -780,6 +856,8 @@ impl Driver<'_> {
                     output: line.to_vec(),
                     class: DecisionClass::Ask,
                     repair_index: 0,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
                 });
                 self.pending_ask = Some(PendingAsk { prompt, schema });
                 self.ask_request_committed = false;
@@ -790,20 +868,28 @@ impl Driver<'_> {
                     output: line.to_vec(),
                     class: DecisionClass::Finish,
                     repair_index: 0,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
                 });
                 self.pending_finish = Some(summary);
                 self.advance(Event::DecodeFinish)?;
             }
             Classified::Invalid(variant) => {
-                let class = match variant {
-                    RepairVariant::Malformed => DecisionClass::Malformed,
-                    RepairVariant::InvalidArgs => DecisionClass::InvalidArgs,
+                let (class, name) = match variant {
+                    RepairVariant::Malformed => (DecisionClass::Malformed, "malformed"),
+                    RepairVariant::InvalidArgs => (DecisionClass::InvalidArgs, "invalid_args"),
                 };
                 self.repair_used += 1;
+                // Remember the variant for the next prompt's repair
+                // hint. Left stale afterwards by design: the hint is
+                // only read while `repair_used > 0`.
+                self.last_repair_variant = Some(name);
                 self.journal.push(Frame::ModelDecision {
                     output: line.to_vec(),
                     class,
                     repair_index: self.repair_used,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
                 });
                 self.advance(Event::DecodeMalformed)?;
             }
@@ -1016,6 +1102,8 @@ impl Driver<'_> {
         let outcome = self.dispatch_intent(&intent).map_err(map_world)?;
         self.fire(CrashPoint::AfterPhysicalBeforeObservation)?;
         let record_outcome = outcome.clone();
+        // Remember the outcome for the next inference prompt (E3).
+        self.last_observation = Some(cap_observation(&outcome));
         self.journal.push(Frame::ToolObservation {
             seq: intent.seq.0,
             attempt: intent.attempt,
@@ -1470,6 +1558,28 @@ const fn map_world(error: WorldError) -> RuntimeError {
         WorldError::EffectArgsMismatch => RuntimeError::ReplayDiverged,
         WorldError::UnknownResource => RuntimeError::IllegalTransition,
     }
+}
+
+/// Map a model-backend failure to the runtime error vocabulary (E3).
+///
+/// An exhausted script is the historical `World("model script
+/// exhausted")` spelling, kept so existing harnesses keep their
+/// assertions; every other backend fault surfaces as
+/// `RuntimeError::Backend`.
+const fn map_backend(error: BackendError) -> RuntimeError {
+    match error {
+        BackendError::Exhausted => RuntimeError::World("model script exhausted"),
+        other => RuntimeError::Backend(other),
+    }
+}
+
+/// The observation bytes remembered for the next inference prompt
+/// (E3): capped at 128 bytes so the prompt carries bounded context,
+/// never the whole outcome.
+fn cap_observation(outcome: &[u8]) -> Vec<u8> {
+    // HOST-ONLY (E3)
+    let cap = outcome.len().min(128);
+    outcome[..cap].to_vec()
 }
 
 /// FNV-1a over 32 bits, for the Waymaker `input_crc` digest.

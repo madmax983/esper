@@ -1,14 +1,20 @@
-# `esper-runtime` — the durable ReAct runtime (E0/E1/E2)
+# `esper-runtime` — the durable ReAct runtime (E0/E1/E2/E3)
 
 ## What this crate is
 
 Esper's agent harness: a durable ReAct loop (one tool call, one
 typed human input, or finish per turn) built on `esper-core`,
-`esper-protocol`, and Waymaker 0.1.0. The model backend, fake device
-(GPIO + sensors + virtual clock), fault injector, and human-input
-queue are host-only doubles; the engine, journal, and durability
-protocol are the real slice. E2: six typed tools from the static
-protocol registry; authorization before dispatch; independent
+`esper-protocol`, and Waymaker 0.1.0. E3: the model interface is the
+object-safe `backend::ModelBackend` trait (`infer` / `bundle_id` /
+`last_usage` / `unemit`) with two backends — `ScriptedBackend`
+(host-only canned lines, the E0/E1 `ScriptedModel` formalized) and
+`TinyBackend` (a distillation stand-in: a caller-owned prompt→line
+table keyed by `fingerprint_prompt`, no trained weights — see
+`docs/adr/0001-e3-tiny-backend-distillation-standin.md`). The fake
+device (GPIO + sensors + virtual clock), fault injector, and
+human-input queue are host-only doubles; the engine, journal, and
+durability protocol are the real slice. E2: six typed tools from the
+static protocol registry; authorization before dispatch; independent
 read-back verification for every mutation; effect-ID dedup on all
 dispatches.
 
@@ -16,13 +22,35 @@ dispatches.
 
 - `src/lib.rs` — crate root, driver entry points (`drive_run`,
   `drive_run_async`).
+- `src/backend.rs` — the E3 model interface: `ModelBackend` trait,
+  `ScriptedBackend` (host-only), `TinyBackend` (distillation
+  stand-in), `PromptCtx` / `RepairHint` / `build_prompt`,
+  `InferenceSettings`, `BundleId` / `fnv1a64`, `BackendError`,
+  `TokenUsage`, `DistillEntry`, `PROMPT_CAP` / `OUTPUT_CAP`,
+  `TINY_PARAMS_BYTES`. Not host-gated; re-exported from the crate
+  root (`ScriptedBackend` only under `cfg(feature = "host")`).
+- `src/jev.rs` — the E3+jev `System One` adapter (host-only):
+  `JevBackend` over the `JevTransport` trait, `MockTransport`
+  (request-hash cassettes) / `LiveTransport` (deferred, no key),
+  `build_request_json`, typed response parsing with the `Noul` ask
+  gate, deterministic arg templates, `JevReceipt` per-turn evidence,
+  `Prob` / `ScoreBand` / `RecordedAnswer` / `synthesize_response`.
+  SPEC §19.
 - `src/engine.rs` — the boundary loop: turn → authorize → dispatch →
-  verify → account, with crash recovery as journal replay.
+  verify → account, with crash recovery as journal replay. E3: the
+  `Infer` step drives a `&mut dyn ModelBackend`; the engine builds
+  the prompt with `build_prompt` from journal-restored inputs so
+  record and replay see byte-identical prompts.
 - `src/journal.rs` — `Frame` / `Journal`: the only durable state.
   Everything else is derived by replay.
 - `src/seed.rs` — `RunSeed`: explicit budgets, capabilities, version.
-- `src/world.rs` — host doubles: `ScriptedModel`, `FakeDevice`,
-  `FaultPlan`, `InputPlan`.
+  E3: `model_bundle: u64` and `inference: InferenceSettings`; the
+  journal-binding snapshot is a 67-byte canonical encoding
+  (SPEC §18.7) — recovery compares it byte for byte, so a reboot can
+  never swap the model or the prompt/output caps.
+- `src/world.rs` — host doubles: `FakeDevice`, `FaultPlan`,
+  `InputPlan`. (`ScriptedModel` was retired in the E3 rewiring; the
+  scripted model backend now lives in `src/backend.rs`.)
 - `src/trace.rs` — `RunTrace`: the eval harness's evidence, derived
   from the journal.
 - `src/error.rs` — `CrashPoint` (11 variants), `Halt`, `RuntimeError`.
@@ -42,8 +70,11 @@ dispatches.
 
 One turn commits in this order, each step crash-injectable:
 
-1. **Infer** — take a scripted line, commit `ModelDecision`, consume a
-   turn, decode. Malformed lines repair twice, then end `ModelInvalid`.
+1. **Infer** — the engine builds the prompt with `build_prompt`
+   from journal-restored inputs, takes one line from the
+   `ModelBackend`, commits `ModelDecision`, consumes a turn, decodes.
+   Malformed lines repair up to 3 times (E3; was 2 in E0/E1), then
+   end `ModelInvalid`.
 2. **Authorize** — capability check first, then device direction; denial
    is terminal `Denied` and never touches hardware.
 3. **Dispatch** — commit `ToolIntent` (new effect id), then the physical
@@ -81,3 +112,18 @@ The doubles model the physical world: `FaultPlan` consumption and
   `cargo check -p esper-runtime --no-default-features` must all pass.
 - Golden fixtures are the contract: terminal strings, reasons, and
   remaining budgets must match `spec/trajectories/` exactly.
+- Backend rules (E3): the tiny backend is a distillation stand-in,
+  not a trained model — never claim it learned anything;
+  `UnknownPrompt` is a hard failure, never a guess. Prompt inputs
+  must come from durable or rebuilt state so record and replay build
+  byte-identical prompts. The `ModelBackend` trait is object-safe
+  (`&mut dyn ModelBackend`) and carries a `Send` supertrait (SPEC
+  §18.10 item 7 resolved; `TinyBackend` borrows only `&[u8]`).
+- Prompt format (E3, SPEC §18.4): `TOOLS` + the six
+  `render_signature` lines (never truncated) + compact
+  `STATE turns=<n> muts=<n>` + optional
+  `REPAIR <attempt>:<variant> <grammar one-liner>` + optional
+  `LAST <observation>` (only this tail may truncate, ending
+  `[truncated]`) + `EMIT one decision line.` The fixed part always
+  fits `PROMPT_CAP` — pinned by test, so signature growth fails
+  loudly.

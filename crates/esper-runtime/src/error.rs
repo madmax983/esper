@@ -7,6 +7,8 @@
 use thiserror::Error;
 use waymaker_core::KernelError;
 
+use crate::backend::BackendError;
+
 /// Crash points where the fault injector may reset the run.
 ///
 /// Each variant names a durable boundary: the crash fires after the
@@ -129,6 +131,12 @@ pub enum RuntimeError {
     /// input, device fault the doubles cannot represent).
     #[error("world backend failed: {0}")]
     World(&'static str),
+    /// The model backend failed (E3): overlong output, unknown
+    /// prompt, or a tampered distill table. An exhausted script keeps
+    /// its historical `World` spelling; every other backend fault
+    /// arrives here.
+    #[error("model backend failed: {0}")]
+    Backend(#[from] BackendError),
     /// The engine reached a state its own state machine forbids.
     /// This is always an engine bug, never a model or device fault.
     #[error("engine bug: illegal workflow transition")]

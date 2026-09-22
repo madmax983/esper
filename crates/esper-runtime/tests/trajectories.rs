@@ -9,15 +9,35 @@
 use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    Capabilities, CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel,
-    drive_run,
+    Capabilities, CrashPoint, FakeDevice, FaultPlan, InferenceSettings, InputPlan, Journal,
+    ModelBackend, RunSeed, ScriptedBackend, drive_run,
 };
 
-/// Build a default seed with this run id.
-const fn seed(id: u64) -> RunSeed {
+/// Build the scripted backend for one run.
+fn backend(script: Vec<&str>) -> ScriptedBackend {
+    ScriptedBackend::new(
+        script
+            .into_iter()
+            .map(|line| line.as_bytes().to_vec())
+            .collect(),
+        InferenceSettings::default_settings(),
+    )
+}
+
+/// The seed bound to this run's model bundle (E3): the journal binds
+/// the exact model that must produce the run.
+fn backend_seed(backend: &ScriptedBackend) -> RunSeed {
+    RunSeed {
+        model_bundle: backend.bundle_id().0,
+        ..RunSeed::default_slice()
+    }
+}
+
+/// Build a default seed with this run id, bound to the backend.
+fn seed(backend: &ScriptedBackend, id: u64) -> RunSeed {
     RunSeed {
         id: RunId::new(id),
-        ..RunSeed::default_slice()
+        ..backend_seed(backend)
     }
 }
 
@@ -35,19 +55,13 @@ const fn write_only_pin_5() -> Capabilities {
 fn drive(
     seed: &RunSeed,
     journal: &mut Journal,
-    script: Vec<&str>,
+    backend: &mut ScriptedBackend,
     device: &mut FakeDevice,
     faults: &mut FaultPlan,
     inputs: &mut InputPlan,
     crash: Option<CrashPoint>,
 ) -> esper_runtime::RunTrace {
-    let mut model = ScriptedModel::new(
-        script
-            .into_iter()
-            .map(|line| line.as_bytes().to_vec())
-            .collect(),
-    );
-    drive_run(seed, journal, &mut model, device, faults, inputs, crash).expect("run failed")
+    drive_run(seed, journal, backend, device, faults, inputs, crash).expect("run failed")
 }
 
 fn pin(n: u8) -> Pin {
@@ -58,7 +72,12 @@ fn pin(n: u8) -> Pin {
 /// `cp_tool_intent`.
 #[test]
 fn trajectory_a_success_read_write_verify_finish() {
-    let seed = seed(1);
+    let mut backend = backend(vec![
+        "CALL gpio_pin_read {\"pin\": 4}",
+        "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high\"}",
+    ]);
+    let seed = seed(&backend, 1);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -66,11 +85,7 @@ fn trajectory_a_success_read_write_verify_finish() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL gpio_pin_read {\"pin\": 4}",
-            "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -88,7 +103,12 @@ fn trajectory_a_success_read_write_verify_finish() {
 /// b: three invalid lines — repair twice, then `ModelInvalid`.
 #[test]
 fn trajectory_b_invalid_output_repair_then_modelinvalid() {
-    let seed = seed(2);
+    let mut backend = backend(vec![
+        "do a flip",
+        "CALL gpio_pin_read {\"pin\": 99}",
+        "CALLL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+    ]);
+    let seed = seed(&backend, 2);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -96,11 +116,7 @@ fn trajectory_b_invalid_output_repair_then_modelinvalid() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "do a flip",
-            "CALL gpio_pin_read {\"pin\": 99}",
-            "CALLL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -121,9 +137,12 @@ fn trajectory_b_invalid_output_repair_then_modelinvalid() {
 /// c: write pin 0 with only pin 5 writable — denied before dispatch.
 #[test]
 fn trajectory_c_denied_pin_fails_before_dispatch() {
+    let mut backend = backend(vec![
+        "CALL gpio_pin_write {\"pin\": 0, \"level\": \"high\"}",
+    ]);
     let seed = RunSeed {
         capabilities: write_only_pin_5(),
-        ..seed(3)
+        ..seed(&backend, 3)
     };
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
@@ -132,7 +151,7 @@ fn trajectory_c_denied_pin_fails_before_dispatch() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec!["CALL gpio_pin_write {\"pin\": 0, \"level\": \"high\"}"],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -157,9 +176,13 @@ fn trajectory_c_denied_pin_fails_before_dispatch() {
 #[test]
 fn trajectory_d_transient_read_failure_retry_success() {
     // The fixture grants 2 mutations, not the default 4.
+    let mut backend = backend(vec![
+        "CALL gpio_pin_read {\"pin\": 4}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 is low\"}",
+    ]);
     let seed = RunSeed {
         mutations: 2,
-        ..seed(4)
+        ..seed(&backend, 4)
     };
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
@@ -169,10 +192,7 @@ fn trajectory_d_transient_read_failure_retry_success() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL gpio_pin_read {\"pin\": 4}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 is low\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -189,7 +209,12 @@ fn trajectory_d_transient_read_failure_retry_success() {
 /// e: three verified-failed writes — `Stuck`, never `Completed`.
 #[test]
 fn trajectory_e_repeated_identical_failure_then_stuck() {
-    let seed = seed(5);
+    let mut backend = backend(vec![
+        "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
+        "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
+        "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
+    ]);
+    let seed = seed(&backend, 5);
     let mut device = FakeDevice::new();
     device.set_stuck(pin(5), Some(esper_core::decision::Level::Low));
     let mut faults = FaultPlan::new();
@@ -198,11 +223,7 @@ fn trajectory_e_repeated_identical_failure_then_stuck() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
-            "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
-            "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -225,23 +246,23 @@ fn trajectory_e_repeated_identical_failure_then_stuck() {
 /// inference.
 #[test]
 fn trajectory_f_budget_exhaustion_durable_terminal() {
+    let mut backend = backend(vec![
+        "CALL gpio_pin_read {\"pin\": 4}",
+        "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"unreached\"}",
+    ]);
     let seed = RunSeed {
         model_turns: 2,
-        ..seed(6)
+        ..seed(&backend, 6)
     };
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
-    let mut model = ScriptedModel::new(vec![
-        b"CALL gpio_pin_read {\"pin\": 4}".to_vec(),
-        b"CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}".to_vec(),
-        b"FINISH {\"status\": \"completed\", \"summary\": \"unreached\"}".to_vec(),
-    ]);
     let mut journal = Journal::new();
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -260,14 +281,18 @@ fn trajectory_f_budget_exhaustion_durable_terminal() {
     assert_eq!(trace.turns_remaining(), 0);
     assert_eq!(trace.mutations_remaining(), 3);
     // No third inference ever happened.
-    assert_eq!(model.lines_consumed(), 2);
+    assert_eq!(backend.lines_consumed(), 2);
 }
 
 /// g: crash after the physical write, before the observation — the
 /// redelivered intent deduplicates and the write happens exactly once.
 #[test]
 fn trajectory_g_reset_after_write_before_outcome() {
-    let seed = seed(7);
+    let mut backend = backend(vec![
+        "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high\"}",
+    ]);
+    let seed = seed(&backend, 7);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -275,10 +300,7 @@ fn trajectory_g_reset_after_write_before_outcome() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -295,7 +317,12 @@ fn trajectory_g_reset_after_write_before_outcome() {
 /// arrives after the reboot and the run completes.
 #[test]
 fn trajectory_h_ask_suspend_resume() {
-    let seed = seed(8);
+    let mut backend = backend(vec![
+        "ASK {\"prompt\": \"which pin?\", \"schema\": 1}",
+        "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high per operator\"}",
+    ]);
+    let seed = seed(&backend, 8);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(vec![b"{\"pin\": 4}".to_vec()]);
@@ -303,11 +330,7 @@ fn trajectory_h_ask_suspend_resume() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "ASK {\"prompt\": \"which pin?\", \"schema\": 1}",
-            "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high per operator\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,

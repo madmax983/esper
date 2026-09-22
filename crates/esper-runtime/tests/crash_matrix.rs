@@ -15,7 +15,8 @@
 use esper_core::ids::RunId;
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel, drive_run,
+    CrashPoint, FakeDevice, FaultPlan, InferenceSettings, InputPlan, Journal, ModelBackend,
+    RunSeed, ScriptedBackend, drive_run,
 };
 
 /// The success script from trajectory (a).
@@ -42,6 +43,20 @@ fn ask_script() -> Vec<Vec<u8>> {
     .collect()
 }
 
+/// Build the scripted backend for one run.
+fn backend(lines: Vec<Vec<u8>>) -> ScriptedBackend {
+    ScriptedBackend::new(lines, InferenceSettings::default_settings())
+}
+
+/// The seed bound to this run's model bundle (E3): the journal binds
+/// the exact model that must produce the run.
+fn backend_seed(backend: &ScriptedBackend) -> RunSeed {
+    RunSeed {
+        model_bundle: backend.bundle_id().0,
+        ..RunSeed::default_slice()
+    }
+}
+
 /// Drive one run with one injected crash; return the trace and the
 /// device's physical write count.
 fn drive_once(
@@ -50,19 +65,19 @@ fn drive_once(
     inputs: Vec<Vec<u8>>,
     crash: CrashPoint,
 ) -> (esper_runtime::RunTrace, u32) {
+    let mut backend = backend(script);
     let seed = RunSeed {
         id: RunId::new(id),
-        ..RunSeed::default_slice()
+        ..backend_seed(&backend)
     };
     let mut journal = Journal::new();
-    let mut model = ScriptedModel::new(script);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut input_plan = InputPlan::new(inputs);
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut input_plan,

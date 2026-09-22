@@ -32,6 +32,7 @@ name = "esper-runtime"
 version = "0.1.0"
 dependencies = [
  "esper-core",
+ "esper-eval",
  "esper-protocol",
  "thiserror",
  "tokio",

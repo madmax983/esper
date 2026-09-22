@@ -8,6 +8,8 @@
 
 use esper_core::registry::Capabilities;
 
+use crate::backend::InferenceSettings;
+
 /// The workflow version the E0/E1 slice runs under.
 ///
 /// The journal binds every run to this version; recovery refuses a
@@ -48,6 +50,15 @@ pub struct RunSeed {
     pub capabilities: Capabilities,
     /// The workflow version this seed runs under.
     pub workflow_version: u16,
+    /// The model bundle this run is bound to (E3): the FNV-1a 64-bit
+    /// identity of the exact model that must produce the run. The
+    /// journal binds to it, so a replay can never swap the model
+    /// under a committed history.
+    pub model_bundle: u64,
+    /// The inference buffer policy (E3): the prompt and output caps
+    /// the engine hands the model backend. Bound into the snapshot so
+    /// a replay can never widen what the seed allowed.
+    pub inference: InferenceSettings,
 }
 
 /// A run seed that failed validation, or a journal bound to a
@@ -84,10 +95,14 @@ pub struct SeedSnapshot {
     pub allow_timer: bool,
     /// Whether the status tool is granted.
     pub allow_status: bool,
+    /// The model bundle the journal is bound to (E3).
+    pub model_bundle: u64,
+    /// The inference buffer policy the journal is bound to (E3).
+    pub inference: InferenceSettings,
 }
 
 impl SeedSnapshot {
-    /// The canonical 55-byte encoding carried as the Waymaker
+    /// The canonical 67-byte encoding carried as the Waymaker
     /// `RunStarted` record's input. Fixed layout, little-endian; the
     /// replay cursor compares it byte for byte.
     ///
@@ -95,11 +110,13 @@ impl SeedSnapshot {
     /// `output_tokens` (4), `model_turns` (2), `mutations` (2),
     /// `workflow_version` (2), `read_pins` (8), `read_count` (1),
     /// `write_pins` (8), `write_count` (1), `sensors` (4),
-    /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1).
-    /// Every identity-bearing field of the seed is bound.
+    /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1),
+    /// `model_bundle` (8), `inference` (4: `max_prompt_bytes`,
+    /// `max_output_bytes`). Every identity-bearing field of the seed
+    /// is bound.
     #[must_use]
-    pub const fn input_bytes(&self) -> [u8; 55] {
-        let mut out = [0u8; 55];
+    pub const fn input_bytes(&self) -> [u8; 67] {
+        let mut out = [0u8; 67];
         let id = self.id.to_le_bytes();
         let elapsed = self.elapsed_ms.to_le_bytes();
         let input_tokens = self.input_tokens.to_le_bytes();
@@ -107,12 +124,15 @@ impl SeedSnapshot {
         let model_turns = self.model_turns.to_le_bytes();
         let mutations = self.mutations.to_le_bytes();
         let version = self.workflow_version.to_le_bytes();
+        let bundle = self.model_bundle.to_le_bytes();
+        let inference = self.inference.bytes();
         let mut i = 0;
         while i < 8 {
             out[i] = id[i];
             out[8 + i] = elapsed[i];
             out[30 + i] = self.read_pins[i];
             out[39 + i] = self.write_pins[i];
+            out[55 + i] = bundle[i];
             i += 1;
         }
         let mut j = 0;
@@ -120,6 +140,7 @@ impl SeedSnapshot {
             out[16 + j] = input_tokens[j];
             out[20 + j] = output_tokens[j];
             out[48 + j] = self.sensors[j];
+            out[63 + j] = inference[j];
             j += 1;
         }
         out[24] = model_turns[0];
@@ -156,6 +177,9 @@ impl RunSeed {
         }
         if self.model_turns == 0 {
             return Err("model_turns must grant at least one turn");
+        }
+        if let Err(reason) = self.inference.validate() {
+            return Err(reason);
         }
         let caps = &self.capabilities;
         if caps.read_count > 8 {
@@ -214,6 +238,8 @@ impl RunSeed {
             sensor_count: self.capabilities.sensor_count,
             allow_timer: self.capabilities.allow_timer,
             allow_status: self.capabilities.allow_status,
+            model_bundle: self.model_bundle,
+            inference: self.inference,
         }
     }
     /// The E0/E1 default seed: 10 turns, 4 mutations, generous token
@@ -244,6 +270,8 @@ impl RunSeed {
                 allow_status: true,
             },
             workflow_version: WORKFLOW_VERSION,
+            model_bundle: 0,
+            inference: InferenceSettings::default_settings(),
         }
     }
 
@@ -264,17 +292,17 @@ impl RunSeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capabilities, RunSeed, SeedSnapshot};
+    use super::{Capabilities, InferenceSettings, RunSeed, SeedSnapshot};
     use esper_core::ids::Pin;
 
     /// Every identity-bearing field of the seed is bound in the
-    /// 55-byte canonical encoding: changing any one of them changes
+    /// 67-byte canonical encoding: changing any one of them changes
     /// the bytes the Waymaker `RunStarted` record carries.
     #[test]
     fn input_bytes_binds_every_field() {
         let base = RunSeed::default_slice().snapshot();
         let base_bytes = base.input_bytes();
-        assert_eq!(base_bytes.len(), 55);
+        assert_eq!(base_bytes.len(), 67);
 
         let variants = [
             SeedSnapshot { id: 1, ..base },
@@ -332,6 +360,17 @@ mod tests {
             },
             SeedSnapshot {
                 allow_status: !base.allow_status,
+                ..base
+            },
+            SeedSnapshot {
+                model_bundle: base.model_bundle + 1,
+                ..base
+            },
+            SeedSnapshot {
+                inference: InferenceSettings {
+                    max_prompt_bytes: 512,
+                    ..base.inference
+                },
                 ..base
             },
         ];

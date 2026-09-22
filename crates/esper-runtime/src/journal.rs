@@ -53,6 +53,12 @@ pub enum Frame {
         class: DecisionClass,
         /// One-based repair number for invalid lines, else `0`.
         repair_index: u8,
+        /// The measured input tokens for this turn (E3). Recorded,
+        /// never metered: SPEC §18 defers token budgeting, so these
+        /// numbers are evidence only.
+        input_tokens: u32,
+        /// The measured output tokens for this turn (E3).
+        output_tokens: u32,
     },
     /// A tool intent committed: the durable promise to dispatch.
     /// Dispatch may run at least once under this intent's effect id;

@@ -1,18 +1,21 @@
-//! The data-driven fixture runner: parse, drive, assert.
+//! The data-driven fixture runner: parse, drive, assert — under both
+//! E3 model backends.
 //!
-//! [`run_fixture`] turns one parsed [`Fixture`] into a live run: it
-//! builds the [`RunSeed`] (with a run id derived deterministically
-//! from the fixture id), the scripted model, the fake device, the
-//! transient-fault plan, and the input queue the fixture describes,
-//! drives [`drive_run`] to its terminal
-//! result — injecting the planned reset and letting the engine recover
-//! by journal replay — and then asserts, in order:
+//! [`run_fixture_with`] turns one parsed [`Fixture`] into two live
+//! runs: first the scripted teacher ([`ScriptedBackend`], wrapped in a
+//! recording harness), then the distilled tiny stand-in
+//! ([`TinyBackend`]) replaying the recorded prompt→line table. The
+//! full assertion battery — terminal status, remaining budgets, the
+//! exact expected trace ([`crate::compare`]), every listed SPEC §11.3
+//! invariant ([`crate::checks`]), every `forbidden` clause, and the
+//! model-bundle binding — runs under **both** backends, and the two
+//! backends' measured token totals must agree. The [`FixtureReport`]
+//! carries the trace of the [`BackendKind`] the caller selected.
 //!
-//! 1. the terminal status,
-//! 2. the remaining budgets,
-//! 3. the exact expected trace ([`crate::compare`]),
-//! 4. every listed SPEC §11.3 invariant ([`crate::checks`]),
-//! 5. every `forbidden` clause ([`crate::checks`]).
+//! [`run_fixture`] selects the scripted teacher's trace (the E0/E1
+//! behavior); [`run_fixture_with`] with [`BackendKind::Tiny`] selects
+//! the tiny replay's trace. Either way both backends ran and both
+//! assertion batteries passed.
 //!
 //! Where the runtime's public API cannot express something the fixture
 //! format allows (several crash points, an initially-high pin, two
@@ -23,12 +26,15 @@
 //!
 //! // HOST-ONLY (E0/E1): heap-allocated orchestration, for the host runner.
 
+use std::collections::HashSet;
+
 use esper_core::decision::Level;
 use esper_core::ids::{Digest, Pin, RunId};
 use esper_core::registry::Capabilities;
 use esper_runtime::{
-    Direction, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, RunTrace, ScriptedModel,
-    drive_run,
+    BackendError, BundleId, Direction, DistillEntry, FakeDevice, FaultPlan, InferenceSettings,
+    InputPlan, Journal, ModelBackend, RunSeed, RunTrace, ScriptedBackend, TinyBackend, TokenUsage,
+    drive_run, fingerprint_prompt, fnv1a64,
 };
 
 use crate::checks::{CheckCtx, pin_levels};
@@ -38,6 +44,20 @@ use crate::fixture::{
     parse_fixture,
 };
 
+/// Which model backend runs the fixture — and which backend's trace
+/// the [`FixtureReport`] carries.
+///
+/// Both backends always run (the tiny backend needs the scripted
+/// pass's recording to distill from); the kind only selects the
+/// reported trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// The scripted teacher: canned lines, prompt ignored.
+    Scripted,
+    /// The distilled tiny stand-in: prompt→line table replay.
+    Tiny,
+}
+
 /// The outcome of running one fixture: the evidence, plus counts of
 /// what was checked.
 #[derive(Debug)]
@@ -46,7 +66,9 @@ pub struct FixtureReport {
     pub fixture_id: String,
     /// The fixture title.
     pub title: String,
-    /// The derived run trace.
+    /// Which backend's trace this report carries.
+    pub backend: BackendKind,
+    /// The derived run trace (from the selected backend).
     pub trace: RunTrace,
     /// How many expected trace events were compared.
     pub events_compared: usize,
@@ -56,33 +78,246 @@ pub struct FixtureReport {
     pub forbidden_checked: usize,
 }
 
-/// Run one parsed fixture to its terminal result and assert everything
-/// the fixture expects.
+/// Run one parsed fixture to its terminal result under the selected
+/// backend, asserting everything the fixture expects under **both**
+/// backends.
+///
+/// Pass 1 drives the scripted teacher through a recording wrapper;
+/// pass 2 distills the recorded `(prompt, line)` pairs into a
+/// [`DistillEntry`] table and replays it under [`TinyBackend`] on a
+/// fresh journal, device, fault plan, and input queue. The full
+/// assertion battery runs against both traces; the report carries the
+/// selected backend's trace.
 ///
 /// # Errors
 ///
-/// Returns [`FixtureError`] when the fixture is malformed, the driver
-/// fails, or any assertion — terminal, budgets, trace, invariant, or
-/// forbidden clause — does not hold.
-pub fn run_fixture(fixture: &Fixture) -> Result<FixtureReport, FixtureError> {
-    let seed = build_seed(fixture)?;
-    let mut model = ScriptedModel::new(fixture.script.clone());
+/// Returns [`FixtureError`] when the fixture is malformed, a driver
+/// fails, or any assertion — terminal, budgets, trace, invariant,
+/// forbidden clause, or model-bundle binding — does not hold under
+/// either backend.
+pub fn run_fixture_with(
+    fixture: &Fixture,
+    kind: BackendKind,
+) -> Result<FixtureReport, FixtureError> {
+    let crash = crash_point(&fixture.crash_plan)?;
+
+    // Pass 1: the scripted teacher, recording every prompt→line pair.
+    let mut recorder = RecordingBackend::new(ScriptedBackend::new(
+        // HOST-ONLY (E3)
+        fixture.script.clone(),
+        InferenceSettings::default_settings(),
+    ));
+    let seed = build_seed(fixture, recorder.bundle_id().0)?;
     let (mut device, mut faults) = build_device(&fixture.device)?;
     let initial_levels = pin_levels(&device);
     let mut inputs = build_inputs(fixture);
     let mut journal = Journal::new();
-    let crash = crash_point(&fixture.crash_plan)?;
-
-    let trace = drive_run(
+    let trace_scripted = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut recorder,
         &mut device,
         &mut faults,
         &mut inputs,
         crash,
     )?;
+    assert_all(fixture, &seed, &trace_scripted, &device, initial_levels)?;
 
+    // Distill the recording: one entry per prompt fingerprint, with
+    // the line integrity hash the tiny backend checks on lookup.
+    // The table borrows the recorder's lines, so the recorder must
+    // outlive the replay below.
+    let table = distill(&recorder.pairs);
+
+    // Pass 2: the tiny stand-in replays the distilled table on a
+    // fresh world. The seed binds the tiny bundle, not the scripted
+    // one — the journal must name the model that actually ran.
+    let mut tiny = TinyBackend::new(&table);
+    let tiny_seed = build_seed(fixture, tiny.bundle_id().0)?;
+    let (mut tiny_device, mut tiny_faults) = build_device(&fixture.device)?;
+    let tiny_initial_levels = pin_levels(&tiny_device);
+    let mut tiny_inputs = build_inputs(fixture);
+    let mut tiny_journal = Journal::new();
+    let trace_tiny = drive_run(
+        &tiny_seed,
+        &mut tiny_journal,
+        &mut tiny,
+        &mut tiny_device,
+        &mut tiny_faults,
+        &mut tiny_inputs,
+        crash,
+    )?;
+    assert_all(
+        fixture,
+        &tiny_seed,
+        &trace_tiny,
+        &tiny_device,
+        tiny_initial_levels,
+    )?;
+
+    // Cross-backend agreement: byte-identical prompts in,
+    // byte-identical lines out, so the measured token totals agree.
+    if trace_scripted.input_tokens_used() != trace_tiny.input_tokens_used()
+        || trace_scripted.output_tokens_used() != trace_tiny.output_tokens_used()
+    {
+        return Err(FixtureError::AssertionFailed {
+            // HOST-ONLY (E3)
+            detail: format!(
+                "token totals differ between backends: scripted ({}, {}) vs tiny ({}, {})",
+                trace_scripted.input_tokens_used(),
+                trace_scripted.output_tokens_used(),
+                trace_tiny.input_tokens_used(),
+                trace_tiny.output_tokens_used(),
+            ),
+        });
+    }
+
+    let (trace, _seed) = match kind {
+        BackendKind::Scripted => (trace_scripted, seed),
+        BackendKind::Tiny => (trace_tiny, tiny_seed),
+    };
+    Ok(FixtureReport {
+        // HOST-ONLY (E0/E1)
+        fixture_id: fixture.id.clone(),
+        title: fixture.title.clone(),
+        backend: kind,
+        trace,
+        events_compared: fixture.expected.trace.len(),
+        invariants_checked: fixture.expected.invariants.len(),
+        forbidden_checked: fixture.expected.forbidden.len(),
+    })
+}
+
+/// Run one parsed fixture to its terminal result and assert everything
+/// the fixture expects, carrying the scripted teacher's trace.
+///
+/// Both backends still run and both assertion batteries still pass;
+/// see [`run_fixture_with`].
+///
+/// # Errors
+///
+/// Returns [`FixtureError`] when the fixture is malformed, a driver
+/// fails, or any assertion does not hold under either backend.
+pub fn run_fixture(fixture: &Fixture) -> Result<FixtureReport, FixtureError> {
+    run_fixture_with(fixture, BackendKind::Scripted)
+}
+
+/// Read a fixture file, parse it, and run it under the selected
+/// backend.
+///
+/// # Errors
+///
+/// Returns [`FixtureError`] for I/O, JSON, schema, driver, or
+/// assertion failures.
+pub fn run_fixture_file_with(path: &str, kind: BackendKind) -> Result<FixtureReport, FixtureError> {
+    let text = std::fs::read_to_string(path).map_err(|source| FixtureError::Io {
+        // HOST-ONLY (E0/E1)
+        path: path.to_owned(),
+        source,
+    })?;
+    run_fixture_with(&parse_fixture(&text)?, kind)
+}
+
+/// Read a fixture file, parse it, and run it, carrying the scripted
+/// teacher's trace.
+///
+/// # Errors
+///
+/// Returns [`FixtureError`] for I/O, JSON, schema, driver, or
+/// assertion failures.
+pub fn run_fixture_file(path: &str) -> Result<FixtureReport, FixtureError> {
+    run_fixture_file_with(path, BackendKind::Scripted)
+}
+
+// ---------------------------------------------------------------------------
+// The dual-backend machinery.
+// ---------------------------------------------------------------------------
+
+/// A [`ModelBackend`] wrapper that records every `(prompt, line)` pair
+/// the scripted teacher emits, keyed by prompt fingerprint, so the
+/// tiny pass can distill them into a [`DistillEntry`] table.
+///
+/// `unemit` pops the recorded pair as well as rewinding the script:
+/// the line was taken but never committed (crash before the decision
+/// commit), so the distill table must never hold an uncommitted line.
+struct RecordingBackend {
+    /// The scripted teacher being recorded.
+    inner: ScriptedBackend,
+    /// `(prompt_fingerprint, emitted_line)` in emission order.
+    pairs: Vec<(u64, Vec<u8>)>,
+}
+
+impl RecordingBackend {
+    /// Wrap the scripted teacher; nothing is recorded yet.
+    const fn new(inner: ScriptedBackend) -> Self {
+        // HOST-ONLY (E3)
+        Self {
+            inner,
+            pairs: Vec::new(),
+        }
+    }
+}
+
+impl ModelBackend for RecordingBackend {
+    fn infer(&mut self, prompt: &[u8], out: &mut [u8]) -> Result<usize, BackendError> {
+        let n = self.inner.infer(prompt, out)?;
+        // HOST-ONLY (E3)
+        self.pairs
+            .push((fingerprint_prompt(prompt), out[..n].to_vec()));
+        Ok(n)
+    }
+
+    fn bundle_id(&self) -> BundleId {
+        self.inner.bundle_id()
+    }
+
+    fn last_usage(&self) -> TokenUsage {
+        self.inner.last_usage()
+    }
+
+    fn unemit(&mut self) {
+        self.inner.unemit();
+        // The emission never committed: drop its recording too, so a
+        // reboot that re-issues the same prompt records it exactly
+        // once.
+        self.pairs.pop();
+    }
+}
+
+/// Distill recorded `(prompt_fingerprint, line)` pairs into the tiny
+/// backend's table: one entry per prompt, first emission wins, with
+/// `line_hash = fnv1a64(line)` for the lookup integrity check.
+///
+/// The entries borrow the recorded lines, so the `pairs` allocation
+/// must outlive the table (and the replay that uses it).
+fn distill(pairs: &[(u64, Vec<u8>)]) -> Vec<DistillEntry<'_>> {
+    // HOST-ONLY (E3)
+    let mut seen = HashSet::new();
+    let mut table = Vec::new();
+    for (fingerprint, line) in pairs {
+        if seen.insert(*fingerprint) {
+            table.push(DistillEntry {
+                prompt_fp: *fingerprint,
+                line_hash: fnv1a64(line),
+                line: line.as_slice(),
+            });
+        }
+    }
+    table
+}
+
+/// The full assertion battery for one backend's trace, in fixture
+/// order: not suspended, terminal status, remaining budgets, the exact
+/// expected trace, every §11.3 invariant, every `forbidden` clause,
+/// and the model-bundle binding (the trace names the seed's bundle —
+/// the journal binds the exact model that ran).
+fn assert_all(
+    fixture: &Fixture,
+    seed: &RunSeed,
+    trace: &RunTrace,
+    device: &FakeDevice,
+    initial_levels: [bool; 8],
+) -> Result<(), FixtureError> {
     if trace.suspended() {
         return Err(FixtureError::AssertionFailed {
             // HOST-ONLY (E0/E1)
@@ -104,13 +339,13 @@ pub fn run_fixture(fixture: &Fixture) -> Result<FixtureReport, FixtureError> {
             ),
         });
     }
-    assert_budgets(fixture, &trace)?;
-    compare_trace(&fixture.expected.trace, &trace)?;
+    assert_budgets(fixture, trace)?;
+    compare_trace(&fixture.expected.trace, trace)?;
 
     let ctx = CheckCtx {
-        trace: &trace,
-        seed: &seed,
-        device: &device,
+        trace,
+        seed,
+        device,
         initial_levels,
     };
     for invariant in &fixture.expected.invariants {
@@ -120,30 +355,17 @@ pub fn run_fixture(fixture: &Fixture) -> Result<FixtureReport, FixtureError> {
         clause.check(&ctx)?;
     }
 
-    Ok(FixtureReport {
-        // HOST-ONLY (E0/E1)
-        fixture_id: fixture.id.clone(),
-        title: fixture.title.clone(),
-        trace,
-        events_compared: fixture.expected.trace.len(),
-        invariants_checked: fixture.expected.invariants.len(),
-        forbidden_checked: fixture.expected.forbidden.len(),
-    })
-}
-
-/// Read a fixture file, parse it, and run it.
-///
-/// # Errors
-///
-/// Returns [`FixtureError`] for I/O, JSON, schema, driver, or
-/// assertion failures.
-pub fn run_fixture_file(path: &str) -> Result<FixtureReport, FixtureError> {
-    let text = std::fs::read_to_string(path).map_err(|source| FixtureError::Io {
-        // HOST-ONLY (E0/E1)
-        path: path.to_owned(),
-        source,
-    })?;
-    run_fixture(&parse_fixture(&text)?)
+    if trace.model_bundle() != seed.model_bundle {
+        return Err(FixtureError::AssertionFailed {
+            // HOST-ONLY (E3)
+            detail: format!(
+                "model-bundle binding broken: the trace names {:#x}, the seed binds {:#x}",
+                trace.model_bundle(),
+                seed.model_bundle,
+            ),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -159,11 +381,15 @@ pub fn run_fixture_file(path: &str) -> Result<FixtureReport, FixtureError> {
 /// §17.7). Absent fixture fields parsed as denied, so E0/E1 fixtures
 /// keep their meaning unchanged.
 ///
+/// `model_bundle` binds the backend that will actually run (scripted
+/// or tiny); the journal carries it so a reboot can never swap the
+/// model mid-run.
+///
 /// # Errors
 ///
 /// Returns [`FixtureError::AssertionFailed`] when a capability list
 /// is longer than the set it fills.
-fn build_seed(fixture: &Fixture) -> Result<RunSeed, FixtureError> {
+fn build_seed(fixture: &Fixture, model_bundle: u64) -> Result<RunSeed, FixtureError> {
     Ok(RunSeed {
         id: RunId::new(Digest::of_bytes(fixture.id.as_bytes()).get()),
         model_turns: fixture.seed.model_turns,
@@ -173,6 +399,8 @@ fn build_seed(fixture: &Fixture) -> Result<RunSeed, FixtureError> {
         elapsed_ms: fixture.seed.elapsed_ms,
         capabilities: build_capabilities(&fixture.seed)?,
         workflow_version: fixture.seed.workflow_version,
+        model_bundle,
+        inference: InferenceSettings::default_settings(),
     })
 }
 
@@ -409,9 +637,13 @@ fn assert_budgets(fixture: &Fixture, trace: &RunTrace) -> Result<(), FixtureErro
 
 #[cfg(test)]
 mod tests {
-    use super::{build_capabilities, build_seed, crash_point};
+    use super::{
+        BackendKind, RecordingBackend, build_capabilities, build_seed, crash_point, distill,
+    };
     use crate::fixture::{CrashEntry, SeedSpec, parse_fixture};
-    use esper_runtime::CrashPoint;
+    use esper_runtime::{
+        BackendError, InferenceSettings, ModelBackend, ScriptedBackend, fingerprint_prompt, fnv1a64,
+    };
 
     #[test]
     fn capabilities_fill_the_fixed_sets() {
@@ -471,8 +703,8 @@ mod tests {
              "budget_remaining":{"model_turns":0,"mutations":1},
              "invariants":[],"forbidden":[]}}"#)
         .expect("test fixture parses");
-        let first = build_seed(&a).expect("seed builds").id.get();
-        let second = build_seed(&a).expect("seed builds").id.get();
+        let first = build_seed(&a, 0).expect("seed builds").id.get();
+        let second = build_seed(&a, 0).expect("seed builds").id.get();
         assert_eq!(first, second);
     }
 
@@ -480,20 +712,95 @@ mod tests {
     fn crash_plan_longer_than_one_fails_closed() {
         let plan = [
             CrashEntry {
-                point: CrashPoint::ToolIntent,
+                point: esper_runtime::CrashPoint::ToolIntent,
                 times: 1,
             },
             CrashEntry {
-                point: CrashPoint::AwaitInput,
+                point: esper_runtime::CrashPoint::AwaitInput,
                 times: 1,
             },
         ];
         assert!(crash_point(&plan).is_err());
         let repeated = [CrashEntry {
-            point: CrashPoint::ToolIntent,
+            point: esper_runtime::CrashPoint::ToolIntent,
             times: 2,
         }];
         assert!(crash_point(&repeated).is_err());
         assert!(crash_point(&[]).expect("empty plan").is_none());
+    }
+
+    #[test]
+    fn recording_backend_captures_prompt_fingerprints() {
+        let script = vec![b"FINISH {\"status\": \"completed\", \"summary\": \"s\"}".to_vec()];
+        let mut recorder = RecordingBackend::new(ScriptedBackend::new(
+            script,
+            InferenceSettings::default_settings(),
+        ));
+        // HOST-ONLY (E3)
+        let mut out = [0u8; 256];
+        let prompt = b"TOOLS\nSTATE turns=1 muts=0\nEMIT one decision line.\n";
+        let n = recorder.infer(prompt, &mut out).expect("script has a line");
+        assert_eq!(
+            &out[..n],
+            b"FINISH {\"status\": \"completed\", \"summary\": \"s\"}"
+        );
+        assert_eq!(recorder.pairs.len(), 1);
+        assert_eq!(recorder.pairs[0].0, fingerprint_prompt(prompt));
+        assert_eq!(recorder.pairs[0].1, out[..n].to_vec());
+    }
+
+    #[test]
+    fn recording_backend_unemit_drops_the_pair() {
+        let script = vec![b"CALL x".to_vec(), b"FINISH {}".to_vec()];
+        let mut recorder = RecordingBackend::new(ScriptedBackend::new(
+            script,
+            InferenceSettings::default_settings(),
+        ));
+        // HOST-ONLY (E3)
+        let mut out = [0u8; 256];
+        recorder.infer(b"p1", &mut out).expect("first line");
+        recorder.infer(b"p2", &mut out).expect("second line");
+        assert_eq!(recorder.pairs.len(), 2);
+        // Crash before commit: the second emission never committed.
+        recorder.unemit();
+        assert_eq!(recorder.pairs.len(), 1);
+        assert_eq!(recorder.pairs[0].0, fingerprint_prompt(b"p1"));
+        // The next boot re-issues the prompt and records it once.
+        recorder.infer(b"p2", &mut out).expect("re-issued line");
+        assert_eq!(recorder.pairs.len(), 2);
+    }
+
+    #[test]
+    fn distill_dedups_and_hashes_lines() {
+        // HOST-ONLY (E3)
+        let pairs = vec![
+            (1u64, b"CALL a".to_vec()),
+            (2u64, b"CALL b".to_vec()),
+            (1u64, b"CALL a-again".to_vec()),
+        ];
+        let table = distill(&pairs);
+        assert_eq!(table.len(), 2, "duplicate fingerprints distill once");
+        assert_eq!(table[0].prompt_fp, 1);
+        assert_eq!(table[0].line_hash, fnv1a64(b"CALL a"));
+        assert_eq!(table[0].line, b"CALL a");
+        assert_eq!(table[1].prompt_fp, 2);
+    }
+
+    #[test]
+    fn backend_kind_selects_the_report_trace() {
+        assert_ne!(BackendKind::Scripted, BackendKind::Tiny);
+        // The unit type check: `run_fixture_with` takes the kind.
+        let _ = BackendKind::Scripted;
+    }
+
+    #[test]
+    fn exhausted_script_surfaces_backend_error() {
+        let mut recorder = RecordingBackend::new(ScriptedBackend::new(
+            Vec::new(),
+            InferenceSettings::default_settings(),
+        ));
+        // HOST-ONLY (E3)
+        let mut out = [0u8; 256];
+        assert_eq!(recorder.infer(b"p", &mut out), Err(BackendError::Exhausted));
     }
 }

@@ -1,4 +1,4 @@
-# `esper-eval` — the golden-fixture evaluation runner (E0/E1/E2)
+# `esper-eval` — the golden-fixture evaluation runner (E0/E1/E2/E3)
 
 ## What this crate is
 
@@ -36,10 +36,20 @@ every adversarial fixture expects zero `ToolRequest` frames.
   `VerificationResult` records normalize into one runtime
   verification event.
 - `src/runner.rs` — builds the deterministic `RunId` (from the
-  fixture id), seed, model, device, fault plan, inputs, journal, and
-  crash injection; drives the runtime; checks terminal status,
-  budgets, trace, invariants, and forbidden clauses. Returns the
-  documented `FixtureReport`.
+  fixture id), seed, device, fault plan, inputs, journal, and crash
+  injection. E3: every fixture runs under **both** backends —
+  `run_fixture_with(fixture, kind)` first drives the scripted
+  teacher through a `RecordingBackend` (which records every
+  `(prompt, line)` pair and pops the pair on `unemit`, so
+  uncommitted lines never distill), distills the recording into a
+  `DistillEntry` table (deduped by prompt fingerprint, `line_hash =
+  fnv1a64(line)`), then replays it under `TinyBackend` on a fresh
+  journal/device/faults/inputs. The full assertion battery —
+  terminal status, budgets, exact trace, §11.3 invariants, forbidden
+  clauses, model-bundle binding — runs under **both** backends, and
+  the two backends' measured token totals must agree. The
+  `FixtureReport` carries the `BackendKind`-selected trace
+  (`run_fixture` / `run_fixture_file` select the scripted trace).
 - `src/compare.rs` — exact trace comparison. Runtime traces are
   decoded semantically: model lines go back through
   `esper_core::decision::decode_line`, JSON fields compare
@@ -97,16 +107,23 @@ every adversarial fixture expects zero `ToolRequest` frames.
    the closed fixture schema. Anything unknown fails closed with a
    path.
 2. **Build** — deterministic `RunId` from the fixture id; `RunSeed`
-   from `run_seed`; `ScriptedModel` from `script`; `FakeDevice` with
-   all eight pins defaulted to input/low, then explicit fixture
-   directions applied; `FaultPlan` from `device.faults`; `InputPlan`
-   from `input_events` in `after_decision` order.
-3. **Drive** — `drive_run` with the single planned `CrashPoint`
-   (at most one per fixture; see gaps). The engine reboots and
-   replays; the eval just observes the committed trace.
-4. **Assert** — terminal status string, exact event trace (kinds in
-   order, fields canonically equal), remaining model-turn and
-   mutation budgets, every §11.3 invariant, every `forbidden` clause.
+   from `run_seed` (the seed binds the backend's `BundleId`, so each
+   pass builds its own); `FakeDevice` with all eight pins defaulted
+   to input/low, then explicit fixture directions applied;
+   `FaultPlan` from `device.faults`; `InputPlan` from `input_events`
+   in `after_decision` order.
+3. **Drive (both backends)** — pass 1 drives the scripted teacher
+   through the `RecordingBackend`; the recording distills into a
+   `DistillEntry` table; pass 2 replays the table under
+   `TinyBackend` on a fresh world. `drive_run` takes the single
+   planned `CrashPoint` (at most one per fixture; see gaps). The
+   engine reboots and replays; the eval just observes the committed
+   traces.
+4. **Assert (both backends)** — terminal status string, exact event
+   trace (kinds in order, fields canonically equal), remaining
+   model-turn and mutation budgets, every §11.3 invariant, every
+   `forbidden` clause, and the model-bundle binding (the trace names
+   the seed's bundle). Scripted and tiny token totals must agree.
 
 ## Rules for working here
 

@@ -9,16 +9,36 @@
 use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel, TraceEvent,
-    drive_run,
+    CrashPoint, FakeDevice, FaultPlan, InferenceSettings, InputPlan, Journal, ModelBackend,
+    RunSeed, ScriptedBackend, TraceEvent, drive_run,
 };
 use waymaker_core::EffectSeq;
 
-/// Build a default seed with this run id.
-const fn seed(id: u64) -> RunSeed {
+/// Build the scripted backend for one run.
+fn backend(script: Vec<&str>) -> ScriptedBackend {
+    ScriptedBackend::new(
+        script
+            .into_iter()
+            .map(|line| line.as_bytes().to_vec())
+            .collect(),
+        InferenceSettings::default_settings(),
+    )
+}
+
+/// The seed bound to this run's model bundle (E3): the journal binds
+/// the exact model that must produce the run.
+fn backend_seed(backend: &ScriptedBackend) -> RunSeed {
+    RunSeed {
+        model_bundle: backend.bundle_id().0,
+        ..RunSeed::default_slice()
+    }
+}
+
+/// Build a default seed with this run id, bound to the backend.
+fn seed(backend: &ScriptedBackend, id: u64) -> RunSeed {
     RunSeed {
         id: RunId::new(id),
-        ..RunSeed::default_slice()
+        ..backend_seed(backend)
     }
 }
 
@@ -26,19 +46,13 @@ const fn seed(id: u64) -> RunSeed {
 fn drive(
     seed: &RunSeed,
     journal: &mut Journal,
-    script: Vec<&str>,
+    backend: &mut ScriptedBackend,
     device: &mut FakeDevice,
     faults: &mut FaultPlan,
     inputs: &mut InputPlan,
     crash: Option<CrashPoint>,
 ) -> esper_runtime::RunTrace {
-    let mut model = ScriptedModel::new(
-        script
-            .into_iter()
-            .map(|line| line.as_bytes().to_vec())
-            .collect(),
-    );
-    drive_run(seed, journal, &mut model, device, faults, inputs, crash).expect("run failed")
+    drive_run(seed, journal, backend, device, faults, inputs, crash).expect("run failed")
 }
 
 fn pin(n: u8) -> Pin {
@@ -79,7 +93,12 @@ fn verifications(trace: &esper_runtime::RunTrace) -> Vec<(bool, Vec<u8>, Vec<u8>
 /// `sensor_sample_read` returns the fixed channel value (SPEC §15.13).
 #[test]
 fn sensor_read_returns_fixed_values() {
-    let seed = seed(1);
+    let mut backend = backend(vec![
+        "CALL sensor_sample_read {\"sensor\": 0}",
+        "CALL sensor_sample_read {\"sensor\": 2}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"sensors sampled\"}",
+    ]);
+    let seed = seed(&backend, 1);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -87,11 +106,7 @@ fn sensor_read_returns_fixed_values() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL sensor_sample_read {\"sensor\": 0}",
-            "CALL sensor_sample_read {\"sensor\": 2}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"sensors sampled\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -113,7 +128,11 @@ fn sensor_read_returns_fixed_values() {
 /// `timer_uptime_read` reports the virtual clock without moving it.
 #[test]
 fn uptime_read_reports_the_clock() {
-    let seed = seed(2);
+    let mut backend = backend(vec![
+        "CALL timer_uptime_read {}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"uptime read\"}",
+    ]);
+    let seed = seed(&backend, 2);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -121,10 +140,7 @@ fn uptime_read_reports_the_clock() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL timer_uptime_read {}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"uptime read\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -143,7 +159,11 @@ fn uptime_read_reports_the_clock() {
 /// clock handle.
 #[test]
 fn delay_wait_advances_clock_and_verifies() {
-    let seed = seed(3);
+    let mut backend = backend(vec![
+        "CALL timer_delay_wait {\"ms\": 250}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"waited\"}",
+    ]);
+    let seed = seed(&backend, 3);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -151,10 +171,7 @@ fn delay_wait_advances_clock_and_verifies() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL timer_delay_wait {\"ms\": 250}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"waited\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -185,7 +202,12 @@ fn delay_wait_advances_clock_and_verifies() {
 /// the clock a second time.
 #[test]
 fn delay_redelivery_across_crash_advances_exactly_once() {
-    let seed = seed(4);
+    let mut backend = backend(vec![
+        "CALL timer_delay_wait {\"ms\": 250}",
+        "CALL timer_uptime_read {}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"waited once\"}",
+    ]);
+    let seed = seed(&backend, 4);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -193,11 +215,7 @@ fn delay_redelivery_across_crash_advances_exactly_once() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL timer_delay_wait {\"ms\": 250}",
-            "CALL timer_uptime_read {}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"waited once\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -219,7 +237,11 @@ fn delay_redelivery_across_crash_advances_exactly_once() {
 /// `device_status_report` summary: counts plus the clock.
 #[test]
 fn status_summary_payload_is_canonical() {
-    let seed = seed(6);
+    let mut backend = backend(vec![
+        "CALL device_status_report {\"detail\": \"summary\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"status read\"}",
+    ]);
+    let seed = seed(&backend, 6);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -227,10 +249,7 @@ fn status_summary_payload_is_canonical() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL device_status_report {\"detail\": \"summary\"}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"status read\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -247,7 +266,11 @@ fn status_summary_payload_is_canonical() {
 /// masks and the per-sensor raw values.
 #[test]
 fn status_full_payload_is_canonical() {
-    let seed = seed(7);
+    let mut backend = backend(vec![
+        "CALL device_status_report {\"detail\": \"full\"}",
+        "FINISH {\"status\": \"completed\", \"summary\": \"status read\"}",
+    ]);
+    let seed = seed(&backend, 7);
     let mut device = FakeDevice::new();
     device.set_direction(pin(4), esper_runtime::Direction::Input);
     let mut faults = FaultPlan::new();
@@ -256,10 +279,7 @@ fn status_full_payload_is_canonical() {
     let trace = drive(
         &seed,
         &mut journal,
-        vec![
-            "CALL device_status_report {\"detail\": \"full\"}",
-            "FINISH {\"status\": \"completed\", \"summary\": \"status read\"}",
-        ],
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,

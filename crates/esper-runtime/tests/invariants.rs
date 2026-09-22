@@ -10,14 +10,29 @@ use esper_core::decision::Level;
 use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    Capabilities, CrashPoint, Direction, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed,
-    ScriptedModel, TraceEvent, drive_run,
+    Capabilities, CrashPoint, Direction, FakeDevice, FaultPlan, InferenceSettings, InputPlan,
+    Journal, ModelBackend, RunSeed, ScriptedBackend, TraceEvent, drive_run,
 };
 
-const fn seed(id: u64) -> RunSeed {
+/// Build the scripted backend for one run.
+fn backend(lines: Vec<Vec<u8>>) -> ScriptedBackend {
+    ScriptedBackend::new(lines, InferenceSettings::default_settings())
+}
+
+/// The seed bound to this run's model bundle (E3): the journal binds
+/// the exact model that must produce the run.
+fn backend_seed(backend: &ScriptedBackend) -> RunSeed {
+    RunSeed {
+        model_bundle: backend.bundle_id().0,
+        ..RunSeed::default_slice()
+    }
+}
+
+/// Build a default seed with this run id, bound to the backend.
+fn seed(backend: &ScriptedBackend, id: u64) -> RunSeed {
     RunSeed {
         id: RunId::new(id),
-        ..RunSeed::default_slice()
+        ..backend_seed(backend)
     }
 }
 
@@ -44,11 +59,11 @@ fn pin(n: u8) -> Pin {
 /// exactly one intent and one physical write.
 #[test]
 fn no_dispatch_without_committed_intent() {
-    let seed = seed(201);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
         "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high\"}",
     ]));
+    let seed = seed(&backend, 201);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -56,7 +71,7 @@ fn no_dispatch_without_committed_intent() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -73,11 +88,11 @@ fn no_dispatch_without_committed_intent() {
 /// two observations, all under sequence 0.
 #[test]
 fn effect_identity_stable_across_retry() {
-    let seed = seed(202);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "CALL gpio_pin_read {\"pin\": 4}",
         "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 is low\"}",
     ]));
+    let seed = seed(&backend, 202);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     faults.fail_transient(pin(4), 1);
@@ -86,7 +101,7 @@ fn effect_identity_stable_across_retry() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -118,8 +133,8 @@ fn budgets_never_widen_across_reboots() {
     for (i, point) in CrashPoint::all().into_iter().enumerate() {
         // `cp_await_input` never fires without an Ask; the run still
         // completes with identical budgets.
-        let seed = seed(210 + i as u64);
-        let mut model = ScriptedModel::new(lines(script));
+        let mut backend = backend(lines(script));
+        let seed = seed(&backend, 210 + i as u64);
         let mut device = FakeDevice::new();
         let mut faults = FaultPlan::new();
         let mut inputs = InputPlan::new(Vec::new());
@@ -127,7 +142,7 @@ fn budgets_never_widen_across_reboots() {
         let trace = drive_run(
             &seed,
             &mut journal,
-            &mut model,
+            &mut backend,
             &mut device,
             &mut faults,
             &mut inputs,
@@ -150,13 +165,13 @@ fn budgets_never_widen_across_reboots() {
 /// untouched.
 #[test]
 fn permissions_never_widen_across_reboots() {
-    let seed = RunSeed {
-        capabilities: write_only_pin_5(),
-        ..seed(220)
-    };
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "CALL gpio_pin_write {\"pin\": 0, \"level\": \"high\"}",
     ]));
+    let seed = RunSeed {
+        capabilities: write_only_pin_5(),
+        ..seed(&backend, 220)
+    };
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -164,7 +179,7 @@ fn permissions_never_widen_across_reboots() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -180,13 +195,13 @@ fn permissions_never_widen_across_reboots() {
 /// though every tool call reported success.
 #[test]
 fn mutation_cannot_complete_without_passing_verifier() {
-    let seed = seed(221);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
         "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
         "CALL gpio_pin_write {\"pin\": 5, \"level\": \"high\"}",
         "FINISH {\"status\": \"completed\", \"summary\": \"unreached\"}",
     ]));
+    let seed = seed(&backend, 221);
     let mut device = FakeDevice::new();
     device.set_stuck(pin(5), Some(Level::Low));
     let mut faults = FaultPlan::new();
@@ -195,7 +210,7 @@ fn mutation_cannot_complete_without_passing_verifier() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -204,18 +219,18 @@ fn mutation_cannot_complete_without_passing_verifier() {
     .expect("run failed");
     assert_eq!(trace.terminal_status(), Some(TerminalStatus::Stuck));
     // The fourth line was never consumed: the run ended at the third attempt.
-    assert_eq!(model.lines_consumed(), 3);
+    assert_eq!(backend.lines_consumed(), 3);
 }
 
 /// Exactly one logical terminal: lines after `FINISH` are never
 /// consumed and only one terminal event exists.
 #[test]
 fn one_logical_terminal_result() {
-    let seed = seed(222);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "FINISH {\"status\": \"completed\", \"summary\": \"done\"}",
         "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
     ]));
+    let seed = seed(&backend, 222);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -223,7 +238,7 @@ fn one_logical_terminal_result() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -231,7 +246,7 @@ fn one_logical_terminal_result() {
     )
     .expect("run failed");
     assert_eq!(trace.terminal_status(), Some(TerminalStatus::Completed));
-    assert_eq!(model.lines_consumed(), 1);
+    assert_eq!(backend.lines_consumed(), 1);
     let terminals = trace
         .events()
         .iter()
@@ -245,12 +260,12 @@ fn one_logical_terminal_result() {
 /// resumes the same run.
 #[test]
 fn ask_remains_suspended_across_reset() {
-    let seed = seed(223);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "ASK {\"prompt\": \"which pin?\", \"schema\": 1}",
         "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
         "FINISH {\"status\": \"completed\", \"summary\": \"pin 4 high per operator\"}",
     ]));
+    let seed = seed(&backend, 223);
     let mut device = FakeDevice::new();
     let mut faults = FaultPlan::new();
     let mut inputs = InputPlan::new(Vec::new());
@@ -258,7 +273,7 @@ fn ask_remains_suspended_across_reset() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -275,7 +290,7 @@ fn ask_remains_suspended_across_reset() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,
@@ -291,10 +306,10 @@ fn ask_remains_suspended_across_reset() {
 /// capability authorization, without touching hardware.
 #[test]
 fn device_direction_denied_after_capability_check() {
-    let seed = seed(224);
-    let mut model = ScriptedModel::new(lines(&[
+    let mut backend = backend(lines(&[
         "CALL gpio_pin_write {\"pin\": 4, \"level\": \"high\"}",
     ]));
+    let seed = seed(&backend, 224);
     let mut device = FakeDevice::new();
     device.set_direction(pin(4), Direction::Input);
     let mut faults = FaultPlan::new();
@@ -303,7 +318,7 @@ fn device_direction_denied_after_capability_check() {
     let trace = drive_run(
         &seed,
         &mut journal,
-        &mut model,
+        &mut backend,
         &mut device,
         &mut faults,
         &mut inputs,

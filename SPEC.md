@@ -1318,3 +1318,630 @@ direction/level arrays and the per-sensor raw values, still within the
   §5.2 reason bytes); delay redelivery under the same `EffectId` after
   a crash between dispatch and observation commit does not
   double-advance the clock.
+
+---
+
+## 18. Rung E3: model adapters
+
+Rung E3 puts a real model interface behind the engine's `Infer`
+step. Two backends implement one object-safe trait: the scripted host
+backend (the E0/E1 `ScriptedModel` behavior, formalized) and the tiny
+local backend (a distillation stand-in: a recorded prompt→line table
+keyed by the prompt fingerprint, ADR 0001). The engine crew owns the rewiring of
+`engine.rs` to this interface; this section is the contract they code
+against. Nothing here changes settled sections; deltas are called out
+as ambiguity resolutions in §18.10.
+
+Reconciled 2026-09-22 against ADR 0001
+(`docs/adr/0001-e3-tiny-backend-distillation-standin.md`) and the
+shipped `backend.rs`: where the foundation draft below differed from
+the implementation, the implementation governs, and each delta is
+marked inline.
+
+### 18.1 The backend contract
+
+`esper_runtime::backend::ModelBackend` is the single model interface.
+It is object-safe (no generics, no `Self` returns) so the engine holds
+`&mut dyn ModelBackend`:
+
+```rust
+pub trait ModelBackend {
+    fn infer(&mut self, prompt: &[u8], out: &mut [u8]) -> Result<usize, BackendError>;
+    fn bundle_id(&self) -> BundleId;
+    fn last_usage(&self) -> TokenUsage;
+    fn unemit(&mut self);
+}
+```
+
+- `infer` writes one decision line into the caller-owned `out`
+  buffer and returns the bytes written. The caller sizes `out` at
+  `OUTPUT_CAP` (256); a line that does not fit is
+  `BackendError::OutputTooLong`, never a truncation. The prompt is
+  read-only; the backend must not retain it beyond the call.
+- `bundle_id` returns the backend's identity (§18.7). It is stable
+  for the backend's lifetime.
+- `last_usage` returns the token accounting of the most recent
+  `infer` call (`TokenUsage { input_tokens, output_tokens }`,
+  `Default` is zero). It changes only on a successful `infer`.
+- `unemit` rewinds one emission for crash-before-commit recovery:
+  the engine calls it when a line was taken but never committed, so
+  the next boot must see the same line again. `TinyBackend::unemit`
+  is a no-op by construction (§18.3); `ScriptedBackend::unemit`
+  rewinds its cursor with `saturating_sub`.
+
+Open item: the trait carries no `Send` bound, and the engine's async
+driver holds `&mut dyn ModelBackend` across an await — clippy's
+`future_not_send` (nursery) fires on it. Either the trait gains
+`: Send` or the engine crew contains the backend outside the `Send`
+future. See §18.10.
+
+Error vocabulary (`BackendError`, via `thiserror`, `no_std`
+compatible):
+
+| Variant | Meaning |
+|---|---|
+| `Exhausted` | the backend has no more outputs to emit (scripted script consumed) |
+| `OutputTooLong` | the emitted line does not fit the caller buffer |
+| `UnknownPrompt` | no distillation entry matches the prompt fingerprint (tiny backend) |
+| `PolicyMismatch` | the entry failed its integrity check (tiny backend) |
+
+Inference settings travel with the seed, never as hidden constants:
+
+```rust
+pub struct InferenceSettings {
+    pub max_prompt_bytes: u16,
+    pub max_output_bytes: u16,
+}
+impl InferenceSettings {
+    pub const fn default_settings() -> Self; // 1024 / 256
+    pub const fn validate(&self) -> Result<(), &'static str>; // each in 1..=cap
+    pub const fn bytes(&self) -> [u8; 4]; // little-endian, for hashing
+}
+```
+
+`PROMPT_CAP` is 1024 and `OUTPUT_CAP` is 256. `validate` fails closed
+on 0 or on either bound above its cap; the seed's `validate` maps the
+reason through unchanged.
+
+### 18.2 Scripted host backend
+
+`ScriptedBackend` (host-only, `#[cfg(feature = "host")]`) formalizes
+the E0/E1 `ScriptedModel` as a `ModelBackend`:
+
+```rust
+pub struct ScriptedBackend {
+    lines: Vec<Vec<u8>>,      // HOST-ONLY
+    index: usize,
+    settings: InferenceSettings,
+    bundle: BundleId,
+    last_usage: TokenUsage,
+}
+impl ScriptedBackend {
+    pub fn new(lines: Vec<Vec<u8>>, settings: InferenceSettings) -> Self;
+    pub const fn lines_consumed(&self) -> usize;
+}
+```
+
+- `new` binds the bundle at construction: `fnv1a64` over the domain
+  tag `esper-scripted-v1`, then each line length-prefixed, in order
+  (§18.7). Two scripts that differ in any byte have different bundle
+  ids. (Change from the foundation draft, ADR 0001: the settings
+  bytes are not hashed into the scripted bundle; the seed snapshot
+  binds the settings separately, so no coverage is lost.)
+- `infer` emits `lines[index]` into `out` (copied, never aliased):
+  exhausted is `Exhausted`, too long for `out` is `OutputTooLong`.
+  On success it sets `last_usage` to `{ prompt.len(), n }`
+  (saturating to `u32::MAX`, unreachable in practice) and advances
+  the index.
+- `unemit` rewinds the index with `saturating_sub(1)` — the same
+  crash-before-commit semantic `ScriptedModel::unemit` had.
+
+`world::ScriptedModel` was retired by the engine crew during the E3
+rewiring; `ScriptedBackend` is its replacement — the engine no longer
+pulls canned lines from a script object.
+
+### 18.3 Tiny local backend
+
+The tiny backend is a **distillation stand-in** for a trained
+on-device model (ADR 0001): it answers each inference prompt from a
+caller-owned `DistillEntry` table keyed by the prompt fingerprint —
+a table of `(prompt, line)` pairs recorded from the scripted
+backend's own runs. No trained weights exist anywhere in this rung.
+
+```rust
+pub fn fingerprint_prompt(prompt: &[u8]) -> u64; // fnv1a64(prompt)
+pub const TINY_PARAMS_BYTES: usize = 2156; // declared parameter budget
+
+pub struct DistillEntry<'a> {
+    pub prompt_fp: u64,   // expected fingerprint_prompt(prompt)
+    pub line_hash: u64,   // fnv1a64(line): integrity of the entry
+    pub line: &'a [u8],   // the decision line to emit
+}
+
+pub struct TinyBackend<'a> {
+    table: &'a [DistillEntry<'a>],
+    usage: TokenUsage,
+    bundle: BundleId,
+}
+impl<'a> TinyBackend<'a> {
+    pub fn new(table: &'a [DistillEntry<'a>]) -> Self;
+}
+```
+
+(Change from the foundation draft, ADR 0001: the draft described a
+`TinyParams` parameter block and a pseudo-random neural forward pass
+producing the fingerprint. The shipped backend keys on
+`fnv1a64(prompt)` directly — the fingerprint contract the trained
+backend will keep is "same prompt bytes in, byte-identical output
+on replay", not the projection — and keeps `TINY_PARAMS_BYTES =
+2156` as a declared parameter budget the reference table distills
+to, pinned by test. Rationale: shipping pseudo-weights would lie
+about the backend's capability; a table replay gives the §18.9
+byte-identical replay by construction, which a pseudo-random
+"model" could not.)
+
+`infer` semantics, in fixed order:
+
+1. `fp = fingerprint_prompt(prompt)`; linear scan for
+   `prompt_fp == fp`, else `UnknownPrompt`. The backend never
+   guesses: an unrecorded prompt is a hard failure.
+2. `fnv1a64(entry.line) == entry.line_hash`, else `PolicyMismatch`.
+   The table is data, not code: a corrupt or tampered entry fails
+   closed here, before any byte reaches the decoder.
+3. `entry.line` fits `out`, else `OutputTooLong`; copy it in.
+4. Set `last_usage = { prompt.len(), n }` (saturating `u32`); return
+   `n`.
+
+`unemit` is a no-op: the lookup is pure — no cursor, no hidden
+state — so crash-before-commit replays the same prompt and gets the
+same line. Idempotent by construction. (This is the documented
+reason, not an omission.)
+
+Bundle identity: `bundle_id` is `fnv1a64` over the domain tag
+`esper-tiny-v1`, then each entry's `(prompt_fp, line_hash)` as
+little-endian `u64`, in table order (§18.7). The line bytes are
+bound indirectly through `line_hash`; two tables that answer the
+same prompts with the same lines share one bundle id — the identity
+is about behavior, not about which bytes were distilled when.
+
+**Honesty statement.** The distillation table is a stand-in for
+trained weights: it replays lines recorded from the scripted backend
+(§18.9). No training has happened and no gradient step has run. Any
+claim that the tiny backend "learned" a trajectory is false. What is
+real: the fingerprint contract, the table lookup, the integrity
+check, and the bundle binding are the exact shapes the
+trained-weights backend will keep; only the lookup source changes.
+
+### 18.4 Prompt construction
+
+`build_prompt(ctx: &PromptCtx, out: &mut [u8]) -> usize` renders one
+prompt into the caller buffer. The prompt opens with `TOOLS`, renders
+all six catalog tool signatures via
+`esper_protocol::render_signature` (the single contract source,
+SPEC §17.3), then a compact `STATE` line, an optional `REPAIR` line,
+an optional `LAST` observation line, and closes with the `EMIT`
+trailer:
+
+```text
+TOOLS
+<render_signature of each of the 6 catalog tools>
+STATE turns=<n> muts=<n>
+REPAIR <attempt>:<variant> <grammar one-liner>
+LAST <observation bytes>
+EMIT one decision line.
+```
+
+The model sees the signatures, never a bare tool list: the tiny
+backend keys on exact prompt bytes, and the scripted backend ignores
+the prompt, so the prompt is data for the fingerprint first and
+readable context second. The `REPAIR` line appears only after an
+invalid line burned a turn; it carries the one-based repair attempt,
+the §4.4 `variant` vocabulary (`malformed` | `invalid_args`), and the
+grammar one-liner derived from `esper_core::decision::decode_line`
+(`CALL <tool> <json> | ASK <json> | FINISH <json>`), so a model that
+just burned a repair turn sees the exact output shape again. The
+`LAST` line appears only after a tool reported; it carries the
+observation bytes raw (already bounded machine JSON, capped at 128
+bytes by the engine).
+
+Supporting types:
+
+```rust
+pub struct RepairHint { pub attempt: u8, pub variant: &'static str }
+pub struct PromptCtx<'a> {
+    pub turns_left: u16,
+    pub mutations_left: u16,
+    pub last_observation: Option<&'a [u8]>,
+    pub repair: Option<RepairHint>,
+}
+```
+
+- `turns_left` / `mutations_left` render as decimal.
+- Truncation rule: the `TOOLS` block, the `STATE` line, the `REPAIR`
+  line, and the `EMIT` trailer are fixed — they are never truncated.
+  Only the `LAST` observation tail may truncate, and then it ends with
+  `[truncated]`. The framing around the signatures is abbreviated
+  (`turns=`/`muts=`) so the fixed prompt — six exact signatures plus
+  framing — always fits `PROMPT_CAP`; a unit test pins this budget, so
+  signature growth fails loudly instead of silently squeezing the
+  observation. (A narrowed `max_prompt_bytes` truncates
+  deterministically head-first.)
+- Replay: every prompt input comes from durable or rebuilt state, so
+  a post-reboot inference builds the byte-identical prompt — the tiny
+  backend's prompt→line lookup depends on it. The engine restores the
+  prompt inputs from the journal for exactly this reason.
+
+### 18.5 Model-agnostic JSON repair policy
+
+Repair is identical under both backends: the engine builds the same
+`PromptCtx` (same REPAIR line shape) whatever backend produced the
+bad line. Backends differ only in how they produce the next line,
+never in the hint they receive.
+
+- Allowance: **3 bounded repair turns.** On the `k`-th repair
+  (`k` = 1, 2, 3) the prompt carries
+  `REPAIR <k>:<variant> <grammar one-liner>` (§18.4). `variant` is the
+  §4.4 vocabulary (`malformed` | `invalid_args`). When the allowance
+  is exhausted the run terminates `ModelInvalid` with a bounded
+  summary — clean, never a hang. (Resolution vs §4.4/§3.2's allowance
+  of 2: see §18.10.)
+- The REPAIR line re-states the decision grammar (`CALL <tool>
+  <json> | ASK <json> | FINISH <json>`, derived from
+  `esper_core::decision::decode_line`): the model that just burned a
+  repair turn sees the exact output shape again. The decoder's
+  field-level detail (§4.4's field and received category) travels in
+  the observation at the engine crew's discretion.
+- Repair turns are ordinary model turns: they consume `model_turn`
+  budget and their output re-enters `Infer` through the sole gate
+  (§18.6). Denials stay terminal `Denied`, never repair turns
+  (§4.5).
+
+### 18.6 Grammar enforcement
+
+`esper_core::decode_line` is the sole gate between a backend and the
+engine. Backends emit bytes; the decoder admits `Decision`s. There is
+no backend-specific parsing, no second grammar, and no lenient path:
+a line the tiny backend emits faces exactly the validator the
+scripted lines faced. This is what makes the §18.9 replay
+meaningful — identical bytes in, identical decisions out.
+
+### 18.7 Bundle identity
+
+`BundleId(pub u64)` names a backend's model identity. Hash: FNV-1a
+64-bit, offset basis `0xcbf29ce484222325`, prime `0x100000001b3`
+(`pub const fn fnv1a64(bytes: &[u8]) -> u64`).
+
+- Scripted: `fnv1a64("esper-scripted-v1" ++ le_len(line_0) ++
+  line_0 ++ …)` — each line length-prefixed, in order.
+- Tiny: `fnv1a64("esper-tiny-v1" ++ le64(prompt_fp) ++
+  le64(line_hash) per entry, table order)` — the line bytes are
+  bound indirectly through `line_hash`.
+
+(Change from the foundation draft, ADR 0001: the scripted bundle no
+longer hashes the settings bytes, and the tiny bundle hashes the
+table entries rather than a parameter block. The seed snapshot binds
+the settings separately, so no coverage is lost.)
+
+Seed wiring: `RunSeed` gains `pub model_bundle: u64` (the
+`BundleId`'s inner value) and `pub inference: InferenceSettings`.
+The journal-binding snapshot grows to a **67-byte** canonical
+encoding:
+
+| bytes | field | encoding |
+|---|---|---|
+| 0..8 | `id` | `u64` le |
+| 8..16 | `elapsed_ms` | `u64` le |
+| 16..20 | `input_tokens` | `u32` le |
+| 20..24 | `output_tokens` | `u32` le |
+| 24..26 | `model_turns` | `u16` le |
+| 26..28 | `mutations` | `u16` le |
+| 28..30 | `workflow_version` | `u16` le |
+| 30..38 | `read_pins` | 8 bytes |
+| 38 | `read_count` | `u8` |
+| 39..47 | `write_pins` | 8 bytes |
+| 47 | `write_count` | `u8` |
+| 48..52 | `sensors` | 4 bytes |
+| 52 | `sensor_count` | `u8` |
+| 53 | `allow_timer` | `u8` |
+| 54 | `allow_status` | `u8` |
+| 55..63 | `model_bundle` | `u64` le |
+| 63..65 | `max_prompt_bytes` | `u16` le |
+| 65..67 | `max_output_bytes` | `u16` le |
+
+The `RunStarted` record carries these 67 bytes; recovery compares
+them byte for byte, so a reboot can never swap the model, the
+prompt/output caps, or any budget or capability the seed granted.
+`RunSeed::validate` additionally runs `inference.validate()` and
+maps its reason through unchanged.
+
+### 18.8 Resource budgets
+
+Normative caps for the E3 slice (measured numbers are the
+measurement crew's pass — stated here as targets, not claims):
+
+| Budget | Cap | Notes |
+|---|---|---|
+| Prompt buffer | 1024 B (`PROMPT_CAP`) | caller-owned; `build_prompt` never exceeds it |
+| Single decision line | 256 B (`OUTPUT_CAP`) | `infer`'s `out`; longer is `OutputTooLong` |
+| `max_prompt_bytes` | 1..=1024 | seed-bound, in the 67-byte snapshot |
+| `max_output_bytes` | 1..=256 | seed-bound, in the 67-byte snapshot |
+| `TINY_PARAMS_BYTES` | 2156 B declared | parameter budget the reference distill table distills to; pinned by test — parameter growth is always deliberate |
+| Fingerprint stack | trivial | `fingerprint_prompt` is `fnv1a64` over the prompt bytes — no arrays, no heap |
+| Distillation table | caller-owned | host builds it; the largest fixture table (`i-sensor-timer-status-happy`, 5 entries) is 292 B by the §18.3 entry layout (line bytes + 16 B/entry); flash is caller-chosen (rodata or RAM) |
+| Tiny-backend RAM | 1,312 B projected | 1024 B prompt buffer (`PROMPT_CAP`) + 256 B output buffer (`OUTPUT_CAP`) + 24 B `TinyBackend` struct (32-bit Xtensa by construction; 32 B on the 64-bit host) + 8 B fingerprint digest state — see the projection below |
+| Repair allowance | 3 turns | §18.5; consumes `model_turn` budget |
+| `TokenUsage` | `u32` counters | saturating; reported per `infer` |
+| Tiny `infer` latency (host) | mean ≈ 0.6 µs | 1,000-iteration loop, `fingerprint_prompt` + `infer`, x86_64 host; max observed 7.5 ms on one preempted iteration (loaded shared VM) — measurement only, never a gate; see `crates/esper-runtime/tests/resource_measure.rs` |
+| Target-board code size (measured) | see projection | Espressif `esp` toolchain, `rustc 1.97.0-nightly (8ea53bcd7 2026-07-08)`, `xtensa-esp32s3-none-elf`, `-Z build-std=core,compiler_builtins`, release; `.text` + `.rodata` per crate rlib; see the projection below |
+| Energy | unmeasured | no energy proxy exists for the target board; the SPEC §16 open question stays open — nothing in E3 stands in for it |
+
+#### 18.8.1 ESP32-S3 projection (measured vs projected)
+
+Method: every "measured-target" row is `size -A` over the release
+rlib built with the toolchain above. The stock tree does **not** build
+for this target as-is: `thiserror = "2"` defaults to its `std`
+feature, and the target has no precompiled `std`; the measurement
+used a temporary `thiserror = { version = "2", default-features =
+false }` override, reverted after measuring. A real firmware port
+must carry that one-line change.
+
+| Component | Bytes | Kind |
+|---|---|---|
+| `esper-protocol` `.text`+`.rodata` | 9,942 | measured-target |
+| `esper-core` `.text`+`.rodata` | 12,626 | measured-target |
+| `esper-runtime` (no `host`) `.text`+`.rodata` | 4,598 | measured-target |
+| `waymaker-core` `.text`+`.rodata` | 3,693 | measured-target |
+| `thiserror` (no default features) `.text`+`.rodata` | 170 | measured-target |
+| `TINY_PARAMS_BYTES` (declared budget) | 2,156 | declared |
+| Largest distill table (§18.3 layout) | 292 | measured-host (fixture-derived) |
+| **Flash subtotal (crates + params + table)** | **33,477** | projected |
+| `core` from `-Z build-std` (full rlib) | 161,538 | measured-target, upper bound — a linked image keeps only referenced items |
+| Prompt buffer + output buffer + `TinyBackend` + fingerprint state | 1,312 | exact by construction (1024 + 256 + 24 + 8) |
+| **RAM subtotal (inference working set)** | **1,312** | projected |
+
+What the projection does **not** claim: a linked firmware image
+(needs a board HAL, linker script, and the E4+ runtime surface — none
+exist in this rung), the `core` share that actually links (only the
+referenced items survive linking; the 161,538 B full-rlib number is an
+upper bound), or any energy figure. The `core` rlib's full
+`.text`+`.rodata` is reported so a later link map can be checked
+against it.
+
+### 18.9 Both-backend exit criterion
+
+E3 exits when every golden trajectory in `spec/trajectories/`
+replays byte-identical under both backends. Procedure:
+
+1. **Record.** Run each fixture under `ScriptedBackend`; capture
+   every `(prompt_bytes, emitted_line)` pair the run produces.
+2. **Distill.** Build the `DistillEntry` table: `prompt_fp =
+   fingerprint_prompt(prompt)`, `line_hash = fnv1a64(line)`,
+   `line` verbatim. The table is a build artifact next to the
+   fixtures, reviewed like one.
+3. **Replay.** Run each fixture under `TinyBackend` with the
+   distilled table. Pass means: same terminal status, same committed
+   decision sequence, same journal bytes — the §18.6 gate makes
+   "same bytes in" mean "same run out".
+
+A trajectory the tiny backend cannot replay (an `UnknownPrompt` on
+the path) is a distillation gap, not a backend bug: re-record with
+the missing prompt covered. The eval crew owns the replay harness;
+the exit criterion is per-trajectory, all green.
+
+### 18.10 Ambiguity resolutions
+
+1. **`TINY_PARAMS_BYTES`.** The brief named 2156; the foundation
+   draft computed 2192 from a `TinyParams` layout that ADR 0001 then
+   removed. 2156 stands as a declared parameter budget the reference
+   distill table distills to, pinned by test — parameter growth is
+   always deliberate.
+2. **Repair allowance.** §4.4/§3.2 settle an allowance of 2 for the
+   E0/E1 slice. E3 normatively sets **3** for backend-driven runs:
+   the tiny backend's outputs are coarser than hand-written script
+   lines, so one extra repair turn keeps the exit criterion
+   reachable while the bound stays small and explicit. The engine
+   crew updates the `Repair` → `Degraded` guard from
+   `repairs_used >= 2` to `repairs_used >= 3`; §4.4's text is left
+   untouched as the slice's history.
+3. **Fingerprint design (superseded).** The foundation draft
+   described byte tokenization feeding a pseudo-random neural
+   forward pass. ADR 0001 replaced it: `fingerprint_prompt` is
+   `fnv1a64` over the exact prompt bytes. The draft's resolution
+   text is retired with the design.
+4. **REPAIR line vs §4.4's structured error.** The shipped prompt's
+   REPAIR line carries the attempt, the §4.4 `variant` vocabulary,
+   **and** the grammar one-liner derived from
+   `esper_core::decision::decode_line` (§18.4) — the model that just
+   burned a repair turn sees the exact output shape again. The
+   decoder's field-level detail (§4.4's field and received category)
+   travels in the observation at the engine crew's discretion. Both
+   backends see the same shape either way.
+5. **`unemit` asymmetry.** `ScriptedBackend::unemit` rewinds a
+   cursor; `TinyBackend::unemit` is a no-op. Not an omission: the
+   table lookup is pure, so replaying the prompt after a crash
+   re-derives the same line — idempotent by construction.
+6. **ADR 0001 override.** The foundation draft's §18.3 (parameter
+   block, neural fingerprint) was deliberately replaced by the E3
+   crews with the distillation stand-in, documented in
+   `docs/adr/0001-e3-tiny-backend-distillation-standin.md`. The
+   draft's §18.4 flat machine prompt was likewise replaced — in the
+   other direction: the shipped prompt restores the draft's
+   TOOLS-block shape (six `render_signature` lines, compact STATE,
+   REPAIR with grammar one-liner, truncatable LAST, EMIT trailer)
+   per the E3 TOOLS/signature requirement. The implementation
+   governs; the draft text is superseded where it disagrees.
+7. **`Send` bound (resolved).** `ModelBackend` now carries a `Send`
+   supertrait: the engine's async driver holds `&mut dyn
+   ModelBackend` across an await, and clippy's `future_not_send`
+   (nursery) requires it. All shipped backends are `Send`
+   (`TinyBackend` borrows only `&[u8]` and holds integer values),
+   proven by test.
+8. **Scripted bundle length prefix (resolved).** The scripted bundle
+   digest now hashes the line lengths as little-endian `u64` and
+   includes `InferenceSettings::bytes()` in the digest, so the bundle
+   id is platform-independent and settings-sensitive. The earlier
+   `usize`-width observation is retired.
+
+## 19. Rung E3+jev: the Jev host-backend adapter
+
+TypeSafe AI's Jev ("System One model", launched 2026-09-15) answers
+typed, probabilistic questions instead of generating text. The
+adapter puts Jev behind the §18 `ModelBackend` trait as a host-only
+network client: one ReAct turn is one `POST` to
+`https://api.typesafe.ai/v1/systemone`, and one parallel pass returns
+the turn's decision as data, not prose.
+
+### 19.1 The typed request contract
+
+The adapter sends, per turn, a JSON body with three fields:
+
+- `state`: the engine's rendered prompt, verbatim (the same compact
+  prompt §18 builds: TOOLS block, STATE line, optional REPAIR line,
+  truncatable LAST observation, EMIT trailer).
+- `model`: the pinned version string (see §19.5).
+- `questions`: three typed questions —
+  - `decision`: a `Choice` over eight options — one per §17 catalog
+    tool plus `ask` and `finish` — with up to 255 options supported
+    by the primitive and eight used by the schema.
+  - `should_ask`: a `Noul` — P(the run cannot proceed safely
+    without human input).
+  - `confidence`: a `Score` over four ordered levels
+    (1 = guessing, 2 = uncertain, 3 = confident, 4 = certain).
+
+Field order is fixed so the request bytes are deterministic: the
+mock cassette keys are `fnv1a64` over the exact request JSON.
+
+### 19.2 The design mapping
+
+- **Choice → the turn's decision.** Jev selects one of the eight
+  options; the adapter renders the decision line from a deterministic
+  template (§19.4). The response's `choice` names the option and its
+  `probabilities` carry the eight-way distribution, recorded on the
+  receipt.
+- **Noul → the ask gate.** At or above 0.50 (`NOUL_GATE_BPS`) the
+  adapter overrides the choice with `ask`, whatever Jev chose: the
+  run cannot proceed safely without human input. The receipt records
+  both the raw choice and the gated outcome, so the override is
+  auditable.
+- **Score → calibrated confidence.** The fractional score (thousandths
+  of a level) and the four per-level probabilities are recorded on
+  every receipt. The documented escalation bands are: below 1.5 →
+  human review; 1.5–3.0 → proceed with extra scrutiny; above 3.0 →
+  act. The deterministic monitor does not consume these yet — the
+  mapping is the escalation policy a later rung wires in.
+
+### 19.3 The response contract and fail-closed parsing
+
+A System One response carries `model`, `answers` (the three typed
+answers, each with its distribution), and informational `usage`. The
+adapter requires: the `model` equals the configured version
+(§19.5); every question present with the right `type`; the choice
+inside the eight-option schema; every probability in 0..=1; the
+score in 1..=4 with all four level probabilities present. Anything
+else — malformed JSON, a missing answer, an unknown option, an
+out-of-range probability — fails closed to `BackendError`
+(`PolicyMismatch` for integrity failures, `UnknownPrompt` for
+out-of-schema answers), never to a guessed line.
+
+The adapter parses responses with its own small host-side JSON
+reader, not the `no_std` protocol parser: a response nests four deep
+(`answers` → `decision` → `probabilities`), past the protocol
+parser's `MAX_JSON_DEPTH = 3` denial-of-service bound, which stays
+untouched. Duplicate keys are rejected; trailing bytes are rejected.
+
+### 19.4 The cascade and its hard limitation
+
+Jev selects *which* decision to take; deterministic arg templates
+supply the concrete arguments. The template reads the turn's last
+observation for numeric `pin`/`sensor` fields (defaulting to 0) and
+renders the byte-exact grammar line; every other argument is a fixed
+constant (`"high"`, `100`, `{}`, `"summary"`).
+
+The limitation is structural and must be stated plainly: **Jev
+cannot emit arbitrary values.** It never sees or produces a pin
+number, a URL, or a JSON blob — every concrete value in an emitted
+line comes from the caller-enumerated template or the last
+observation. A decision outside the template space (a pin Jev
+"chose", a free-form summary) is inexpressible through this backend,
+loudly, by construction. Where the scripted backend can emit any
+line (including adversarial ones) and the tiny backend looks up any
+recorded line, the Jev backend can only ever emit the eight template
+lines. A truncated observation fails closed to the defaults: the
+templates do not act on partial evidence.
+
+### 19.5 Model and evidence identity
+
+- **Bundle identity.** `JevBackend::bundle_id` digests the adapter
+  tag (`esper-jev-v1`), the model version string, and the endpoint.
+  The seed binds this bundle exactly like §18's: a version change is
+  a different bundle, and a response naming a different version than
+  the backend was constructed with fails closed (`VersionMismatch`).
+  The adapter pins `jev-1.13.0` so the digest is reproducible;
+  the value is what public material resolves `jev-latest` to
+  (2026-09-18), unverified against official documentation — the pin
+  is a label, not a discovery.
+- **Per-turn evidence.** Every inference appends a `JevReceipt`:
+  the parsed answer (raw choice, gated choice, the gate bit, the
+  eight choice probabilities, the Noul probability, the fractional
+  score, the four level probabilities) plus the measured usage
+  (input bytes read; output tokens are always zero — Jev generates
+  no text and output is unmetered). The receipts are the run-record
+  home for the returned probabilities.
+- **Crash consistency.** `unemit` pops the last receipt. A crash
+  before the decision commit re-infers the identical prompt, the
+  mock serves the identical recorded response by request hash, and
+  the run completes with exactly one receipt per turn.
+- **Determinism caveat.** Jev answers are reproducible to about
+  0.02, not bit-identical. The receipts record what was actually
+  returned; the mock path is exact, the live path carries the
+  caveat. Replay of a live run is evidence review, not
+  bit-reproduction.
+
+### 19.6 Transports: mock now, live deferred
+
+- **`MockTransport`** replays recorded System One responses from a
+  cassette: `{"model_version", "endpoint",
+  "pairs": [{"request_hash": "<decimal u64>",
+  "response": {…}}, …]}`. The hash is a decimal *string* because
+  request hashes are full-width `u64`s, past what a JSON number
+  carries exactly. An unrecorded request fails closed
+  (`UnknownPrompt`) — the mock never guesses, the same rule as the
+  tiny backend's distill table. Cassettes live in
+  `spec/jev-cassettes/` as reviewed fixtures, authored by record
+  mode (`ESPER_JEV_RECORD=1` drives the scenarios through a
+  directing transport and writes the pairs).
+- **`LiveTransport`** builds the documented `POST` (bearer auth,
+  JSON body) but defers the send: without an API key — and without
+  TLS in this host profile — every call fails with `LiveDeferred`.
+  The request bytes it *would* send are exactly what
+  `build_request_json` produces, pinned by golden tests, so the day
+  a key arrives only the socket layer is new. **No API key is
+  available; live verification is deferred until Mark provides one,
+  and he is not being asked for it now.**
+
+### 19.7 Why the 19 byte-exact fixtures stay scripted+tiny
+
+The §14 fixture corpus (19 trajectories) asserts byte-exact model
+lines, including adversarial ones: invalid arguments, unknown tools,
+trailing garbage, NUL bytes, malformed verbs. A typed Jev mock can
+only emit the eight template lines — it cannot produce, and must
+not pretend to produce, the adversarial stream. So the 19 fixtures
+keep running under Scripted and Tiny only, and the Jev suite
+(`crates/esper-runtime/tests/jev.rs`) mirrors the key scenarios in
+typed form instead: the happy path (read → write → finish), a
+denied write, the Noul ask gate with suspend/resume, and a crash
+before the decision commit. The §18 JSON repair policy is
+unreachable-by-construction through the Jev backend (there is no
+text to repair) and is retained as defense in depth.
+
+### 19.8 Host-only boundary and resource notes
+
+The adapter is a network client behind the `host` feature. Nothing
+in it enters the `no_std`/`no_alloc` crates, the firmware story, or
+the §18 target measurements: there is no Xtensa size, no RAM
+budget, and no energy claim for a cloud call. Per-call cost follows
+the Jev pricing ($0.042/MTok input, output unmetered) against the
+measured input bytes on the receipts; stated latency is 70–500 ms
+per the docs, unmeasured here. `cargo check/test -p esper-runtime
+--no-default-features` stays green, and no Jev symbol is reachable
+without `host`.

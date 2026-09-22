@@ -1,10 +1,12 @@
 //! Host-only world doubles for the E0/E1 slice.
 //!
-//! `ScriptedModel` emits canned model lines, `FakeDevice` is an 8-pin
-//! GPIO double with idempotent redelivery plus four fixed sensor
-//! channels and a shared virtual millisecond clock (SPEC §15.13–
-//! §15.14), `FaultPlan` injects transient device hiccups, and
-//! `InputPlan` delivers typed human input for `Ask` suspension.
+//! `FakeDevice` is an 8-pin GPIO double with idempotent redelivery
+//! plus four fixed sensor channels and a shared virtual millisecond
+//! clock (SPEC §15.13–§15.14), `FaultPlan` injects transient device
+//! hiccups, and `InputPlan` delivers typed human input for `Ask`
+//! suspension. The scripted model backend lives in
+//! [`crate::backend`]: [`crate::backend::ScriptedBackend`] emits the
+//! canned lines the harness used to pull from `ScriptedModel`.
 //!
 //! The verifier's clock handle ([`FakeDevice::clock_read`]) is a
 //! separate `&self` method from the dispatch path: the verifier reads
@@ -68,51 +70,6 @@ const fn sensor_value(sensor: u8) -> Option<u16> {
         2 => Some(SENSOR_VALUES[2]),
         3 => Some(SENSOR_VALUES[3]),
         _ => None,
-    }
-}
-
-/// The scripted model backend: emits canned lines, one per turn.
-///
-/// Repair lines are just later script lines; the script already
-/// contains what the model would emit after a repair hint.
-#[derive(Debug, Clone)]
-pub struct ScriptedModel {
-    /// The canned lines, in emission order.
-    // HOST-ONLY (E0/E1)
-    lines: Vec<Vec<u8>>,
-    /// How many lines have been emitted.
-    index: usize,
-}
-
-impl ScriptedModel {
-    /// Build a model from canned lines, in emission order.
-    #[must_use]
-    pub const fn new(lines: Vec<Vec<u8>>) -> Self {
-        Self { lines, index: 0 }
-    }
-
-    /// Emit the next line, or `None` when the script is exhausted.
-    ///
-    /// An exhausted script is a harness bug, not a run outcome; the
-    /// engine surfaces it as [`crate::RuntimeError::World`].
-    pub fn next_line(&mut self) -> Option<Vec<u8>> {
-        // HOST-ONLY (E0/E1)
-        let line = self.lines.get(self.index)?.clone();
-        self.index += 1;
-        Some(line)
-    }
-
-    /// Rewind one emission: the last line was taken but never
-    /// committed (crash before the decision commit), so the next boot
-    /// must see it again.
-    pub const fn unemit(&mut self) {
-        self.index = self.index.saturating_sub(1);
-    }
-
-    /// How many lines have been emitted so far.
-    #[must_use]
-    pub const fn lines_consumed(&self) -> usize {
-        self.index
     }
 }
 

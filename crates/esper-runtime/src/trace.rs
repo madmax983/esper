@@ -108,6 +108,14 @@ pub struct RunTrace {
     mutations_remaining: u16,
     /// Whether the run is durably suspended awaiting input.
     suspended: bool,
+    /// The model bundle the run is bound to (E3): the seed's
+    /// `model_bundle`, so the evidence names the exact model that
+    /// produced it.
+    model_bundle: u64,
+    /// Measured input tokens across all committed decisions (E3).
+    input_tokens_used: u32,
+    /// Measured output tokens across all committed decisions (E3).
+    output_tokens_used: u32,
 }
 
 impl RunTrace {
@@ -169,6 +177,27 @@ impl RunTrace {
         self.suspended
     }
 
+    /// The model bundle the run is bound to (E3): the exact model
+    /// that produced this trace.
+    #[must_use]
+    pub const fn model_bundle(&self) -> u64 {
+        self.model_bundle
+    }
+
+    /// Measured input tokens across all committed model decisions.
+    /// Recorded, never metered (SPEC §18).
+    #[must_use]
+    pub const fn input_tokens_used(&self) -> u32 {
+        self.input_tokens_used
+    }
+
+    /// Measured output tokens across all committed model decisions.
+    /// Recorded, never metered (SPEC §18).
+    #[must_use]
+    pub const fn output_tokens_used(&self) -> u32 {
+        self.output_tokens_used
+    }
+
     /// How many tool intents committed.
     #[must_use]
     pub fn tool_requests(&self) -> usize {
@@ -205,6 +234,12 @@ struct Accumulator {
     /// The committed run summary, if any.
     // HOST-ONLY (E0/E1)
     summary: Option<Vec<u8>>,
+    /// The model bundle the run is bound to (E3).
+    model_bundle: u64,
+    /// Measured input tokens across all committed decisions (E3).
+    input_tokens_used: u32,
+    /// Measured output tokens across all committed decisions (E3).
+    output_tokens_used: u32,
 }
 
 impl Accumulator {
@@ -217,6 +252,9 @@ impl Accumulator {
             terminal: None,
             reason: None,
             summary: None,
+            model_bundle: seed.model_bundle,
+            input_tokens_used: 0,
+            output_tokens_used: 0,
         }
     }
 
@@ -224,10 +262,20 @@ impl Accumulator {
     fn apply(&mut self, frame: &Frame) -> Result<(), RuntimeError> {
         match frame {
             Frame::RunStarted { .. } => Ok(()),
-            Frame::ModelDecision { output, class, .. } => {
+            Frame::ModelDecision {
+                output,
+                class,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
                 self.budget
                     .consume_turn()
                     .map_err(|_| RuntimeError::JournalCorrupt)?;
+                // Measured, never metered: the token units ride along
+                // as evidence (SPEC §18).
+                self.input_tokens_used = self.input_tokens_used.saturating_add(*input_tokens);
+                self.output_tokens_used = self.output_tokens_used.saturating_add(*output_tokens);
                 // HOST-ONLY (E0/E1)
                 self.events.push(TraceEvent::ModelDecision {
                     class: *class,
@@ -333,6 +381,9 @@ impl Accumulator {
             turns_remaining: self.budget.model_turns,
             mutations_remaining: self.budget.mutations,
             suspended,
+            model_bundle: self.model_bundle,
+            input_tokens_used: self.input_tokens_used,
+            output_tokens_used: self.output_tokens_used,
         })
     }
 }

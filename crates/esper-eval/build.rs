@@ -4,9 +4,10 @@
 //! `#[test]` per `*.json` file into `$OUT_DIR/fixture_tests.rs`, which
 //! `tests/fixtures.rs` includes. Adding a ninth fixture file therefore
 //! adds a ninth test with no code change: the directory is the test
-//! list. Each generated test calls
-//! `esper_eval::runner::run_fixture_file` with the fixture's path and
-//! panics with the full [`esper_eval::FixtureError`] report on failure.
+//! list. Each generated test runs the fixture under **both** E3 model
+//! backends — the scripted teacher and the distilled tiny stand-in —
+//! via `esper_eval::runner::run_fixture_file_with`, and panics with the
+//! full [`esper_eval::FixtureError`] report on failure.
 //!
 //! `cargo:rerun-if-changed` is emitted for every fixture file, so
 //! adding, removing, or editing a fixture re-runs the script.
@@ -80,14 +81,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fn_name = test_name(name);
         code.push_str("#[test]\n");
         let _ = writeln!(code, "fn {fn_name}() {{");
-        code.push_str("    if let Err(err) = esper_eval::runner::run_fixture_file(concat!(\n");
+        code.push_str("    let path = concat!(\n");
         code.push_str("        env!(\"CARGO_MANIFEST_DIR\"),\n");
         let _ = writeln!(code, "        \"/../../spec/trajectories/{name}\"");
-        code.push_str("    )) {\n");
+        code.push_str("    );\n");
+        code.push_str("    for kind in [\n");
+        code.push_str("        esper_eval::runner::BackendKind::Scripted,\n");
+        code.push_str("        esper_eval::runner::BackendKind::Tiny,\n");
+        code.push_str("    ] {\n");
+        code.push_str(
+            "        if let Err(err) = esper_eval::runner::run_fixture_file_with(path, kind) {\n",
+        );
         let _ = writeln!(
             code,
-            "        panic!(\"golden fixture {name} failed:\\n{{err}}\");"
+            "            panic!(\"golden fixture {name} failed under {{kind:?}}:\\n{{err}}\");"
         );
+        code.push_str("        }\n");
         code.push_str("    }\n");
         code.push_str("}\n\n");
     }

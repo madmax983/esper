@@ -21,11 +21,14 @@
 #[allow(unused_extern_crates)]
 extern crate waymaker_embassy as _;
 
+pub mod backend;
 pub mod error;
 pub mod seed;
 
 #[cfg(feature = "host")]
 pub mod engine;
+#[cfg(feature = "host")]
+pub mod jev;
 #[cfg(feature = "host")]
 pub mod journal;
 #[cfg(feature = "host")]
@@ -34,6 +37,25 @@ pub mod trace;
 pub mod world;
 
 pub use error::{CrashPoint, Halt, RuntimeError};
+// The E3 model-backend vocabulary: the inference boundary types live
+// in `backend` and are re-exported here. `ScriptedBackend` is the
+// host-only canned-line double; `TinyBackend` is allocation-free and
+// available without the `host` feature.
+#[cfg(feature = "host")]
+pub use backend::ScriptedBackend;
+// The E3+jev System One adapter: a typed host backend. The transport
+// vocabulary it names is public so cassettes stay authorable.
+pub use backend::{
+    BackendError, BundleId, DistillEntry, InferenceSettings, ModelBackend, OUTPUT_CAP, PROMPT_CAP,
+    PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend, TokenUsage, build_prompt,
+    fingerprint_prompt, fnv1a64,
+};
+#[cfg(feature = "host")]
+pub use jev::{
+    JEV_ENDPOINT, JEV_MODEL_VERSION, JevAnswer, JevBackend, JevError, JevReceipt, JevTransport,
+    LiveTransport, MockTransport, Prob, RecordedAnswer, ScoreBand, build_request_json, score_band,
+    synthesize_response,
+};
 // The E2 typed-tool vocabulary lives in `esper-core`; the runtime
 // re-exports the three shapes its public API names (seed capabilities,
 // the status detail level, and the typed dispatch arguments).
@@ -48,6 +70,4 @@ pub use journal::{Frame, Journal};
 #[cfg(feature = "host")]
 pub use trace::{RunTrace, TraceEvent};
 #[cfg(feature = "host")]
-pub use world::{
-    Direction, FakeDevice, FaultPlan, InputPlan, ScriptedModel, WorldError, WriteRecord,
-};
+pub use world::{Direction, FakeDevice, FaultPlan, InputPlan, WorldError, WriteRecord};
