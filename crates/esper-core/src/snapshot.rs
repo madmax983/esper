@@ -1,4 +1,4 @@
-//! Versioned, integrity-checked snapshot encoding for [`CompactState`](crate::compact::CompactState) (SPEC §20.3).
+//! Versioned, integrity-checked snapshot encoding for [`CompactState`] (SPEC §20.3).
 //!
 //! Byte layout:
 //!
@@ -34,8 +34,9 @@
 
 use crate::budget::ResourceBudget;
 use crate::compact::{
-    CompactState, Fact, FailedPath, Note, PendingItem, PendingKind, VersionSet, MAX_ACCEPTED_DECISIONS,
-    MAX_COMPLETED, MAX_FACTS, MAX_FAILED_PATHS, MAX_FINGERPRINTS, MAX_OPEN, MAX_PENDING, NOTE_MAX,
+    CompactState, Fact, FailedPath, MAX_ACCEPTED_DECISIONS, MAX_COMPLETED, MAX_FACTS,
+    MAX_FAILED_PATHS, MAX_FINGERPRINTS, MAX_OPEN, MAX_PENDING, NOTE_MAX, Note, PendingItem,
+    PendingKind, VersionSet,
 };
 use crate::error::{Error, ErrorCode};
 use crate::ids::{Digest, ToolId};
@@ -88,9 +89,12 @@ pub fn encode(state: &CompactState, out: &mut [u8]) -> Result<usize, Error> {
     put_list(out, &mut pos, state.open(), |out, pos, note| {
         put_note(out, pos, note)
     })?;
-    put_list(out, &mut pos, state.accepted_decisions(), |out, pos, digest| {
-        put_u64(out, pos, digest.get())
-    })?;
+    put_list(
+        out,
+        &mut pos,
+        state.accepted_decisions(),
+        |out, pos, digest| put_u64(out, pos, digest.get()),
+    )?;
     put_list(out, &mut pos, state.facts(), |out, pos, fact| {
         put_note(out, pos, &fact.text)?;
         put_u32(out, pos, fact.source_seq)
@@ -253,11 +257,12 @@ fn payload_len(state: &CompactState) -> usize {
 
 /// Bounded cursor writer; every write fails closed.
 fn put_u8(out: &mut [u8], pos: &mut usize, v: u8) -> Result<(), Error> {
-    out.get_mut(*pos).map_or(Err(Error::SnapshotBufferTooSmall), |slot| {
-        *slot = v;
-        *pos = pos.saturating_add(1);
-        Ok(())
-    })
+    out.get_mut(*pos)
+        .map_or(Err(Error::SnapshotBufferTooSmall), |slot| {
+            *slot = v;
+            *pos = pos.saturating_add(1);
+            Ok(())
+        })
 }
 
 fn put_u16(out: &mut [u8], pos: &mut usize, v: u16) -> Result<(), Error> {

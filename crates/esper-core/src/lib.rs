@@ -29,7 +29,7 @@
 //! - [`registry`]: the static tool catalog (re-exported from
 //!   `esper-protocol`), capabilities, and the policy gate.
 //! - [`budget`]: the resource budget model (part of run identity).
-//! - [`compact`]: bounded context compaction into a durable compact state.
+//! - [`compact`](mod@crate::compact): bounded context compaction into a durable compact state.
 //! - [`monitor`]: the deterministic runtime monitor (loop and guard rules).
 //! - [`records`]: logical journal record kinds and the terminal result type.
 //! - [`lineage`]: run lineage for `continue_as_new`.
@@ -61,13 +61,13 @@ pub mod state;
 // Convenience re-exports of the types the runtime crew reaches for most.
 pub use budget::ResourceBudget;
 pub use compact::{
-    compact, should_compact, CompactState, CompactionPolicy, CompactionReport, FailedPath, Fact,
-    FrameSummary, Note, PendingItem, PendingKind, VersionSet, DEFAULT_POLICY,
+    CompactState, CompactionPolicy, CompactionReport, DEFAULT_POLICY, Fact, FailedPath,
+    FrameSummary, Note, PendingItem, PendingKind, VersionSet, compact, should_compact,
 };
 pub use decision::{Decision, StatusDetail, ToolArgs};
 pub use error::{Error, ErrorCode};
 pub use ids::{Digest, EffectId, EffectSeq, Pin, RunId, ToolId};
-pub use lineage::{continue_as_new, ContinuedRun, Lineage};
-pub use mask::{fnv1a64, mask_bound, mask_bytes, mask_report, MaskClass, MaskReport};
-pub use snapshot::{decode, encode, encoded_len, verify, SNAPSHOT_VERSION};
+pub use lineage::{ContinuedRun, Lineage, continue_as_new};
+pub use mask::{MaskClass, MaskReport, fnv1a64, mask_bound, mask_bytes, mask_report};
+pub use snapshot::{SNAPSHOT_VERSION, decode, encode, encoded_len, verify};
 pub use state::{Event, State, TerminalStatus, committed_records, is_legal, transition};

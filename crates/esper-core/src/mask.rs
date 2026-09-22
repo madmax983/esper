@@ -60,8 +60,9 @@ const MIN_SPAN_LEN: usize = 6;
 /// Worst-case output length for masking `input_len` input bytes.
 ///
 /// Every input byte is either copied (1 byte) or belongs to a redacted
-/// span of at least [`MIN_SPAN_LEN`] bytes replaced by a marker of at
-/// most [`MAX_MARKER_LEN`] bytes, so the bound is
+/// span of at least 6 bytes (`a@b.co`, the shortest accepted shape)
+/// replaced by a marker of at most 28 bytes (`[redacted:secret#` + up
+/// to 10 decimal digits + `]`), so the bound is
 /// `n + (MAX_MARKER_LEN - MIN_SPAN_LEN) * (n / MIN_SPAN_LEN)`,
 /// saturating. The marker-length term assumes span indices stay under
 /// ten decimal digits (inputs below ~60 GiB); [`mask_bytes`] still
@@ -69,9 +70,8 @@ const MIN_SPAN_LEN: usize = 6;
 /// proves insufficient.
 #[must_use]
 pub const fn mask_bound(input_len: usize) -> usize {
-    input_len.saturating_add(
-        (MAX_MARKER_LEN - MIN_SPAN_LEN).saturating_mul(input_len / MIN_SPAN_LEN),
-    )
+    input_len
+        .saturating_add((MAX_MARKER_LEN - MIN_SPAN_LEN).saturating_mul(input_len / MIN_SPAN_LEN))
 }
 
 /// Mask `input` into `output`, returning the bytes written.
@@ -140,7 +140,9 @@ pub fn mask_report(input: &[u8], output: &mut [u8]) -> Result<MaskReport, Error>
             }
         }
         let first = rest.first().ok_or(Error::MaskOutputTooSmall)?;
-        if (*first == b'+' || first.is_ascii_digit()) && let Some(span) = match_phone(rest) {
+        if (*first == b'+' || first.is_ascii_digit())
+            && let Some(span) = match_phone(rest)
+        {
             spans = spans.saturating_add(1);
             out = emit_marker(output, out, MaskClass::Pii, spans)?;
             i += span;
@@ -259,11 +261,7 @@ fn match_token(rest: &[u8], anchor: usize) -> Option<usize> {
         }
         len += 1;
     }
-    if len - anchor >= 16 {
-        Some(len)
-    } else {
-        None
-    }
+    if len - anchor >= 16 { Some(len) } else { None }
 }
 
 /// `AKIA` plus exactly 16 alphanumerics (AWS access-key-ID shape).

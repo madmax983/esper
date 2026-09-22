@@ -1,7 +1,7 @@
 //! Run lineage for `continue_as_new` (SPEC §20.4).
 //!
 //! When context or journal pressure forces a history rollover, the
-//! runtime persists the [`CompactState`](crate::compact::CompactState)
+//! runtime persists the [`CompactState`]
 //! through an idempotent snapshot activity, verifies it by reading it
 //! back, and begins a new Waymaker run. [`Lineage`] is the new run's
 //! link to its parent: which run it continues, at which frame, with

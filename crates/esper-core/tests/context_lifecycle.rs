@@ -6,17 +6,17 @@
 
 use esper_core::budget::ResourceBudget;
 use esper_core::compact::{
-    compact, should_compact, CompactState, CompactionPolicy, CompactionReport, FailedPath, Fact,
-    FrameSummary, Note, PendingItem, PendingKind, VersionSet, DEFAULT_POLICY, MAX_FAILED_PATHS,
-    MAX_FACTS, MAX_PENDING, NOTE_MAX,
+    CompactState, CompactionPolicy, CompactionReport, DEFAULT_POLICY, Fact, FailedPath,
+    FrameSummary, MAX_FACTS, MAX_FAILED_PATHS, MAX_PENDING, NOTE_MAX, Note, PendingItem,
+    PendingKind, VersionSet, compact, should_compact,
 };
 use esper_core::error::{Error, ErrorCode};
 use esper_core::ids::{Digest, RunId, ToolId};
-use esper_core::lineage::{continue_as_new, Lineage};
+use esper_core::lineage::{Lineage, continue_as_new};
 use esper_core::mask::{fnv1a64, mask_bound, mask_bytes, mask_report};
 use esper_core::monitor::{ProgressDelta, StepOutcome};
 use esper_core::records::RecordKind;
-use esper_core::snapshot::{decode, encode, encoded_len, verify, SNAPSHOT_VERSION};
+use esper_core::snapshot::{SNAPSHOT_VERSION, decode, encode, encoded_len, verify};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,7 +36,11 @@ const fn test_versions() -> VersionSet {
 }
 
 fn test_state() -> CompactState {
-    CompactState::new(Digest::of_bytes(b"read pin 4"), test_budget(), test_versions())
+    CompactState::new(
+        Digest::of_bytes(b"read pin 4"),
+        test_budget(),
+        test_versions(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,7 +208,8 @@ fn mask_leaves_benign_text_alone() {
 
 #[test]
 fn mask_report_counts_spans_and_digests() {
-    let input = b"a sk-proj-abcdefghijklmnop123456 and ada@example.com then sk_live_abcdefghijklmnop123456";
+    let input =
+        b"a sk-proj-abcdefghijklmnop123456 and ada@example.com then sk_live_abcdefghijklmnop123456";
     let mut out = vec![0u8; mask_bound(input.len())];
     let report = mask_report(input, &mut out).expect("mask must succeed");
     assert_eq!(report.redacted_spans, 3);
@@ -248,7 +253,10 @@ fn mask_bound_always_suffices() {
     let n = mask_bytes(&input, &mut out).expect("bound must suffice");
     assert!(n <= out.len());
     let text = std::str::from_utf8(&out[..n]).expect("output is ASCII");
-    assert!(text.contains("[redacted:pii#500]"), "all spans kept: {text:?}");
+    assert!(
+        text.contains("[redacted:pii#500]"),
+        "all spans kept: {text:?}"
+    );
 
     // Mixed minimal spans.
     let mut mixed: Vec<u8> = Vec::new();
@@ -318,10 +326,9 @@ fn compact_preserves_every_failed_path() {
     for f in &frames {
         if let StepOutcome::Failed(error) = f.outcome {
             assert!(
-                state
-                    .failed_paths()
-                    .iter()
-                    .any(|p| p.tool == f.tool && p.args_digest == f.args_digest && p.error == error),
+                state.failed_paths().iter().any(|p| p.tool == f.tool
+                    && p.args_digest == f.args_digest
+                    && p.error == error),
                 "failed path lost for seq {}: {error}",
                 f.seq
             );
@@ -633,7 +640,10 @@ fn snapshot_encode_rejects_a_small_buffer() {
     let need = encoded_len(&state);
     assert!(need > 0);
     let mut small = vec![0u8; need - 1];
-    assert_eq!(encode(&state, &mut small), Err(Error::SnapshotBufferTooSmall));
+    assert_eq!(
+        encode(&state, &mut small),
+        Err(Error::SnapshotBufferTooSmall)
+    );
 }
 
 // ---------------------------------------------------------------------------

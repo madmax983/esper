@@ -1,8 +1,9 @@
 # esper-core
 
-Pure types, decision decoder, resource budgets, and the deterministic runtime
-monitor for Esper (E0/E1 slice + E2 typed tools). Authority: `SPEC.md` at the
-workspace root (§3–§8, §10, §17).
+Pure types, decision decoder, resource budgets, the deterministic runtime
+monitor, and the E4 context lifecycle (masking, compaction, snapshots,
+lineage) for Esper. Authority: `SPEC.md` at the workspace root
+(§3–§8, §10, §17, §20).
 
 ## Non-negotiables
 
@@ -36,9 +37,12 @@ workspace root (§3–§8, §10, §17).
 | `budget` | §7 | `ResourceBudget`: consume/check per unit, field-wise `meet`, `check_no_widen` against run identity |
 | `monitor` | §8.3 | `Monitor`: bounded 5-event ring; budget guard → 5×`NoProgress` → 3× identical failure → 3-of-5 error majority |
 | `records` | §10 | `RecordKind` (stable codes + max lengths), `TerminalResult`, `VerificationResult` |
+| `mask` | §20.1 | `mask_bytes` / `mask_report`: secret + PII shape scanners, opaque `[redacted:*#N]` markers, `mask_bound` proof, `fnv1a64` (delegates to `Digest::of_bytes`) |
+| `compact` | §20.2 | `CompactState`: durable compact state; `compact` folds `FrameSummary` views; failed paths and obligations are never dropped (fail closed); `should_compact` (80% default) |
+| `snapshot` | §20.3 | `encode` / `decode` / `verify`: canonical LE layout, version byte, FNV-1a-64 integrity; `encoded_len` |
+| `lineage` | §20.4 | `Lineage`, `continue_as_new`: parent link, remaining budgets carried never widened (`BudgetWidened` on widen) |
 
 ## Key invariants (see `docs/invariants.md` for the full list)
-
 - `End` has no outgoing transitions; only `Finalize`, `Degraded`, `SafeStop` reach it.
 - `Infer` cannot reach `Observe`; `AwaitInput` exits only via committed input to `Account`.
 - Budget `meet` is field-wise monotonic and cannot widen identity (`check_no_widen`).
@@ -46,6 +50,12 @@ workspace root (§3–§8, §10, §17).
 - Verification failure never auto-compensates.
 - `args` is *validated borrowed JSON bytes*, not canonicalized JSON — the
   digest is FNV-1a over the bytes as emitted.
+- E4 (§20): masking runs before durability, never after — the journal
+  keeps markers plus digests, never raw secrets. Failed paths and open
+  obligations are never dropped by compaction (fail closed with
+  `CompactStateFull`); facts/decisions drop oldest-first. Snapshot
+  version is checked before the checksum; unknown versions refuse
+  loudly. `continue_as_new` never widens budgets.
 
 ## The two JSON bounds (read before touching)
 

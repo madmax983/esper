@@ -1945,3 +1945,245 @@ measured input bytes on the receipts; stated latency is 70–500 ms
 per the docs, unmeasured here. `cargo check/test -p esper-runtime
 --no-default-features` stays green, and no Jev symbol is reachable
 without `host`.
+
+## 20. Rung E4: context lifecycle
+
+The design doc's tiered context policy (§8 normalize/redact at
+ingestion, mask superseded observations, retain the last five
+interactions, compact at 80%, continue as new; §9 redaction before
+durability; ADR 4 no persisted chain of thought; ADR 10 budgets are
+run identity) becomes `esper-core` machinery in four modules —
+`mask`, `compact`, `snapshot`, `lineage` — plus
+`crates/esper-core/tests/context_lifecycle.rs` (30 tests). Everything
+in this section is `no_std`, no allocation, core-only, edition 2024.
+
+### 20.1 Masking: classes, boundaries, and the bound
+
+`mask::mask_bytes(input, output) -> Result<usize, Error>` redacts in
+a single pass and fails closed with `Error::MaskOutputTooSmall` when
+`output` is smaller than `mask::mask_bound(input.len())`. A companion,
+`mask::mask_report`, additionally returns a `MaskReport`
+(`redacted_spans`, `secret_digest`, `output_len`) — the byte-level
+function cannot carry the report, so both exist.
+
+**Secret class** (`[redacted:secret#N]`), shape-based, ASCII:
+
+- `sk-`, `sk_live_`, `sk_test_` prefixes plus a token tail of
+  alphanumerics and `._~+/=-` of at least 16 characters.
+- `github_pat_` plus a tail of at least 16 token characters.
+- `AKIA` plus exactly 16 alphanumerics (AWS access-key-ID shape).
+- `Bearer ` (case-sensitive; a lowercase `bearer ` is also matched)
+  plus a token tail of at least 16 characters.
+- PEM blocks: from `-----BEGIN ` through the end of the
+  `-----END ...` line, with the closing marker required inside a
+  2048-byte window — an unclosed `-----BEGIN ` is ordinary text.
+
+**PII class** (`[redacted:pii#N]`), shape-based, ASCII:
+
+- Email-shaped values: local part of alphanumerics plus
+  `._%+-`, `@`, and a domain of alphanumerics, `.`, `-` with at
+  least 4 characters and at least one dot; trailing dots are
+  sentence punctuation, not the domain. Matching runs at each `@`;
+  the output is rewound over the already-copied local part only
+  when the output tail provably equals the input's local part (a
+  secret match ending right before the `@` declines the email).
+  Addresses abutting without separators (`a@b.coa@b.co`) are
+  scanned greedily: the local part is always consumed into a
+  redacted span, so no local part is ever left visible — only
+  inert domain residue remains.
+- Phone-like digit runs: optional `+` then digits with ` .-()`
+  separators, 7–15 digits total. A span with no separators must be
+  at most 11 digits (timestamps are not phone numbers); anything
+  separator-shaped in the 7–15 range is redacted.
+
+Marker numbering is 1-based per call, shared across both classes.
+Non-ASCII bytes pass through untouched (UTF-8 multibyte sequences
+never match an ASCII class). Matching is shape-based, not semantic:
+anything shaped like a secret or like PII is redacted, and the eval
+crew measures the false-positive rate (§20.7).
+
+**The output bound** is a proof, not a guess. Every input byte is
+either copied (1 byte) or belongs to a redacted span of at least 6
+bytes (`a@b.co`, the shortest accepted shape) replaced by a marker
+of at most 28 bytes (`[redacted:secret#` + up to 10 decimal digits
++ `]`), so
+
+```text
+mask_bound(n) = n + (28 − 6) · (n / 6)
+```
+
+saturating. The 10-digit term assumes span indices stay under ten
+decimal digits (inputs below ~60 GiB); `mask_bytes` still fails
+closed if the bound ever proves insufficient.
+
+**Durable replacement record.** What the journal keeps instead of
+the raw bytes is the opaque marker plus digests: `MaskReport`
+carries `secret_digest`, FNV-1a-64 over the concatenated redacted
+*secret* bytes in redaction order (`0` when no secret span was
+redacted; PII bytes are excluded), so a later crew can correlate
+"the same secret appeared again" without ever storing the secret.
+The compacted frame view (§20.2) records the tool ID, the argument
+digest, the outcome class, and the digest of the redacted payload
+bytes — never raw secrets. `mask::fnv1a64` delegates to
+`Digest::of_bytes` so the algorithm is not duplicated.
+
+### 20.2 Compaction: the durable compact state
+
+`compact::CompactState` is the design §8 durable compact state:
+objective digest, remaining `ResourceBudget`, `VersionSet`
+(workflow / model / catalog / policy), plus bounded lists —
+completed subgoals (8), open subgoals (8), accepted-decision
+digests (8), facts with source frame IDs (16), failed paths (16),
+pending approvals/verifications (8), and recent event fingerprints
+(16). Notes and facts are bounded text (`NOTE_MAX` = 64 bytes);
+`Note::from_bytes` fails closed on overlong input while
+`Note::truncated_from` truncates, so a long observation can never
+fail a compaction.
+
+`compact::compact(frames, policy, state)` folds `FrameSummary`
+views (already masked — masking is the runtime's job at ingestion,
+before durability, §9) into the state and returns a
+`CompactionReport` (`frames_in`, `frames_compacted`, `tail_kept`,
+`bytes_saved_estimate`). Trigger: `should_compact` fires at
+`trigger_pct` of the context budget; `DEFAULT_POLICY` is 80% with a
+5-interaction verbatim tail. The tail is a prompt-construction
+optimization for the current run, not durable state: facts,
+completed subgoals, and accepted decisions fold from *all* frames
+so the compact state stands alone at a `continue_as_new` boundary.
+Folding is idempotent across overlapping windows — failed paths,
+obligations, and facts dedupe, so re-feeding frames is safe.
+
+**Preservation invariant (a): failed paths are never dropped.**
+Every `(tool, args_digest, error)` failure tuple is recorded;
+`record_failed_path` fails closed with `Error::CompactStateFull`
+rather than dropping a new path. A resumed run can never retry a
+ruled-out path.
+
+**Preservation invariant (b): open obligations are never
+dropped.** Pending approvals and verifications record under the
+same fail-closed discipline and leave only through
+`resolve_pending`.
+
+Positive knowledge is bounded institutional memory with different
+discipline: facts, completed subgoals, and decisions drop the
+*oldest* entry when full. That is deliberate — (a) and (b) are the
+must-preserve sets; facts can be re-observed, obligations cannot
+be re-invented.
+
+Event fingerprints are FNV-1a-64 over frame identity fields
+(sequence, record kind, tool, argument digest, outcome, progress) —
+never over payload bytes — feeding the §5 loop detector across
+compactions.
+
+### 20.3 Snapshots: versioned, integrity-checked encoding
+
+`snapshot::encode(state, out)` writes the canonical little-endian
+layout, exactly `snapshot::encoded_len(state)` bytes:
+
+```text
+[version: 1][payload][integrity: u64 LE]
+```
+
+The payload encodes, in fixed order: objective digest (`u64`);
+budgets (`model_turns u16`, `input_tokens u32`,
+`output_tokens u32`, `elapsed_ms u64`, `radio_bytes u32`,
+`mutations u16`, `consecutive_errors u8`); versions
+(`workflow u32`, `model/catalog/policy u64`); then each bounded
+list as `count u8` followed by its entries (notes as `len u8` +
+bytes; facts add `source_seq u32`; failed paths as
+`tool u8, args_digest u64, error u8`; pending items as
+`kind u8, seq u32, digest u64`; fingerprints as `u64`).
+`integrity` is FNV-1a-64 over `version || payload`.
+
+Decoding fails closed, in order: `Error::SnapshotTruncated` for
+short input (including a short checksum), then
+`Error::SnapshotVersionMismatch { found }` for a foreign version
+byte — version is checked before the checksum, so a version bump
+reads as a version problem, never a corruption problem — then
+`Error::SnapshotChecksumMismatch`, then
+`Error::SnapshotCorrupt` when the payload passes the checksum but
+does not decode to a valid state (overlong note, count beyond a
+list's capacity, unknown obligation kind or error code, trailing
+bytes). `snapshot::verify` performs the length/version/integrity
+checks without building the state, for the runtime's read-back
+verification after the snapshot activity writes. `encode` fails
+closed with `Error::SnapshotBufferTooSmall` when `out` is short.
+
+### 20.4 Lineage: `continue_as_new` and never-widen budgets
+
+`lineage::Lineage` links the new run to its parent: `parent_run`
+(`RunId`), `continued_at_frame`, `budgets_remaining`, and the
+`VersionSet` the new run's seed states. `continue_as_new(state,
+lineage)` inherits the compact state with budgets replaced by the
+lineage's remaining budgets; fingerprints, failed paths,
+obligations, facts, and versions ride along untouched — the new run
+continues the same task, so its loop detector keeps recent history.
+
+Budgets are *remaining* and never widened (ADR 10): the
+continuation fails closed with `Error::BudgetWidened` when the
+lineage grants more than the compacted state holds in any unit
+(`ResourceBudget::check_no_widen`, E2 §17.4). Version
+compatibility is *not* gated here — the runtime's `RunSeed`
+validation owns the version gate (design §4); the lineage carries
+the versions so the new seed can state them.
+
+### 20.5 The stale-reference rule
+
+Superseded frame payloads are replaced by a **stale-payload
+compact marker**: the runtime swaps a folded frame's full bytes for
+a compact marker naming the compact epoch it was folded into
+(e.g. the folded frame's sequence range), and the marker is what
+any later reference resolves to. Concretely:
+
+- A reference to a compacted frame's payload never resolves to
+  the original bytes — they are gone from the context by
+  construction.
+- A reference to a compacted frame's *identity* (sequence number,
+  tool, outcome class, argument digest) resolves through the
+  compact state: failed paths via `failed_paths()`, obligations
+  via `pending()`, decisions via `accepted_decisions()`.
+- A reference to a frame inside the verbatim tail resolves to the
+  tail's masked bytes as usual.
+
+There is no dangling reference: every lookup either hits the
+tail, the compact state, or the stale-payload marker, and the
+marker itself carries the epoch so a crew can say "folded at
+compaction N" instead of chasing bytes that no longer exist.
+
+### 20.6 Version mismatch and the migration boundary
+
+`SNAPSHOT_VERSION` is 1. A snapshot whose version byte differs
+fails closed with `SnapshotVersionMismatch { found }` — the new
+run refuses to start from a state it cannot interpret. Bumping the
+version requires a migration path written, tested, and specified
+in this section *before* the bump lands; until then, the boundary
+is: unknown version ⇒ refuse, loudly, with the found version in
+the error. No silent reinterpretation, no best-effort parse.
+
+### 20.7 Measurement methodology (results pending)
+
+The E4 exit criterion is behavioral: long tasks survive journal
+rollover and reboot without repeated failed paths or lost
+obligations. The eval crew (a later rung) measures, per
+trajectory:
+
+| Metric | Method | Result |
+|---|---|---|
+| Full-history context bytes | sum of frame payload bytes before compaction | — |
+| Masked-tail context bytes | bytes after `mask_bytes` over the folded region | — |
+| Compact-state bytes | `snapshot::encoded_len` of the resulting state | — |
+| Failed-path repeats after rollover | count of retried `(tool, args_digest)` in `failed_paths()` | — |
+| Lost obligations after rollover | `pending()` items unresolved at the new run's first ask gate | — |
+| Masking false-positive rate | redacted spans over benign-shape inputs, human-judged | — |
+
+The methodology is specified here; the table is empty until the
+eval crew fills it. Byte-measurement tests live in
+`crates/esper-core/tests/context_lifecycle.rs` (compaction byte
+savings, snapshot exact length); corruption, stale-reference, and
+version-mismatch behavior are tested there too (single-bit flips
+across payload and checksum regions, truncation at every
+boundary class, foreign version byte). What E4 does *not* claim:
+no reboot test yet (the runtime owns journal rollover), no
+measured false-positive rate, no firmware size numbers for the
+new modules — those arrive with the runtime integration and the
+eval crew.
