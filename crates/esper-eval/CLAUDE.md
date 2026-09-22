@@ -108,7 +108,9 @@ every adversarial fixture expects zero `ToolRequest` frames.
    path.
 2. **Build** — deterministic `RunId` from the fixture id; `RunSeed`
    from `run_seed` (the seed binds the backend's `BundleId`, so each
-   pass builds its own); `FakeDevice` with all eight pins defaulted
+   pass builds its own); `run_seed.context_budget_bytes` (optional)
+   maps onto `RunSeed.context_budget_bytes` — the runtime's journal
+   rollover trigger, `None` disables; `FakeDevice` with all eight pins defaulted
    to input/low, then explicit fixture directions applied;
    `FaultPlan` from `device.faults`; `InputPlan` from `input_events`
    in `after_decision` order.

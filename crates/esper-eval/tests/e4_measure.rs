@@ -3,8 +3,13 @@
 //! Each test drives one trajectory through `drive_run` under the
 //! scripted teacher, measures the three §20.7 context sizes
 //! (full-history, masked-tail, compact-state), prints them for the
-//! §20.7 results table, and asserts the methodology's ordering:
-//! `compact < masked-tail < full-history`.
+//! §20.7 results table, and asserts the robust E4 byte claim: the
+//! continued run's carried context (compact state + masked tail) is
+//! strictly below the full history. The naive universal ordering
+//! `compact < masked-tail < full-history` does NOT hold on every
+//! trajectory (the snapshot's fixed overhead dominates the
+//! five-frame masked tail on small-frame runs); see
+//! `assert_e4_byte_claim`.
 //!
 //! The trajectories live in `tests/data/` and are measurement-only:
 //! they are not golden fixtures (no `expected.trace` assertions) and
@@ -83,9 +88,8 @@ fn long_successful_run_context_tiers() {
 
 #[test]
 fn failure_heavy_run_context_tiers() {
-    let measurement = measure_file(
-        "../../spec/trajectories/e-repeated-identical-failure-then-stuck.json",
-    );
+    let measurement =
+        measure_file("../../spec/trajectories/e-repeated-identical-failure-then-stuck.json");
     print_row("failure-heavy", measurement);
     assert_e4_byte_claim("failure-heavy", measurement);
 }
@@ -110,8 +114,14 @@ fn secret_bearing_trajectory_masks_two_spans() {
                   Notify op@example.com when done.";
     let mut out = vec![0u8; mask::mask_bound(prompt.len())];
     let report = mask::mask_report(prompt.as_bytes(), &mut out).expect("bound-sized buffer");
-    assert_eq!(report.redacted_spans, 2, "one secret span and one email span");
-    assert_ne!(report.secret_digest, 0, "the secret span feeds secret_digest");
+    assert_eq!(
+        report.redacted_spans, 2,
+        "one secret span and one email span"
+    );
+    assert_ne!(
+        report.secret_digest, 0,
+        "the secret span feeds secret_digest"
+    );
     let masked = String::from_utf8_lossy(&out[..report.output_len]);
     assert!(
         !masked.contains("sk-live-abcdefghijklmnop"),

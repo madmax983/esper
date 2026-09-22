@@ -46,9 +46,7 @@ use esper_core::mask;
 use esper_core::monitor::{ProgressDelta, StepOutcome};
 use esper_core::records::RecordKind;
 use esper_core::snapshot;
-use esper_runtime::{
-    Frame, InferenceSettings, Journal, ModelBackend, ScriptedBackend, drive_run,
-};
+use esper_runtime::{Frame, InferenceSettings, Journal, ModelBackend, ScriptedBackend, drive_run};
 
 use crate::fixture::{Fixture, FixtureError};
 use crate::runner::{build_device, build_inputs, build_seed};
@@ -75,9 +73,7 @@ pub struct ContextMeasurement {
 /// driver fails, masking fails on a bound-sized buffer (which would
 /// mean the [`mask::mask_bound`] proof is wrong), or the trajectory
 /// overflows the compact state's never-drop stores.
-pub fn measure_fixture_context(
-    fixture: &Fixture,
-) -> Result<ContextMeasurement, FixtureError> {
+pub fn measure_fixture_context(fixture: &Fixture) -> Result<ContextMeasurement, FixtureError> {
     // HOST-ONLY (E0/E1)
     let mut backend = ScriptedBackend::new(
         fixture.script.clone(),
@@ -167,9 +163,7 @@ pub fn measure_journal(frames: &[Frame]) -> Result<ContextMeasurement, FixtureEr
                 seq: effect, write, ..
             } if *write => open_writes.push((*effect, seq)),
             Frame::Verification { seq: effect, .. } => {
-                if let Some(position) =
-                    open_writes.iter().position(|(open, _)| open == effect)
-                {
+                if let Some(position) = open_writes.iter().position(|(open, _)| open == effect) {
                     let (_, intent_seq) = open_writes.remove(position);
                     state.resolve_pending(PendingKind::Verification, intent_seq);
                 }

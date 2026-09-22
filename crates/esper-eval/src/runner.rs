@@ -403,6 +403,10 @@ pub(crate) fn build_seed(fixture: &Fixture, model_bundle: u64) -> Result<RunSeed
         workflow_version: fixture.seed.workflow_version,
         model_bundle,
         inference: InferenceSettings::default_settings(),
+        // The eval crew's fixture mapping: the fixture's declared
+        // context budget drives the runtime's rollover trigger.
+        context_budget_bytes: fixture.seed.context_budget_bytes,
+        parent: None,
     })
 }
 

@@ -2160,7 +2160,7 @@ in this section *before* the bump lands; until then, the boundary
 is: unknown version ⇒ refuse, loudly, with the found version in
 the error. No silent reinterpretation, no best-effort parse.
 
-### 20.7 Measurement methodology (results pending)
+### 20.7 Measurement methodology (partial results 2026-09-22)
 
 The E4 exit criterion is behavioral: long tasks survive journal
 rollover and reboot without repeated failed paths or lost
@@ -2169,20 +2169,33 @@ trajectory:
 
 | Metric | Method | Result |
 |---|---|---|
-| Full-history context bytes | sum of frame payload bytes before compaction | — |
-| Masked-tail context bytes | bytes after `mask_bytes` over the folded region | — |
-| Compact-state bytes | `snapshot::encoded_len` of the resulting state | — |
-| Failed-path repeats after rollover | count of retried `(tool, args_digest)` in `failed_paths()` | — |
-| Lost obligations after rollover | `pending()` items unresolved at the new run's first ask gate | — |
-| Masking false-positive rate | redacted spans over benign-shape inputs, human-judged | — |
+| Full-history context bytes | sum of frame payload bytes before compaction | long-success: 1163 B (38 frames); failure-heavy: 513 B (14 frames); secret-bearing: 407 B (9 frames) |
+| Masked-tail context bytes | bytes after `mask_bytes` over the folded region | long-success: 194 B; failure-heavy: 223 B; secret-bearing: 199 B |
+| Compact-state bytes | `snapshot::encoded_len` of the resulting state | long-success: 269 B; failure-heavy: 223 B; secret-bearing: 165 B |
+| Failed-path repeats after rollover | count of retried `(tool, args_digest)` in `failed_paths()` | — (pending runtime rollover; fixture `x` staged) |
+| Lost obligations after rollover | `pending()` items unresolved at the new run's first ask gate | — (pending runtime rollover; fixture `w` staged) |
+| Masking false-positive rate | redacted spans over benign-shape inputs, human-judged | 10% — 2 of 20 benign inputs redacted (`{"uptime_ms": 1234567}`, an ISO date) |
 
-The methodology is specified here; the table is empty until the
-eval crew fills it. Byte-measurement tests live in
+Note on the byte tiers: `compact < masked-tail` is
+trajectory-dependent, not universal — the snapshot's fixed overhead
+dominates the five-frame masked tail on small-frame runs
+(long-success: 269 B compact vs 194 B tail; failure-heavy: 223 B vs
+223 B). The robust claim the harness asserts is carried context
+(compact state + masked tail) strictly below full history, with the
+gap widening as runs lengthen.
+
+The methodology is specified here; byte and false-positive
+results are filled as measured, and the rollover rows await the
+runtime integration. Byte-measurement tests live in
 `crates/esper-core/tests/context_lifecycle.rs` (compaction byte
 savings, snapshot exact length); corruption, stale-reference, and
 version-mismatch behavior are tested there too (single-bit flips
 across payload and checksum regions, truncation at every
-boundary class, foreign version byte). What E4 does *not* claim:
+boundary class, foreign version byte). The §20.7 methodology
+harness — three representative trajectories with printed table
+rows, the false-positive probe, and the negative tests — lives in
+`crates/esper-eval` (`src/measure.rs`, `tests/e4_measure.rs`,
+`tests/e4_fp_probe.rs`, `tests/e4_negative.rs`). What E4 does *not* claim:
 no reboot test yet (the runtime owns journal rollover), no
 measured false-positive rate, no firmware size numbers for the
 new modules — those arrive with the runtime integration and the
