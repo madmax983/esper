@@ -389,7 +389,9 @@ fn assert_all(
 ///
 /// Returns [`FixtureError::AssertionFailed`] when a capability list
 /// is longer than the set it fills.
-fn build_seed(fixture: &Fixture, model_bundle: u64) -> Result<RunSeed, FixtureError> {
+///
+/// Shared with the §20.7 measurement harness.
+pub(crate) fn build_seed(fixture: &Fixture, model_bundle: u64) -> Result<RunSeed, FixtureError> {
     Ok(RunSeed {
         id: RunId::new(Digest::of_bytes(fixture.id.as_bytes()).get()),
         model_turns: fixture.seed.model_turns,
@@ -473,7 +475,9 @@ fn must_pin(pin: u8) -> Result<Pin, FixtureError> {
 /// Returns [`FixtureError::AssertionFailed`] naming the gap when the
 /// fixture needs device or fault-plan surface the runtime does not
 /// expose.
-fn build_device(spec: &DeviceSpec) -> Result<(FakeDevice, FaultPlan), FixtureError> {
+///
+/// Shared with the §20.7 measurement harness.
+pub(crate) fn build_device(spec: &DeviceSpec) -> Result<(FakeDevice, FaultPlan), FixtureError> {
     let mut device = FakeDevice::new();
     // Unlisted pins default to input/low per the fixture semantics, so
     // set every pin to input before applying explicit directions.
@@ -577,7 +581,9 @@ fn tool_filter_id(tool: Option<&str>) -> Result<Option<u8>, FixtureError> {
 
 /// Queue the typed inputs in `after_decision` order; the engine takes
 /// them in order at each `AwaitInput`.
-fn build_inputs(fixture: &Fixture) -> InputPlan {
+///
+/// Shared with the §20.7 measurement harness.
+pub(crate) fn build_inputs(fixture: &Fixture) -> InputPlan {
     // HOST-ONLY (E0/E1)
     let payloads: Vec<Vec<u8>> = fixture
         .input_events
