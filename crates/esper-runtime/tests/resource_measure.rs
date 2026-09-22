@@ -153,6 +153,8 @@ fn seed_for(harness: &Harness, model_bundle: u64) -> RunSeed {
         workflow_version: fixture.seed.workflow_version,
         model_bundle,
         inference: InferenceSettings::default_settings(),
+        context_budget_bytes: None,
+        parent: None,
     }
 }
 

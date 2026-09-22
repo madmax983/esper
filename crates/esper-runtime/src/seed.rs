@@ -6,6 +6,7 @@
 //! allowed. This module is allocation-free and compiles without the
 //! `host` feature.
 
+use esper_core::lineage::Lineage;
 use esper_core::registry::Capabilities;
 
 use crate::backend::InferenceSettings;
@@ -59,6 +60,16 @@ pub struct RunSeed {
     /// the engine hands the model backend. Bound into the snapshot so
     /// a replay can never widen what the seed allowed.
     pub inference: InferenceSettings,
+    /// The context-byte rollover trigger (E4, SPEC §20.4): `Some(b)`
+    /// arms the 80% compaction trigger once the cumulative
+    /// built-prompt bytes reach `b`; `None` disables rollover. Part
+    /// of run identity: a continuation carries the *remaining*
+    /// budget, never a widened one.
+    pub context_budget_bytes: Option<u64>,
+    /// The continuation binding (E4, SPEC §20.6): `Some` when this
+    /// run continues a compacted parent. Bound into the seed
+    /// snapshot, so a reboot can never drop or swap the lineage.
+    pub parent: Option<Lineage>,
 }
 
 /// A run seed that failed validation, or a journal bound to a
@@ -99,10 +110,13 @@ pub struct SeedSnapshot {
     pub model_bundle: u64,
     /// The inference buffer policy the journal is bound to (E3).
     pub inference: InferenceSettings,
+    /// The continuation binding the journal is bound to (E4,
+    /// SPEC §20.6); `None` for root runs.
+    pub parent: Option<Lineage>,
 }
 
 impl SeedSnapshot {
-    /// The canonical 67-byte encoding carried as the Waymaker
+    /// The canonical 133-byte encoding carried as the Waymaker
     /// `RunStarted` record's input. Fixed layout, little-endian; the
     /// replay cursor compares it byte for byte.
     ///
@@ -112,11 +126,22 @@ impl SeedSnapshot {
     /// `write_pins` (8), `write_count` (1), `sensors` (4),
     /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1),
     /// `model_bundle` (8), `inference` (4: `max_prompt_bytes`,
-    /// `max_output_bytes`). Every identity-bearing field of the seed
-    /// is bound.
+    /// `max_output_bytes`), parent tag (1), parent lineage (65).
+    /// Every identity-bearing field of the seed is bound, including
+    /// the continuation binding: a child seed's snapshot differs
+    /// from its parent's, and two children continued at different
+    /// frames differ from each other.
+    ///
+    /// The lineage encoding is `parent_run` (8),
+    /// `continued_at_frame` (4), `budgets_remaining` (25:
+    /// `model_turns` (2), `input_tokens` (4), `output_tokens` (4),
+    /// `elapsed_ms` (8), `radio_bytes` (4), `mutations` (2),
+    /// `consecutive_errors` (1)), `versions` (28: `workflow` (4),
+    /// `model` (8), `catalog` (8), `policy` (8)). A `None` parent
+    /// encodes the tag `0` with 65 zero bytes.
     #[must_use]
-    pub const fn input_bytes(&self) -> [u8; 67] {
-        let mut out = [0u8; 67];
+    pub const fn input_bytes(&self) -> [u8; 133] {
+        let mut out = [0u8; 133];
         let id = self.id.to_le_bytes();
         let elapsed = self.elapsed_ms.to_le_bytes();
         let input_tokens = self.input_tokens.to_le_bytes();
@@ -154,8 +179,65 @@ impl SeedSnapshot {
         out[52] = self.sensor_count;
         out[53] = self.allow_timer as u8;
         out[54] = self.allow_status as u8;
+        out[67] = self.parent.is_some() as u8;
+        match self.parent {
+            Some(lineage) => {
+                let encoded = lineage_bytes(&lineage);
+                let mut k = 0;
+                while k < 65 {
+                    out[68 + k] = encoded[k];
+                    k += 1;
+                }
+            }
+            None => {}
+        }
         out
     }
+}
+
+/// Canonical 65-byte little-endian encoding of a [`Lineage`].
+///
+/// Layout: `parent_run` (8), `continued_at_frame` (4),
+/// `budgets_remaining` (25), `versions` (28). See
+/// [`SeedSnapshot::input_bytes`] for the field order.
+const fn lineage_bytes(lineage: &Lineage) -> [u8; 65] {
+    let mut out = [0u8; 65];
+    let run = lineage.parent_run.get().to_le_bytes();
+    let frame = lineage.continued_at_frame.to_le_bytes();
+    let turns = lineage.budgets_remaining.model_turns.to_le_bytes();
+    let input = lineage.budgets_remaining.input_tokens.to_le_bytes();
+    let output = lineage.budgets_remaining.output_tokens.to_le_bytes();
+    let elapsed = lineage.budgets_remaining.elapsed_ms.to_le_bytes();
+    let radio = lineage.budgets_remaining.radio_bytes.to_le_bytes();
+    let mutations = lineage.budgets_remaining.mutations.to_le_bytes();
+    let workflow = lineage.versions.workflow.to_le_bytes();
+    let model = lineage.versions.model.get().to_le_bytes();
+    let catalog = lineage.versions.catalog.get().to_le_bytes();
+    let policy = lineage.versions.policy.get().to_le_bytes();
+    let mut i = 0;
+    while i < 8 {
+        out[i] = run[i];
+        out[22 + i] = elapsed[i];
+        out[41 + i] = model[i];
+        out[49 + i] = catalog[i];
+        out[57 + i] = policy[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 4 {
+        out[8 + j] = frame[j];
+        out[14 + j] = input[j];
+        out[18 + j] = output[j];
+        out[30 + j] = radio[j];
+        out[37 + j] = workflow[j];
+        j += 1;
+    }
+    out[12] = turns[0];
+    out[13] = turns[1];
+    out[34] = mutations[0];
+    out[35] = mutations[1];
+    out[36] = lineage.budgets_remaining.consecutive_errors;
+    out
 }
 
 impl RunSeed {
@@ -240,6 +322,7 @@ impl RunSeed {
             allow_status: self.capabilities.allow_status,
             model_bundle: self.model_bundle,
             inference: self.inference,
+            parent: self.parent,
         }
     }
     /// The E0/E1 default seed: 10 turns, 4 mutations, generous token
@@ -272,6 +355,8 @@ impl RunSeed {
             workflow_version: WORKFLOW_VERSION,
             model_bundle: 0,
             inference: InferenceSettings::default_settings(),
+            context_budget_bytes: None,
+            parent: None,
         }
     }
 
@@ -292,17 +377,33 @@ impl RunSeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capabilities, InferenceSettings, RunSeed, SeedSnapshot};
+    use super::{Capabilities, InferenceSettings, Lineage, RunSeed, SeedSnapshot};
     use esper_core::ids::Pin;
+    use esper_core::{Digest, ResourceBudget, RunId, VersionSet};
+
+    /// A fixed continuation binding for the encoding tests.
+    fn test_lineage(frame: u32) -> Lineage {
+        Lineage {
+            parent_run: RunId::new(7),
+            continued_at_frame: frame,
+            budgets_remaining: ResourceBudget::new(9, 3000, 900, 50_000, 0, 3, 0),
+            versions: VersionSet {
+                workflow: 1,
+                model: Digest::new(11),
+                catalog: Digest::new(12),
+                policy: Digest::new(13),
+            },
+        }
+    }
 
     /// Every identity-bearing field of the seed is bound in the
-    /// 67-byte canonical encoding: changing any one of them changes
+    /// 133-byte canonical encoding: changing any one of them changes
     /// the bytes the Waymaker `RunStarted` record carries.
     #[test]
     fn input_bytes_binds_every_field() {
         let base = RunSeed::default_slice().snapshot();
         let base_bytes = base.input_bytes();
-        assert_eq!(base_bytes.len(), 67);
+        assert_eq!(base_bytes.len(), 133);
 
         let variants = [
             SeedSnapshot { id: 1, ..base },
@@ -373,6 +474,14 @@ mod tests {
                 },
                 ..base
             },
+            SeedSnapshot {
+                parent: Some(test_lineage(12)),
+                ..base
+            },
+            SeedSnapshot {
+                parent: Some(test_lineage(13)),
+                ..base
+            },
         ];
         for variant in variants {
             assert_ne!(
@@ -381,6 +490,30 @@ mod tests {
                 "field change did not alter the binding"
             );
         }
+    }
+
+    /// The seed snapshot carries the continuation binding: a child
+    /// seed's encoding differs from its parent's, the tag byte marks
+    /// the presence of a parent, and two children continued at
+    /// different frames differ from each other.
+    #[test]
+    fn snapshot_binds_parent_lineage() {
+        let seed = RunSeed {
+            parent: Some(test_lineage(12)),
+            ..RunSeed::default_slice()
+        };
+        let snap = seed.snapshot();
+        assert_eq!(snap.parent, Some(test_lineage(12)));
+        let bytes = snap.input_bytes();
+        let base_bytes = RunSeed::default_slice().snapshot().input_bytes();
+        assert_ne!(bytes, base_bytes);
+        assert_eq!(bytes[67], 1);
+        assert_eq!(base_bytes[67], 0);
+        let other = RunSeed {
+            parent: Some(test_lineage(13)),
+            ..RunSeed::default_slice()
+        };
+        assert_ne!(other.snapshot().input_bytes(), bytes);
     }
 
     #[test]
