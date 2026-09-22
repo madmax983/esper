@@ -1,12 +1,13 @@
 [package]
 name = "esper-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Esper E0/E1 harness core: state machine, decision decoder, budgets, monitor. no_std, allocation-free."
 license = "MIT"
 
 [dependencies]
 thiserror = "2"
+esper-protocol = { path = "../esper-protocol", version = "0.1.0" }
 
 [lints]
 workspace = true

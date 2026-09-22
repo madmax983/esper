@@ -1,10 +1,10 @@
 //! `esper-runtime`: the durable `ReAct` runtime for the Esper E0/E1 slice.
 //!
 //! The engine runs one scripted `ReAct` trajectory at a time: the model
-//! emits one line per turn, the engine decodes it with `esper-core`,
-//! authorizes tool calls against the seed's capabilities, dispatches
-//! them to the world doubles, verifies mutating tools with an
-//! independent read-back, and accounts every committed step with the
+//! emits one line per turn, the engine decodes it with the E2 contract
+//! validator, authorizes tool calls against the seed's capabilities,
+//! dispatches them to the world doubles, verifies mutating tools with
+//! an independent read-back, and accounts every committed step with the
 //! deterministic monitor. Every boundary crossing appends a journal
 //! frame first; a simulated crash at any [`CrashPoint`] drops all
 //! in-memory state and replays the journal, so recovery is just replay.
@@ -34,7 +34,12 @@ pub mod trace;
 pub mod world;
 
 pub use error::{CrashPoint, Halt, RuntimeError};
-pub use seed::{RunSeed, ESPER_WORKFLOW_KIND, WORKFLOW_VERSION};
+// The E2 typed-tool vocabulary lives in `esper-core`; the runtime
+// re-exports the three shapes its public API names (seed capabilities,
+// the status detail level, and the typed dispatch arguments).
+pub use esper_core::decision::{StatusDetail, ToolArgs};
+pub use esper_core::registry::Capabilities;
+pub use seed::{ESPER_WORKFLOW_KIND, RunSeed, WORKFLOW_VERSION};
 
 #[cfg(feature = "host")]
 pub use engine::{drive_run, drive_run_async};

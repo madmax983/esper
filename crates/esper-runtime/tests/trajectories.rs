@@ -9,7 +9,8 @@
 use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    drive_run, CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel,
+    Capabilities, CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel,
+    drive_run,
 };
 
 /// Build a default seed with this run id.
@@ -17,6 +18,16 @@ const fn seed(id: u64) -> RunSeed {
     RunSeed {
         id: RunId::new(id),
         ..RunSeed::default_slice()
+    }
+}
+
+/// A capability set granting only pin 5 for writing; every other
+/// grant stays at the default.
+const fn write_only_pin_5() -> Capabilities {
+    Capabilities {
+        write_pins: [5, 0, 0, 0, 0, 0, 0, 0],
+        write_count: 1,
+        ..RunSeed::default_slice().capabilities
     }
 }
 
@@ -111,7 +122,7 @@ fn trajectory_b_invalid_output_repair_then_modelinvalid() {
 #[test]
 fn trajectory_c_denied_pin_fails_before_dispatch() {
     let seed = RunSeed {
-        writable_pins: 1 << 5,
+        capabilities: write_only_pin_5(),
         ..seed(3)
     };
     let mut device = FakeDevice::new();

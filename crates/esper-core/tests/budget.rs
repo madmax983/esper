@@ -1,7 +1,7 @@
 //! Budget arithmetic and the never-widen identity rule (§7).
 
-use esper_core::budget::{BudgetUnit, ResourceBudget};
 use esper_core::Error;
+use esper_core::budget::{BudgetUnit, ResourceBudget};
 
 const fn full() -> ResourceBudget {
     ResourceBudget::new(10, 4000, 1000, 60_000, 0, 4, 0)

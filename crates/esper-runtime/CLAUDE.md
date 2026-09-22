@@ -1,12 +1,16 @@
-# `esper-runtime` — the durable ReAct runtime (E0/E1)
+# `esper-runtime` — the durable ReAct runtime (E0/E1/E2)
 
 ## What this crate is
 
-The E0/E1 vertical slice of Esper's agent harness: a durable ReAct
-loop (one tool call, one typed human input, or finish per turn) built
-on `esper-core` and Waymaker 0.1.0. The model backend, GPIO device,
-fault injector, and human-input queue are host-only doubles; the
-engine, journal, and durability protocol are the real slice.
+Esper's agent harness: a durable ReAct loop (one tool call, one
+typed human input, or finish per turn) built on `esper-core`,
+`esper-protocol`, and Waymaker 0.1.0. The model backend, fake device
+(GPIO + sensors + virtual clock), fault injector, and human-input
+queue are host-only doubles; the engine, journal, and durability
+protocol are the real slice. E2: six typed tools from the static
+protocol registry; authorization before dispatch; independent
+read-back verification for every mutation; effect-ID dedup on all
+dispatches.
 
 ## Where things live
 

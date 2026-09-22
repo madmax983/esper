@@ -6,6 +6,8 @@
 //! allowed. This module is allocation-free and compiles without the
 //! `host` feature.
 
+use esper_core::registry::Capabilities;
+
 /// The workflow version the E0/E1 slice runs under.
 ///
 /// The journal binds every run to this version; recovery refuses a
@@ -23,7 +25,10 @@ pub const ESPER_WORKFLOW_KIND: u16 = 1;
 /// The seed carries the full budget explicitly: turns and mutations are
 /// the metered units in the slice, while the token and time grants are
 /// carried so the monitor's exhaustion guard (which fires on any zeroed
-/// unit) only trips on units the run actually spends.
+/// unit) only trips on units the run actually spends. The capability
+/// set is `esper-core`'s normative §5.2 v2 shape, shared with the
+/// authorizer, so the seed and the gate can never disagree on what a
+/// grant means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunSeed {
     /// The run identity, bound into every journal frame.
@@ -38,10 +43,9 @@ pub struct RunSeed {
     pub output_tokens: u32,
     /// Milliseconds on the host monotonic clock (carried, not metered).
     pub elapsed_ms: u64,
-    /// Pins the model may read (bitmask over pins `0..=7`).
-    pub readable_pins: u8,
-    /// Pins the model may write (bitmask over pins `0..=7`).
-    pub writable_pins: u8,
+    /// The E2 capability set: readable and writable pins, samplable
+    /// sensors, and the timer/status grants.
+    pub capabilities: Capabilities,
     /// The workflow version this seed runs under.
     pub workflow_version: u16,
 }
@@ -64,24 +68,38 @@ pub struct SeedSnapshot {
     pub output_tokens: u32,
     /// Milliseconds granted.
     pub elapsed_ms: u64,
-    /// Pins the model may read (bitmask over pins `0..=7`).
-    pub readable_pins: u8,
-    /// Pins the model may write (bitmask over pins `0..=7`).
-    pub writable_pins: u8,
+    /// Pins the model may read.
+    pub read_pins: [u8; 8],
+    /// How many of `read_pins` are granted.
+    pub read_count: u8,
+    /// Pins the model may write.
+    pub write_pins: [u8; 8],
+    /// How many of `write_pins` are granted.
+    pub write_count: u8,
+    /// Sensors the model may sample.
+    pub sensors: [u8; 4],
+    /// How many of `sensors` are granted.
+    pub sensor_count: u8,
+    /// Whether the timer tools are granted.
+    pub allow_timer: bool,
+    /// Whether the status tool is granted.
+    pub allow_status: bool,
 }
 
 impl SeedSnapshot {
-    /// The canonical 32-byte encoding carried as the Waymaker
+    /// The canonical 55-byte encoding carried as the Waymaker
     /// `RunStarted` record's input. Fixed layout, little-endian; the
     /// replay cursor compares it byte for byte.
     ///
     /// Layout: `id` (8), `elapsed_ms` (8), `input_tokens` (4),
     /// `output_tokens` (4), `model_turns` (2), `mutations` (2),
-    /// `workflow_version` (2), `readable_pins` (1), `writable_pins`
-    /// (1). Every identity-bearing field of the seed is bound.
+    /// `workflow_version` (2), `read_pins` (8), `read_count` (1),
+    /// `write_pins` (8), `write_count` (1), `sensors` (4),
+    /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1).
+    /// Every identity-bearing field of the seed is bound.
     #[must_use]
-    pub const fn input_bytes(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
+    pub const fn input_bytes(&self) -> [u8; 55] {
+        let mut out = [0u8; 55];
         let id = self.id.to_le_bytes();
         let elapsed = self.elapsed_ms.to_le_bytes();
         let input_tokens = self.input_tokens.to_le_bytes();
@@ -93,12 +111,15 @@ impl SeedSnapshot {
         while i < 8 {
             out[i] = id[i];
             out[8 + i] = elapsed[i];
+            out[30 + i] = self.read_pins[i];
+            out[39 + i] = self.write_pins[i];
             i += 1;
         }
         let mut j = 0;
         while j < 4 {
             out[16 + j] = input_tokens[j];
             out[20 + j] = output_tokens[j];
+            out[48 + j] = self.sensors[j];
             j += 1;
         }
         out[24] = model_turns[0];
@@ -107,8 +128,11 @@ impl SeedSnapshot {
         out[27] = mutations[1];
         out[28] = version[0];
         out[29] = version[1];
-        out[30] = self.readable_pins;
-        out[31] = self.writable_pins;
+        out[38] = self.read_count;
+        out[47] = self.write_count;
+        out[52] = self.sensor_count;
+        out[53] = self.allow_timer as u8;
+        out[54] = self.allow_status as u8;
         out
     }
 }
@@ -119,6 +143,9 @@ impl RunSeed {
     /// A seed names the exact workflow version this build runs; any
     /// other version is refused before the journal binds to it. A seed
     /// that grants no model turn could never act, so it is malformed.
+    /// The capability sets name real resources: counts beyond the
+    /// storage, pins outside `0..=7`, and sensors outside `0..=3` fail
+    /// closed here, so a malformed grant can never widen silently.
     ///
     /// # Errors
     ///
@@ -129,6 +156,37 @@ impl RunSeed {
         }
         if self.model_turns == 0 {
             return Err("model_turns must grant at least one turn");
+        }
+        let caps = &self.capabilities;
+        if caps.read_count > 8 {
+            return Err("read_count exceeds the pin storage");
+        }
+        if caps.write_count > 8 {
+            return Err("write_count exceeds the pin storage");
+        }
+        if caps.sensor_count > 4 {
+            return Err("sensor_count exceeds the sensor storage");
+        }
+        let mut i = 0;
+        while i < caps.read_count {
+            if caps.read_pins[i as usize] > 7 {
+                return Err("read_pins names a pin outside 0..=7");
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < caps.write_count {
+            if caps.write_pins[j as usize] > 7 {
+                return Err("write_pins names a pin outside 0..=7");
+            }
+            j += 1;
+        }
+        let mut k = 0;
+        while k < caps.sensor_count {
+            if caps.sensors[k as usize] > 3 {
+                return Err("sensors names a sensor outside 0..=3");
+            }
+            k += 1;
         }
         Ok(())
     }
@@ -148,12 +206,19 @@ impl RunSeed {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             elapsed_ms: self.elapsed_ms,
-            readable_pins: self.readable_pins,
-            writable_pins: self.writable_pins,
+            read_pins: self.capabilities.read_pins,
+            read_count: self.capabilities.read_count,
+            write_pins: self.capabilities.write_pins,
+            write_count: self.capabilities.write_count,
+            sensors: self.capabilities.sensors,
+            sensor_count: self.capabilities.sensor_count,
+            allow_timer: self.capabilities.allow_timer,
+            allow_status: self.capabilities.allow_status,
         }
     }
     /// The E0/E1 default seed: 10 turns, 4 mutations, generous token
-    /// and time grants, all pins readable and writable.
+    /// and time grants, every pin readable and writable, every sensor
+    /// samplable, timer and status granted.
     ///
     /// The token and time units are carried from the seed so the
     /// monitor's exhaustion guard only fires on turns and mutations;
@@ -168,29 +233,18 @@ impl RunSeed {
             input_tokens: 4000,
             output_tokens: 1000,
             elapsed_ms: 60_000,
-            readable_pins: 0xFF,
-            writable_pins: 0xFF,
+            capabilities: Capabilities {
+                read_pins: [0, 1, 2, 3, 4, 5, 6, 7],
+                read_count: 8,
+                write_pins: [0, 1, 2, 3, 4, 5, 6, 7],
+                write_count: 8,
+                sensors: [0, 1, 2, 3],
+                sensor_count: 4,
+                allow_timer: true,
+                allow_status: true,
+            },
             workflow_version: WORKFLOW_VERSION,
         }
-    }
-
-    /// The capability set this seed grants, derived from the pin masks.
-    #[must_use]
-    pub const fn capabilities(&self) -> esper_core::registry::Capabilities {
-        let mut caps = esper_core::registry::Capabilities::empty();
-        let mut pin: u8 = 0;
-        while pin < 8 {
-            if self.readable_pins & (1 << pin) != 0 {
-                caps.read_pins[caps.read_count as usize] = pin;
-                caps.read_count += 1;
-            }
-            if self.writable_pins & (1 << pin) != 0 {
-                caps.write_pins[caps.write_count as usize] = pin;
-                caps.write_count += 1;
-            }
-            pin += 1;
-        }
-        caps
     }
 
     /// The starting resource budget, straight from the seed's grants.
@@ -210,16 +264,17 @@ impl RunSeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunSeed, SeedSnapshot};
+    use super::{Capabilities, RunSeed, SeedSnapshot};
+    use esper_core::ids::Pin;
 
     /// Every identity-bearing field of the seed is bound in the
-    /// 32-byte canonical encoding: changing any one of them changes
+    /// 55-byte canonical encoding: changing any one of them changes
     /// the bytes the Waymaker `RunStarted` record carries.
     #[test]
     fn input_bytes_binds_every_field() {
         let base = RunSeed::default_slice().snapshot();
         let base_bytes = base.input_bytes();
-        assert_eq!(base_bytes.len(), 32);
+        assert_eq!(base_bytes.len(), 55);
 
         let variants = [
             SeedSnapshot { id: 1, ..base },
@@ -248,11 +303,35 @@ mod tests {
                 ..base
             },
             SeedSnapshot {
-                readable_pins: !base.readable_pins,
+                read_pins: [7, 6, 5, 4, 3, 2, 1, 0],
                 ..base
             },
             SeedSnapshot {
-                writable_pins: !base.writable_pins,
+                read_count: base.read_count - 1,
+                ..base
+            },
+            SeedSnapshot {
+                write_pins: [7, 6, 5, 4, 3, 2, 1, 0],
+                ..base
+            },
+            SeedSnapshot {
+                write_count: base.write_count - 1,
+                ..base
+            },
+            SeedSnapshot {
+                sensors: [3, 2, 1, 0],
+                ..base
+            },
+            SeedSnapshot {
+                sensor_count: base.sensor_count - 1,
+                ..base
+            },
+            SeedSnapshot {
+                allow_timer: !base.allow_timer,
+                ..base
+            },
+            SeedSnapshot {
+                allow_status: !base.allow_status,
                 ..base
             },
         ];
@@ -268,5 +347,72 @@ mod tests {
     #[test]
     fn default_slice_validates() {
         RunSeed::default_slice().validate().expect("default seed");
+    }
+
+    #[test]
+    fn malformed_counts_fail_closed() {
+        for capabilities in [
+            Capabilities {
+                read_count: 9,
+                ..Capabilities::empty()
+            },
+            Capabilities {
+                write_count: 9,
+                ..Capabilities::empty()
+            },
+            Capabilities {
+                sensor_count: 5,
+                ..Capabilities::empty()
+            },
+        ] {
+            let seed = RunSeed {
+                capabilities,
+                ..RunSeed::default_slice()
+            };
+            assert!(seed.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn out_of_range_grants_fail_closed() {
+        for capabilities in [
+            Capabilities {
+                read_pins: [8, 0, 0, 0, 0, 0, 0, 0],
+                read_count: 1,
+                ..Capabilities::empty()
+            },
+            Capabilities {
+                write_pins: [0, 0, 0, 0, 0, 0, 0, 9],
+                write_count: 8,
+                ..Capabilities::empty()
+            },
+            Capabilities {
+                sensors: [4, 0, 0, 0],
+                sensor_count: 1,
+                ..Capabilities::empty()
+            },
+        ] {
+            let seed = RunSeed {
+                capabilities,
+                ..RunSeed::default_slice()
+            };
+            assert!(seed.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn default_grants_cover_everything() {
+        let seed = RunSeed::default_slice();
+        let caps = seed.capabilities;
+        for pin in 0..8 {
+            let pin = Pin::new(pin).expect("pin in range");
+            assert!(caps.can_read(pin));
+            assert!(caps.can_write(pin));
+        }
+        for sensor in 0..4 {
+            assert!(caps.can_sample(sensor));
+        }
+        assert!(caps.allow_timer);
+        assert!(caps.allow_status);
     }
 }

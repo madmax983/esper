@@ -10,14 +10,24 @@ use esper_core::decision::Level;
 use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    drive_run, CrashPoint, Direction, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed,
-    ScriptedModel, TraceEvent,
+    Capabilities, CrashPoint, Direction, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed,
+    ScriptedModel, TraceEvent, drive_run,
 };
 
 const fn seed(id: u64) -> RunSeed {
     RunSeed {
         id: RunId::new(id),
         ..RunSeed::default_slice()
+    }
+}
+
+/// A capability set granting only pin 5 for writing; every other
+/// grant stays at the default.
+const fn write_only_pin_5() -> Capabilities {
+    Capabilities {
+        write_pins: [5, 0, 0, 0, 0, 0, 0, 0],
+        write_count: 1,
+        ..RunSeed::default_slice().capabilities
     }
 }
 
@@ -141,7 +151,7 @@ fn budgets_never_widen_across_reboots() {
 #[test]
 fn permissions_never_widen_across_reboots() {
     let seed = RunSeed {
-        writable_pins: 1 << 5,
+        capabilities: write_only_pin_5(),
         ..seed(220)
     };
     let mut model = ScriptedModel::new(lines(&[

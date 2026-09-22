@@ -1,13 +1,13 @@
 //! Record kinds, terminal results, and verification results (§10.1, §8.2, §9).
 
+use esper_core::Error;
 use esper_core::decision::Level;
 use esper_core::error::ErrorCode;
 use esper_core::ids::{EffectId, EffectSeq, RunId};
 use esper_core::records::{
-    RecordKind, TerminalResult, VerificationResult, TERMINAL_REASON_MAX, TERMINAL_SUMMARY_MAX,
+    RecordKind, TERMINAL_REASON_MAX, TERMINAL_SUMMARY_MAX, TerminalResult, VerificationResult,
 };
 use esper_core::state::TerminalStatus;
-use esper_core::Error;
 
 #[test]
 fn record_kind_codes_are_stable() {

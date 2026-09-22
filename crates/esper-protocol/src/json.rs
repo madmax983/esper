@@ -6,9 +6,18 @@
 //! bytes after the top-level value — and exposes values as borrowed
 //! slices or streaming cursors, never owned data.
 //!
+//! E2 move: this module lived in `esper-core` for the E0/E1 slice. It now
+//! lives in `esper-protocol` so the contract validator and the decoder
+//! share one parser without a dependency cycle; `esper-core` re-exports
+//! it (`pub use esper_protocol::json;`, SPEC §17.4), so every existing
+//! `esper_core::json::…` path keeps working.
+//!
 //! String values are returned as their **raw content** (escapes preserved
 //! verbatim): the decoded form can only shrink, so enforcing bounds on
 //! the raw content is conservative and keeps the decoder borrow-only.
+//! Enum matching in the contract validator therefore compares raw
+//! content: an escaped spelling of an option (e.g. `"h\u0069gh"`) is
+//! rejected, exactly like the E0/E1 decoder's `Level::from_bytes`.
 
 use thiserror::Error;
 
@@ -452,4 +461,32 @@ pub fn parse_u8(digits: &[u8]) -> Result<u8, JsonError> {
         }
     }
     u8::try_from(value).map_err(|_| JsonError::BadNumber)
+}
+
+/// Parse an ASCII digit string as `u16`.
+///
+/// The same strictness contract as [`parse_u8`], extended to the full
+/// `u16` range. Added in E2 for the `timer_delay_wait` `ms` argument
+/// (`1..=5000`, SPEC §17).
+///
+/// # Errors
+///
+/// Returns [`JsonError::BadNumber`] for empty input, non-digit bytes, or
+/// values above 65535.
+pub fn parse_u16(digits: &[u8]) -> Result<u16, JsonError> {
+    if digits.is_empty() || digits.len() > 5 {
+        return Err(JsonError::BadNumber);
+    }
+    let mut value: u32 = 0;
+    for byte in digits {
+        let byte = *byte;
+        if !byte.is_ascii_digit() {
+            return Err(JsonError::BadNumber);
+        }
+        value = value * 10 + u32::from(byte - b'0');
+        if value > u32::from(u16::MAX) {
+            return Err(JsonError::BadNumber);
+        }
+    }
+    u16::try_from(value).map_err(|_| JsonError::BadNumber)
 }

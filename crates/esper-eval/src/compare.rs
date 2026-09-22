@@ -26,11 +26,11 @@
 //!
 //! // HOST-ONLY (E0/E1): heap-allocated comparison, for the host runner.
 
-use esper_core::decision::{decode_line, Decision};
+use esper_core::decision::{Decision, decode_line};
 use esper_core::error::RepairVariant;
 use esper_core::registry::lookup_by_id;
 use esper_core::state::TerminalStatus;
-use esper_runtime::{journal::DecisionClass, RunTrace, TraceEvent};
+use esper_runtime::{RunTrace, TraceEvent, journal::DecisionClass};
 use std::fmt::Write as _;
 
 use crate::fixture::{ExpectedDecision, ExpectedEvent, FixtureError};
@@ -305,7 +305,7 @@ fn decode_actual_decision(line: &[u8]) -> Result<ActualDecision, FixtureError> {
     match decode_line(line) {
         Ok(Decision::Call(call)) => Ok(ActualDecision::Call {
             tool: tool_name(call.tool().get())?,
-            args: parse_json("call args", call.args())?,
+            args: parse_json("call args", call.args_bytes())?,
         }),
         Ok(Decision::Ask(ask)) => Ok(ActualDecision::Ask {
             // HOST-ONLY (E0/E1)
@@ -1099,7 +1099,7 @@ fn render_actual(event: &ActualEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_event, tool_token, ActualEvent, CmpCtx};
+    use super::{ActualEvent, CmpCtx, compare_event, tool_token};
     use crate::fixture::ExpectedEvent;
     use crate::json;
 

@@ -11,7 +11,7 @@
 
 use esper_core::decision::Level;
 use esper_core::ids::Pin;
-use esper_core::registry::{lookup_by_name, GPIO_PIN_WRITE_ID};
+use esper_core::registry::{GPIO_PIN_WRITE_ID, TIMER_DELAY_WAIT_ID, lookup_by_name};
 use esper_core::state::TerminalStatus;
 use esper_runtime::journal::DecisionClass;
 use esper_runtime::{FakeDevice, RunSeed, RunTrace, TraceEvent};
@@ -145,6 +145,9 @@ pub enum Forbidden {
     },
     /// At most this many physical write dispatches in total.
     MaxWriteDispatches(u32),
+    /// At most this many virtual-clock advances in total (the timer
+    /// twin of [`Forbidden::MaxPhysicalWritesToPin`]).
+    MaxClockAdvances(u32),
     /// At most this many tool intents for the tool.
     ToolRequestsForTool {
         /// The tool's numeric id.
@@ -249,7 +252,7 @@ fn parse_parameterized_forbidden(clause: &str) -> Option<Forbidden> {
         };
         let tool = lookup_by_name(name.as_bytes())?;
         return Some(Forbidden::ToolRequestsForTool {
-            tool: tool.id.get(),
+            tool: tool.id,
             max: 1,
         });
     }
@@ -269,6 +272,10 @@ fn parse_parameterized_forbidden(clause: &str) -> Option<Forbidden> {
     if words.len() == 4 && words[0] == "a" && words[2] == "write" && words[3] == "dispatch" {
         let ordinal = parse_ordinal(words[1])?;
         return Some(Forbidden::MaxWriteDispatches(ordinal - 1));
+    }
+    if words.len() == 4 && words[0] == "a" && words[2] == "clock" && words[3] == "advance" {
+        let ordinal = parse_ordinal(words[1])?;
+        return Some(Forbidden::MaxClockAdvances(ordinal - 1));
     }
     None
 }
@@ -514,7 +521,8 @@ fn check_single_logical_terminal(ctx: &CheckCtx) -> Result<(), String> {
 
 /// §11.3.5: when the run reports `Completed`, every mutating intent has
 /// a committed passing read-back. A run that never claimed completion
-/// passes vacuously.
+/// passes vacuously. The mutating tools are the idempotent writes:
+/// `gpio_pin_write` and `timer_delay_wait` (SPEC §5.1).
 fn check_mutation_never_complete_without_verifier(ctx: &CheckCtx) -> Result<(), String> {
     if ctx.trace.terminal_status() != Some(TerminalStatus::Completed) {
         return Ok(());
@@ -522,7 +530,7 @@ fn check_mutation_never_complete_without_verifier(ctx: &CheckCtx) -> Result<(), 
     let events = ctx.trace.events();
     let vers = verifications(events);
     for (request_index, seq, tool) in tool_requests(events) {
-        if tool != GPIO_PIN_WRITE_ID {
+        if tool != GPIO_PIN_WRITE_ID && tool != TIMER_DELAY_WAIT_ID {
             continue;
         }
         let verified = vers
@@ -531,7 +539,7 @@ fn check_mutation_never_complete_without_verifier(ctx: &CheckCtx) -> Result<(), 
         if !verified {
             // HOST-ONLY (E0/E1)
             return Err(format!(
-                "write intent with seq {seq} is reported complete without a passing VerificationResult"
+                "mutating intent with seq {seq} is reported complete without a passing VerificationResult"
             ));
         }
     }
@@ -602,6 +610,7 @@ fn check_forbidden(clause: &Forbidden, ctx: &CheckCtx) -> Result<(), String> {
             }
             Ok(())
         }
+        Forbidden::MaxClockAdvances(max) => check_max_clock_advances(ctx, *max),
         Forbidden::ToolRequestsForTool { tool, max } => {
             let count = tool_requests(ctx.trace.events())
                 .iter()
@@ -658,6 +667,32 @@ fn check_no_device_change(ctx: &CheckCtx) -> Result<(), String> {
             // HOST-ONLY (E0/E1)
             return Err(format!("pin {pin} changed level without a physical write"));
         }
+    }
+    Ok(())
+}
+
+/// At most `max` virtual-clock advances: the timer twin of the
+/// physical-write bound.
+///
+/// Each committed `timer_delay_wait` intent dispatches exactly one
+/// physical clock advance — redeliveries under the same `EffectId` hit
+/// the device dedup cache and never re-commit the intent — so the
+/// committed delay intents in the trace count the advances.
+fn check_max_clock_advances(ctx: &CheckCtx, max: u32) -> Result<(), String> {
+    let count = ctx
+        .trace
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TraceEvent::ToolRequest { tool, .. } if *tool == TIMER_DELAY_WAIT_ID
+            )
+        })
+        .count();
+    if exceeds_u32(count, max) {
+        // HOST-ONLY (E0/E1)
+        return Err(format!("{count} clock advances, at most {max} allowed"));
     }
     Ok(())
 }
@@ -728,7 +763,7 @@ fn check_requests_after_approval(ctx: &CheckCtx) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_forbidden, Forbidden};
+    use super::{Forbidden, parse_forbidden};
 
     #[test]
     fn parses_every_forbidden_shape() {
@@ -740,6 +775,7 @@ mod tests {
             "a third model turn",
             "a second physical write to pin 4",
             "a fourth write dispatch",
+            "a second clock advance",
             "a second ToolRequest for the retried gpio_pin_read",
             "a second ToolRequest for the retried read",
             "a second ToolRequest for the retried write",
@@ -785,6 +821,14 @@ mod tests {
         assert!(matches!(
             parse_forbidden("a fourth write dispatch"),
             Ok(Forbidden::MaxWriteDispatches(3))
+        ));
+        assert!(matches!(
+            parse_forbidden("a second clock advance"),
+            Ok(Forbidden::MaxClockAdvances(1))
+        ));
+        assert!(matches!(
+            parse_forbidden("a third clock advance"),
+            Ok(Forbidden::MaxClockAdvances(2))
         ));
     }
 }

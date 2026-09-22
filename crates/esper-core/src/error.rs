@@ -118,6 +118,12 @@ pub enum Field {
     Pin,
     /// `gpio_pin_write` `level` argument.
     Level,
+    /// `sensor_sample_read` `sensor` argument.
+    Sensor,
+    /// `timer_delay_wait` `ms` argument.
+    Ms,
+    /// `device_status_report` `detail` argument.
+    Detail,
 }
 
 impl Field {
@@ -131,6 +137,9 @@ impl Field {
             Self::Summary => "summary",
             Self::Pin => "pin",
             Self::Level => "level",
+            Self::Sensor => "sensor",
+            Self::Ms => "ms",
+            Self::Detail => "detail",
         }
     }
 }
@@ -280,12 +289,14 @@ pub enum Error {
 
     // --- Policy (§5.2) ---
     /// The capability set refuses this call; terminal `Denied`.
-    #[error("capability denied: {tool} on pin {pin}")]
+    #[error("capability denied: {tool} on resource {resource}")]
     PermissionDenied {
         /// The refused tool.
         tool: ToolId,
-        /// The refused pin.
-        pin: u8,
+        /// The refused resource (§15.16): the pin for GPIO tools, the
+        /// sensor id for `sensor_sample_read`, 0 for timer and status
+        /// tools.
+        resource: u8,
     },
 
     // --- Records (§10.1) ---
@@ -381,6 +392,9 @@ impl Error {
             Field::Status => "\"completed\"",
             Field::Pin => "0..=7",
             Field::Level => "\"low\" | \"high\"",
+            Field::Sensor => "0..=3",
+            Field::Ms => "1..=5000",
+            Field::Detail => "\"summary\" | \"full\"",
         }
     }
 }

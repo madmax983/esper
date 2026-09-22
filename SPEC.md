@@ -38,11 +38,34 @@ Design-doc shorthand: "design §N" refers to
 |---|---|---|
 | Context compaction / `Compact` state / `continue_as_new` | E4 | Omitted from the state machine. `Gather` enforces a context budget guard; scripted contexts are bounded by construction, so the guard never fires in the slice. |
 | Human approval flow (`AwaitApproval`) | E2+ | Omitted. No tool in the slice catalog has permission class `SensitiveWrite`; the capability set cannot express it. |
-| `esper-protocol` crate (generated schemas/encodings) | E2 | Slice encodings are hand-rolled canonical byte layouts in `esper-core`. |
-| Sensor, timer, status, network tools | E2/E5 | Catalog holds exactly two tools. |
+| `esper-protocol` crate (generated schemas/encodings) | E2 — built | The E2 contract source (§17): one table drives the validator, signatures, and JSON Schema. |
+| Sensor, timer, status tools | E2 — built | Six-tool catalog (§17.2); tool ids 1–2 keep their slice assignments. |
+| Network tools | E5 | Explicitly out of E2: no tool name, description, or argument suggests network access; an anti-network test guards the catalog (§17.2). |
 | Remote model backend, MCP gateway | E3/E5 | Scripted backend only. |
 | `SubgoalClosed` progress emission | E4 | Defined, never emitted in the slice (no explicit subgoal model yet). |
 | Bounded parallel calls | E6 | Rejected: one call per turn, enforced by the decoder. |
+
+### Rung E2 scope
+
+E2 builds on the E0/E1 slice without changing its state machine, budget
+model, or durability contract:
+
+1. `esper-protocol`: the single contract source for the typed native tool
+   catalog (§17) — one constant table driving the allocation-free
+   validator, the compact model-facing signatures, the JSON Schema
+   export, and the golden argument fixtures.
+2. The catalog grows from two tools to six: `gpio_pin_read` (id 1) and
+   `gpio_pin_write` (id 2) keep their E0/E1 ids; `sensor_sample_read`
+   (3), `timer_uptime_read` (4), `timer_delay_wait` (5), and
+   `device_status_report` (6) join.
+3. Permission model v2 (§5.2): capability sets gain sensor, timer, and
+   status grants; authorization is per-tool (allowlist → capability →
+   device business rules), and denials still happen before dispatch.
+4. The strict JSON parser moves from `esper-core` to `esper-protocol`
+   (§17.4); `esper-core` re-exports it, so no E0/E1 code path changes
+   meaning.
+5. Generic network access is explicitly out of E2 and stays deferred to
+   E5.
 
 ### Host-only versus firmware
 
@@ -71,6 +94,7 @@ esper/
   SPEC.md
   spec/trajectories/*.json        golden fixtures (the red tests)
   crates/
+    esper-protocol/   the E2 contract source: tool table, validator, renderers (§17)
     esper-core/       pure types, decoder, budgets, monitor, policy gates
     esper-runtime/    ReAct workflow, Waymaker integration, scripted model,
                       fake device, verifier
@@ -80,14 +104,22 @@ esper/
 Dependency direction (strict, CI-enforced):
 
 ```text
-esper-eval --> esper-runtime --> esper-core
+esper-eval --> esper-runtime --> esper-core --> esper-protocol
 esper-eval --> esper-core
 esper-runtime --> waymaker-core, waymaker-embassy, waymaker-flash (0.1.0, crates.io)
 ```
 
 Rules:
 
-- `esper-core` depends on nothing but `core`. No I/O, no clocks, no
+- `esper-protocol` depends on nothing in the workspace: only `core`
+  (plus `thiserror`, `no_std`-compatible). It owns the static tool
+  table, the strict JSON parser (moved from `esper-core` in E2, §17.4),
+  the argument validator, and the signature / JSON Schema renderers.
+- `esper-core` depends on `esper-protocol` (for the shared `json`
+  module), never the reverse: a protocol→core edge is a layering
+  violation.
+
+- `esper-core` depends on nothing but `core` and `esper-protocol`. No I/O, no clocks, no
   logging, no serialization framework, no Waymaker.
 - `esper-runtime` depends only on `esper-core` and the Waymaker surfaces
   named in §10. It owns orchestration but not physical device authority
@@ -212,7 +244,8 @@ pub enum Decision<'a> {
 
 pub struct ToolCall<'a> {
     pub tool: ToolId,          // stable numeric id, not a name string
-    pub args: &'a [u8],        // canonical JSON bytes, borrowed
+    pub args: ToolArgs,        // typed dispatch shape (E2, §17.5; Copy)
+    pub args_bytes: &'a [u8],  // raw validated JSON bytes, borrowed
     pub args_digest: Digest,   // computed at decode time
 }
 
@@ -309,55 +342,82 @@ summary — a clean termination, never a hang, never a silent drop.
 ### 5.1 Static catalog
 
 The catalog is fixed at build time (ADR: static capability catalog).
-The slice catalog holds exactly two entries:
+The E0/E1 slice catalog held exactly two entries. Rung E2 extends it to
+six (§17.2); tool ids 1–2 keep their slice assignments and are never
+renumbered:
 
 | # | `ToolId` | Name | Permission class | Args schema | Result bound | Verification | Idempotency |
 |---|---|---|---|---|---|---|---|
-| 1 | `1` | `gpio_pin_read` | `ReadOnly` | `{"pin": u8 0..8}` | 64 B | `None` (read-only) | n/a (no effect) |
-| 2 | `2` | `gpio_pin_write` | `IdempotentWrite` | `{"pin": u8 0..8, "level": "low"\|"high"}` | 64 B | `ReadBack` | set-operation on `(pin)` keyed by stable `EffectId` |
+| 1 | `1` | `gpio_pin_read` | `ReadOnly` | `{"pin": u8 0..=7}` | 64 B | `None` (read-only) | n/a (no effect) |
+| 2 | `2` | `gpio_pin_write` | `IdempotentWrite` | `{"pin": u8 0..=7, "level": "low"\|"high"}` | 64 B | `ReadBack` | set-operation on `(pin)` keyed by stable `EffectId` |
+| 3 | `3` | `sensor_sample_read` | `ReadOnly` | `{"sensor": u8 0..=3}` | 64 B | `None` (read-only) | n/a (no effect) |
+| 4 | `4` | `timer_uptime_read` | `ReadOnly` | `{}` (empty object valid) | 64 B | `None` (read-only) | n/a (no effect) |
+| 5 | `5` | `timer_delay_wait` | `IdempotentWrite` | `{"ms": u16 1..=5000}` | 64 B | `ReadBack` | set-operation: the effect is "clock ≥ t0+ms"; redelivery under the same `EffectId` never double-advances |
+| 6 | `6` | `device_status_report` | `ReadOnly` | `{"detail": "summary"\|"full"}` | 128 B | `None` (read-only) | n/a (no effect) |
 
 Each registry entry contains: `ToolId`, name, schema version, compact
-model-facing description, argument validator, business-rule validator,
-permission class, dispatch function, result bound, verification
+model-facing description, the argument schema (the `ArgSpec` table the
+validator, the compact signature, and the JSON Schema all derive from),
+golden `example_ok` / `example_bad` argument fixtures, permission class,
+business-rule validator, dispatch function, result bound, verification
 strategy, idempotency strategy.
 
 Naming follows `domain_resource_verb`. `gpio_pin_write` is a set
 operation, never a toggle: re-dispatch with the same arguments is safe
 (ADR: at-least-once effects).
 
-### 5.2 Pin permission model
+### 5.2 Permission model (v2, rung E2)
 
 The `RunSeed` carries a fixed capability set:
 
 ```rust
 pub struct Capabilities {
-    pub read_pins: [u8; 8],   // pins the run may read, with count
-    pub read_count: u8,
-    pub write_pins: [u8; 8],  // pins the run may write, with count
-    pub write_count: u8,
+    pub read_pins: [u8; 8], pub read_count: u8,
+    pub write_pins: [u8; 8], pub write_count: u8,
+    pub sensors: [u8; 4], pub sensor_count: u8,
+    pub allow_timer: bool,
+    pub allow_status: bool,
 }
 ```
 
+(The E0/E1 struct held only the two pin sets; `sensors`,
+`allow_timer`, and `allow_status` are the E2 extension. The count
+discipline is unchanged: counts beyond the storage fail closed wherever
+they are read.)
+
 Authorization rule for a `Call`:
 
-1. Tool allowlisted in the current workflow phase (slice: both tools,
+1. Tool allowlisted in the current workflow phase (E2: all six tools,
    all phases).
-2. `pin` in `0..8`.
-3. Read: `pin` ∈ `read_pins`.
-4. Write: `pin` ∈ `write_pins` **and** the device reports the pin as
-   output-capable. Both must hold; the model cannot grant itself pins.
+2. Arguments validate against the tool's contract (decoder, §4.5;
+   violations consume repair allowance, never terminal).
+3. Capability check, by tool:
+   - `gpio_pin_read`: `pin` ∈ `read_pins`;
+   - `gpio_pin_write`: `pin` ∈ `write_pins` **and** the device reports
+     the pin as output-capable;
+   - `sensor_sample_read`: `sensor` ∈ `sensors`;
+   - `timer_uptime_read`, `timer_delay_wait`: `allow_timer`;
+   - `device_status_report`: `allow_status`.
+4. Device business rules for the tool's resource (pin direction for
+   writes, sensor present, clock sane). Both capability and device truth
+   must hold; the model cannot grant itself resources.
 5. The capability set is part of run identity: it can never widen after
-   reboot (§10, crash oracle).
+   reboot (§10, crash oracle). Absent fields in a fixture (`sensors`,
+   `allow_timer`, `allow_status`) mean denied — fail closed (§17.7).
 
-A write to a pin outside `write_pins`, or to a pin the device reports
-as input-only, fails **before dispatch** with terminal status `Denied`
-(fixture c). The permission check order above is normative: capability
-first, then device truth, so denials never touch hardware.
+A refusal fails **before dispatch** with terminal status `Denied`
+(fixture c pattern). The check order above is normative: allowlist,
+then contract validation, then capability, then device truth, so
+denials never touch hardware.
 
-Permission classes in the slice: `ReadOnly`, `IdempotentWrite`.
-`SensitiveWrite` and `Irreversible` exist as enum variants but no slice
-tool carries them and no capability set can grant them; `AwaitApproval`
-is therefore unreachable in the slice (§1).
+Permission classes: `ReadOnly`, `IdempotentWrite`, `SensitiveWrite`,
+`Irreversible`. The latter two still have no E2 tool and no grant path,
+so `AwaitApproval` stays unreachable.
+
+Denial reason vocabulary (normative terminal reason bytes): keep
+`pin_not_in_write_capabilities`, `pin_not_in_read_capabilities`,
+`pin_direction_denied`; add `sensor_not_in_capabilities`,
+`timer_not_permitted`, `status_not_permitted`.
 
 ### 5.3 Result envelope
 
@@ -900,6 +960,48 @@ the stub scan; design §10 requires incident → regression fixture).
    grant it (§5.2).
 10. **`Compact` in the diagram.** Resolved: E4; omitted from the slice
     machine with the deferral recorded (§1).
+11. **`timer_delay_wait` is `IdempotentWrite`, not a new class.**
+    Resolved: the effect is "the virtual clock has advanced to at least
+    t0+ms" — a set-operation on the clock. Redelivery under the same
+    `EffectId` re-asserts the same target and must not double-advance,
+    which is exactly the at-least-once machinery (intent before dispatch,
+    stable `EffectId`, device-side dedup, §10.3). No new permission class
+    was needed. The runtime verifies with `ReadBack`: the clock advanced
+    by at least `ms` from its pre-dispatch reading.
+12. **Delays consume the mutations budget.** Resolved: `timer_delay_wait`
+    is an `IdempotentWrite`, so each committed intent consumes one
+    `mutations` unit, exactly like `gpio_pin_write` (§7.2). Time passing
+    is a world-state change.
+13. **Sensor values are fixed per channel.** Resolved: the E2 fake device
+    returns deterministic raw values per sensor id — normative table:
+    sensor 0 → 210, 1 → 315, 2 → 1800, 3 → 42. Golden fixtures assert
+    these bytes; no noise, no drift (§17.6).
+14. **Status payload shapes.** Resolved: `detail: "summary"` returns
+    `{"pins":8,"sensors":4,"uptime_ms":N}`; `"full"` adds the pin
+    direction/level arrays and the per-sensor raw values, still within
+    the 128-byte bound. `N` is the virtual clock the timer tools share
+    (§17.6).
+15. **Enum spellings compare raw JSON string content.** Resolved: the
+    strict parser preserves escapes verbatim, so `"h\u0069gh"` does not
+    spell the `high` option — exactly like the E0/E1 decoder's
+    `Level::from_bytes`. One rule, documented in `esper-protocol`, not a
+    second code path (§17.3).
+16. **`Error::PermissionDenied` carries `resource`, not `pin`.**
+    Resolved: the E0/E1 field `pin: u8` becomes `resource: u8` — the pin
+    for GPIO tools, the sensor id for `sensor_sample_read`, 0 for timer
+    and status tools. Core-crew change (§17.5).
+17. **Encoding: keep the line grammar for E2.** Resolved: the `VERB
+    <json>` grammar (§4.3) survives E2; `esper-protocol` does not replace
+    it. Tradeoff: the line grammar is proven, token-cheap, and parsed by
+    the strict parser that now also powers the contract validator — one
+    parser for both jobs. What the model actually sees in the prompt is
+    not JSON Schema but the compact per-tool signatures generated by
+    `esper-protocol` (e.g.
+    `gpio_pin_write(pin:u8[0-7], level:low|high) -- …`), which are
+    cheaper than a schema dump and unambiguous. Full JSON-Schema
+    validation stays a host/training-side concern (the renderer exports
+    it for exactly that). Revisit at E3 only if the tiny-model backend
+    needs a different wire shape.
 
 ---
 
@@ -907,7 +1009,312 @@ the stub scan; design §10 requires incident → regression fixture).
 
 - Whether the §4.3 line grammar survives contact with the local
   tiny-model backend (E3), or whether E2's `esper-protocol` replaces it.
+  **Resolved for E2 (§15.17): keep the line grammar.** Revisit at E3
+  only if the tiny-model backend needs a different wire shape.
 - Firmware `TimeBudget` backend for `esper-device` (E2/E3).
 - Whether tool-local circuits need durable state (design §14).
 - Hard RAM/flash caps for `esper-core` + `esper-runtime` once the
   target board is fixed (E3); the slice only measures.
+
+---
+
+## 17. Rung E2: typed native tools
+
+### 17.1 Contract-source design
+
+One constant table — `esper_protocol::CATALOG`
+(`crates/esper-protocol/src/contract.rs`) — is the single source of
+truth for the six-tool catalog. From it the crate derives:
+
+1. the allocation-free on-device argument validator (`validate`);
+2. the compact model-facing signature per tool (`render_signature`) —
+   the line the model sees in the prompt's tool list (design §8);
+3. the minimal JSON Schema per tool (`render_json_schema`) — for
+   training and host interop (design §7 schema-pipeline item 1);
+4. the golden valid/invalid argument fixtures (each entry's
+   `example_ok` / `example_bad`, asserted by in-crate tests: every
+   `example_ok` validates, every `example_bad` fails, at least four bad
+   cases per tool).
+
+Nothing else in the workspace hand-writes a tool schema. The rendered
+signature and JSON Schema strings of every tool are byte-pinned by
+golden tests: any wording change is a deliberate, reviewed diff.
+
+The crate is `#![no_std]`, `#![deny(unsafe_code)]`, no `alloc`,
+core-only; its only dependency is `thiserror` (2), like `esper-core`.
+It depends on nothing else in the workspace.
+
+### 17.2 The six tools
+
+The normative catalog is the §5.1 table: `gpio_pin_read` (1),
+`gpio_pin_write` (2), `sensor_sample_read` (3), `timer_uptime_read` (4),
+`timer_delay_wait` (5), `device_status_report` (6). Tool ids 1–2 keep
+their E0/E1 assignments and are never renumbered.
+
+E2 excludes generic network access (deferred to E5): no tool name,
+description, or argument suggests network access, and the
+`no_generic_network_access_in_catalog` test fails the build if any
+entry's name or description contains "http", "network", "socket", or
+"url".
+
+### 17.3 Normative `esper-protocol` API
+
+Other crews code against exactly this surface (delivered by Crew A):
+
+```rust
+pub struct ToolContract {
+    pub id: u8,
+    pub name: &'static str,
+    pub schema_version: u8,
+    pub permission: PermissionClass,
+    pub verification: VerificationStrategy,
+    pub idempotency: IdempotencyStrategy,
+    pub result_bound: u16,
+    pub description: &'static str,
+    pub args: &'static [ArgSpec],
+    pub example_ok: &'static str,
+    pub example_bad: &'static [&'static str],
+}
+
+pub struct ArgSpec {
+    pub name: &'static str,
+    pub kind: ArgKind,
+    pub required: bool,
+}
+
+pub enum ArgKind {
+    U8 { lo: u8, hi: u8 },
+    U16 { lo: u16, hi: u16 },
+    Enum { options: &'static [&'static str] },
+}
+
+pub enum PermissionClass {
+    ReadOnly, IdempotentWrite, SensitiveWrite, Irreversible,
+}
+pub enum VerificationStrategy { None, ReadBack }
+pub enum IdempotencyStrategy { NotApplicable, SetOperation }
+// each with `pub const fn name(self) -> &'static str`
+
+pub const MAX_ARGS_PER_TOOL: usize = 4;
+
+pub struct BoundArgs {
+    pub fields: [Option<BoundField>; MAX_ARGS_PER_TOOL],
+    pub len: u8,
+}
+pub struct BoundField {
+    pub name: &'static str,
+    pub value: Scalar,
+}
+pub enum Scalar {
+    U8(u8),
+    U16(u16),
+    Enum(u8), // index into the spec's `options`
+}
+impl BoundArgs {
+    pub fn get(&self, name: &str) -> Option<Scalar>;
+}
+
+pub enum ValidationError {
+    Json(JsonError),
+    NotObject,
+    UnknownArgument,
+    MissingArgument(&'static str),
+    WrongType(&'static str),
+    OutOfRange(&'static str),
+    BadEnumValue(&'static str),
+    TooManyArguments,
+}
+
+pub fn validate(contract: &ToolContract, json: &[u8]) -> Result<BoundArgs, ValidationError>;
+pub fn render_signature(
+    contract: &ToolContract,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result;
+pub fn render_json_schema(
+    contract: &ToolContract,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result;
+pub const fn catalog() -> &'static [ToolContract];
+pub fn lookup_by_id(id: u8) -> Option<&'static ToolContract>;
+pub fn lookup_by_name(name: &str) -> Option<&'static ToolContract>;
+```
+
+Validator semantics (normative):
+
+- Fixed check order: JSON syntax, then top-level object shape, then
+  per-field checks in JSON key order, then required-field presence in
+  contract order. The first violation wins.
+- Top-level value must be an object (`NotObject` otherwise). An empty
+  object is valid exactly when the contract declares no arguments
+  (`timer_uptime_read`).
+- Unknown fields are rejected (`UnknownArgument`); every required field
+  must be present (`MissingArgument` carries the contract's field name,
+  never model bytes).
+- Per kind: `U8`/`U16` require a JSON number spelled as plain digits
+  (the strict parser already rejects signs, fractions, exponents, and
+  leading zeros) within the closed range (`WrongType` / `OutOfRange`);
+  `Enum` requires a JSON string byte-equal to one option
+  (`BadEnumValue`), compared against raw string content — escaped
+  spellings are rejected (§15.15). The bound `Enum` value is the
+  option's index.
+- Depth over 3 and duplicate keys are rejected by the strict parser
+  itself (`Json`); trailing bytes after the object are rejected too.
+  Where the parser/drain does not descend into a value — a composite in
+  a scalar argument position — the validator reports the schema
+  violation instead (`WrongType`, surfacing as `InvalidArgs`); depth
+  faults are `Json` only where the parser descends (ASK/FINISH
+  envelopes).
+- `BoundArgs` fields are emitted in contract order, not JSON key order,
+  so dispatch sees deterministic order whatever the model spells.
+  Values are `Copy` scalars; nothing borrows the model input.
+
+Signature format (normative, byte-pinned by tests):
+
+```text
+gpio_pin_write(pin:u8[0-7], level:low|high) -- Set the logic level of a GPIO pin. Re-dispatch is safe (set-operation). [idempotent_write, verify:read_back, bound:64B]
+```
+
+i.e. `name(args) -- description [permission, verify:verification, bound:NB]`,
+arguments as `name:u8[lo-hi]`, `name:u16[lo-hi]`, or `name:opt1|opt2`,
+and `name()` for argument-less tools. This is the line the model sees
+in the prompt's tool list (design §8).
+
+JSON Schema format (normative, byte-pinned by tests): one compact line,
+fields in fixed order —
+`{"name":…,"type":"object","properties":{…},"required":[…],"additionalProperties":false}`;
+integer kinds render with `minimum`/`maximum`, enums with an `enum`
+array in option order, `required` lists required arguments in contract
+order. Contract-table text is ASCII by construction; the renderers emit
+it verbatim without string escaping.
+
+### 17.4 The `json.rs` move (normative; executed once)
+
+1. `crates/esper-core/src/json.rs` moved to
+   `crates/esper-protocol/src/json.rs` via `git mv` — **done by Crew A;
+   do not repeat.**
+2. `esper-core` gained the dependency
+   `esper-protocol = { path = "../esper-protocol", version = "0.1.0" }`,
+   and `src/lib.rs` now has `pub use esper_protocol::json;` instead of
+   `pub mod json;` — done by Crew A.
+3. Every existing path (`crate::json::…`, `esper_core::json::…`, the
+   `tests/json.rs` integration tests) keeps working through the
+   re-export; no E0/E1 code path changes meaning.
+4. Crew A added `json::parse_u16` (the `u16` sibling of `parse_u8`) for
+   the `timer_delay_wait` `ms` argument; it lives with the parser.
+5. There is exactly one implementation of this module. The core crew
+   must not move, copy, or fork it.
+
+Rationale: `esper-protocol` cannot depend on `esper-core` (the core
+will depend on the protocol — a cycle), so the shared parser lives in
+the protocol crate and the core re-exports it.
+
+### 17.5 Normative `esper-core` adoption (core crew)
+
+- Replace the local `PermissionClass`, `VerificationStrategy`, and
+  `IdempotencyStrategy` in `registry.rs` with re-exports of
+  `esper_protocol`'s. Variant names are identical, so this is
+  mechanical; afterwards exactly one definition of each exists.
+- Replace `registry::ToolEntry` / `CATALOG` (the two-tool E0/E1 table)
+  with `esper_protocol::ToolContract` / `catalog()` (re-exported). The
+  decoder validates `CALL` args with `esper_protocol::validate`
+  instead of the hand-written per-tool schemas; schema violations keep
+  consuming repair allowance (§4.5).
+- Bind validated arguments to the typed dispatch shape:
+
+```rust
+pub enum ToolArgs {
+    GpioPinRead { pin: Pin },
+    GpioPinWrite { pin: Pin, level: Level },
+    SensorSampleRead { sensor: u8 }, // 0..=3, range proven by validate
+    TimerUptimeRead,
+    TimerDelayWait { ms: u16 },
+    DeviceStatusReport { detail: StatusDetail },
+}
+
+pub enum StatusDetail { Summary, Full }
+
+impl ToolArgs {
+    /// Bind validated arguments to the typed shape. The `BoundArgs`
+    /// came from `esper_protocol::validate`, so ranges are already
+    /// proven; this only reorganizes into the dispatch shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidArgs`-family rejections when the tool id
+    /// is unknown or a field is absent — fail closed. Unreachable when
+    /// the decoder ran `validate` first.
+    pub fn bind(tool_id: ToolId, args: &BoundArgs) -> Result<Self, Error>;
+}
+```
+
+(`sensor` stays `u8` — the range is proven by the validator; the core
+crew may add a `SensorId` newtype if it prefers.)
+
+- Replace the E0/E1 `authorize_capability` with the full `Authorize`
+  gate:
+
+```rust
+/// Allowlist → capability (§5.2 v2) → device business rules, in the
+/// normative check order. Denial is terminal `Denied`, never a repair turn.
+///
+/// # Errors
+///
+/// Returns `Error::PermissionDenied` when the capability set or the
+/// device business rules refuse the call.
+pub fn authorize(
+    caps: &Capabilities,
+    entry: &ToolContract,
+    args: &ToolArgs,
+) -> Result<(), Error>;
+```
+
+- Rename `Error::PermissionDenied`'s field `pin: u8` to `resource: u8`:
+  the pin for GPIO tools, the sensor id for `sensor_sample_read`, 0
+  for timer and status tools (§15.16).
+
+### 17.6 Normative `esper-runtime` mapping (runtime crew)
+
+| Tool | Dispatch | Verification |
+|---|---|---|
+| `gpio_pin_read` | sample the pin level | `None` |
+| `gpio_pin_write` | set the pin level; dedup on `EffectId`; set-operation | `ReadBack`: independent read of the pin vs the committed level (§9) |
+| `sensor_sample_read` | return the channel's fixed raw value (§15.13 table) | `None` |
+| `timer_uptime_read` | return the virtual-clock reading in ms | `None` |
+| `timer_delay_wait` | advance the virtual clock to ≥ t0+ms, where t0 is the pre-dispatch reading; redelivery under the same `EffectId` does not re-advance (dedup + set-operation); consumes one `mutations` unit (§15.12) | `ReadBack`: the clock advanced by at least `ms` from its pre-dispatch reading |
+| `device_status_report` | summary or full payload (§15.14) | `None` |
+
+Timer semantics: the fake device owns a virtual `u64` millisecond
+clock shared by the timer and status tools. `timer_delay_wait`'s
+committed intent records the target; dispatch advances the clock to at
+least t0+ms. The verifier is independent of the dispatch path (ADR 7):
+it reads the clock through a separate handle and checks the advance —
+a verifier that reads a flag the dispatcher set is not a verifier
+(§9.1).
+
+Sensor semantics: the fake device holds four channels with the fixed
+raw values from §15.13. `sensor_sample_read` returns the channel's
+value; there is no noise and no drift, so golden fixtures assert exact
+bytes.
+
+Status semantics: `detail: "summary"` returns
+`{"pins":8,"sensors":4,"uptime_ms":N}`; `"full"` adds the pin
+direction/level arrays and the per-sensor raw values, still within the
+128-byte bound. `N` is the shared virtual clock (§15.14).
+
+### 17.7 Normative `esper-eval` fixture deltas (eval crew)
+
+- `run_seed.capabilities` gains `sensors: [...]` (array of sensor ids),
+  `allow_timer: bool`, `allow_status: bool`. Absent means denied — fail
+  closed. E0/E1 fixtures without these fields keep their meaning.
+- `device.faults[]` entries gain an optional `tool: "<name>"` filter;
+  absent means the fault applies to any tool (preserves E0/E1
+  behavior).
+- Fault resource matching: GPIO tools match on `pin`,
+  `sensor_sample_read` on `sensor`, timer and status tools on resource
+  0.
+- New golden fixtures (eval crew writes, following §14.3): sensor read
+  success; timer delay with read-back verification; status summary and
+  full; denied sensor / timer / status (each terminal `Denied` with the
+  §5.2 reason bytes); delay redelivery under the same `EffectId` after
+  a crash between dispatch and observation commit does not
+  double-advance the clock.

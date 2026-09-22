@@ -22,20 +22,21 @@
 //! The firmware port (E2) keeps the boundary vocabulary and replaces
 //! the doubles.
 
-use esper_core::decision::{decode_line, Decision, Level};
-use esper_core::error::{ErrorCode, RepairVariant};
-use esper_core::ids::{Digest, Pin, ToolId};
-use esper_core::monitor::{Monitor, MonitorVerdict, ProgressDelta, StepRecord};
-use esper_core::registry::{authorize_capability, lookup_by_id, PermissionClass};
-use esper_core::state::{transition, Event, State, TerminalStatus};
 use esper_core::ResourceBudget;
+use esper_core::decision::{Decision, Level, ToolArgs, decode_line};
+use esper_core::error::{ErrorCode, RepairVariant};
+use esper_core::ids::{Digest, ToolId};
+use esper_core::monitor::{Monitor, MonitorVerdict, ProgressDelta, StepRecord};
+use esper_core::registry::{authorize, lookup_by_id};
+use esper_core::state::{Event, State, TerminalStatus, transition};
+use esper_protocol::PermissionClass;
 use waymaker_core::{
     ActivityKind, EffectIdAllocator, EffectSeq, RecordRef, ReplayCursor, RunId as WaymakerRunId,
 };
 
 use crate::error::{CrashPoint, Halt, RuntimeError};
 use crate::journal::{DecisionClass, Frame, Journal};
-use crate::seed::{RunSeed, ESPER_WORKFLOW_KIND};
+use crate::seed::{ESPER_WORKFLOW_KIND, RunSeed};
 use crate::trace::RunTrace;
 use crate::world::{FakeDevice, FaultPlan, InputPlan, ScriptedModel, WorldError};
 
@@ -67,10 +68,8 @@ enum Classified {
         args: Vec<u8>,
         /// The decode-time digest of `args`.
         digest: u64,
-        /// The target pin.
-        pin: u8,
-        /// The requested level (writes only).
-        level_high: Option<bool>,
+        /// The typed dispatch shape, bound from the validated bytes.
+        tool_args: ToolArgs,
     },
     /// A human-input request.
     Ask {
@@ -100,10 +99,8 @@ struct PendingCall {
     args: Vec<u8>,
     /// The decode-time digest of `args`.
     digest: u64,
-    /// The target pin.
-    pin: u8,
-    /// The requested level (writes only).
-    level_high: Option<bool>,
+    /// The typed dispatch shape, bound from the validated bytes.
+    tool_args: ToolArgs,
 }
 
 /// A committed intent with no terminal outcome yet.
@@ -113,16 +110,24 @@ struct PendingIntent {
     seq: EffectSeq,
     /// The tool's numeric id.
     tool: u8,
+    /// The typed dispatch shape, re-derived on replay via
+    /// `ToolArgs::bind` over the committed argument bytes.
+    tool_args: ToolArgs,
     /// The decode-time digest of the argument bytes.
     digest: u64,
-    /// The target pin.
-    pin: u8,
-    /// Whether the tool mutates the world.
+    /// Whether the tool mutates the world: consumes one `mutations`
+    /// unit and routes through `Verify`. Kept in the frame (not
+    /// re-derived from the permission class) because the mutation was
+    /// accounted at commit time; replay must reproduce the accounting,
+    /// not recompute it.
     write: bool,
-    /// The requested level (writes only).
-    level_high: bool,
     /// Attempts so far under this effect id.
     attempt: u32,
+    /// The committed observation bytes, when the outcome committed.
+    /// The delay verifier derives the pre-dispatch clock reading from
+    /// them.
+    // HOST-ONLY (E0/E1)
+    outcome: Option<Vec<u8>>,
 }
 
 /// A committed ask with no approval yet.
@@ -200,7 +205,7 @@ pub fn drive_run(
         monitor: Monitor::new(),
         allocator: EffectIdAllocator::for_run(run),
         cursor: ReplayCursor::new(run),
-        seed_input: [0u8; 32],
+        seed_input: [0u8; 55],
         repair_used: 0,
         turns_used: 0,
         mutations_used: 0,
@@ -281,7 +286,8 @@ struct Driver<'a> {
     /// The Waymaker replay cursor over the derived records.
     cursor: ReplayCursor,
     /// The canonical seed bytes for the `RunStarted` record.
-    seed_input: [u8; 32],
+    // HOST-ONLY (E0/E1)
+    seed_input: [u8; 55],
     /// Invalid lines committed this run.
     repair_used: u8,
     /// Model turns consumed this run.
@@ -423,10 +429,8 @@ impl Driver<'_> {
                 tool,
                 args,
                 digest,
-                pin,
                 write,
-                level_high,
-            } => self.replay_intent(*seq, *tool, args, *digest, *pin, *write, *level_high),
+            } => self.replay_intent(*seq, *tool, args, *digest, *write),
             Frame::ToolObservation {
                 seq,
                 attempt,
@@ -478,13 +482,12 @@ impl Driver<'_> {
             .consume_turn()
             .map_err(|_| RuntimeError::JournalCorrupt)?;
         self.turns_used += 1;
-        match Self::classify_output(output)? {
+        match Self::classify_output(output) {
             Classified::Call {
                 tool,
                 args,
                 digest,
-                pin,
-                level_high,
+                tool_args,
             } => {
                 if class != DecisionClass::Call {
                     return Err(RuntimeError::JournalCorrupt);
@@ -493,8 +496,7 @@ impl Driver<'_> {
                     tool,
                     args,
                     digest,
-                    pin,
-                    level_high,
+                    tool_args,
                 });
                 Ok(ResumePoint::Authorize)
             }
@@ -531,17 +533,18 @@ impl Driver<'_> {
     }
 
     /// Replay a committed intent: the allocator must mint the same
-    /// effect id, and the cursor replays the schedule record.
-    #[allow(clippy::too_many_arguments)]
+    /// effect id, and the cursor replays the schedule record. The
+    /// typed dispatch shape is re-derived deterministically from the
+    /// committed argument bytes via `ToolArgs::bind`: the bytes were
+    /// validated at commit, so bind cannot fail on a consistent
+    /// journal.
     fn replay_intent(
         &mut self,
         seq: u32,
         tool: u8,
         args: &[u8],
         digest: u64,
-        pin: u8,
         write: bool,
-        level_high: bool,
     ) -> Result<ResumePoint, RuntimeError> {
         let effect = self.allocator.allocate().map_err(RuntimeError::Waymaker)?;
         if effect.seq != EffectSeq(seq) {
@@ -559,15 +562,21 @@ impl Driver<'_> {
             input_len: u16::try_from(args.len()).map_err(|_| RuntimeError::JournalCorrupt)?,
             input_crc: fnv1a32(args),
         })?;
+        // Re-derive the typed dispatch shape from the committed bytes.
+        let entry = lookup_by_id(ToolId::new(tool)).ok_or(RuntimeError::JournalCorrupt)?;
+        let bound =
+            esper_protocol::validate(entry, args).map_err(|_| RuntimeError::JournalCorrupt)?;
+        let tool_args =
+            ToolArgs::bind(ToolId::new(tool), &bound).map_err(|_| RuntimeError::JournalCorrupt)?;
         self.pending_call = None;
         self.pending_intent = Some(PendingIntent {
             seq: EffectSeq(seq),
             tool,
+            tool_args,
             digest,
-            pin,
             write,
-            level_high,
             attempt: 0,
+            outcome: None,
         });
         Ok(ResumePoint::Observe)
     }
@@ -592,6 +601,12 @@ impl Driver<'_> {
                 return Err(RuntimeError::ReplayDiverged);
             }
             intent.attempt = attempt;
+            if !transient {
+                // Stash the committed outcome: the delay verifier
+                // derives the pre-dispatch clock reading from it.
+                // HOST-ONLY (E0/E1)
+                intent.outcome = Some(outcome.to_vec());
+            }
             (intent.write, intent.tool, intent.digest)
         };
         if transient {
@@ -730,7 +745,7 @@ impl Driver<'_> {
     /// The pre-commit half of `Infer`.
     fn infer_pre_commit(&mut self, line: &[u8]) -> Result<(), Halt> {
         self.fire(CrashPoint::ModelIntent)?;
-        let classified = Self::classify_output(line).map_err(Halt::Error)?;
+        let classified = Self::classify_output(line);
         self.fire(CrashPoint::BeforeDecisionCommit)?;
         // Unreachable in a consistent run: every path into `Infer`
         // passes a budget gate (`Gather`, or `Repair` which checks
@@ -744,8 +759,7 @@ impl Driver<'_> {
                 tool,
                 args,
                 digest,
-                pin,
-                level_high,
+                tool_args,
             } => {
                 // HOST-ONLY (E0/E1)
                 self.journal.push(Frame::ModelDecision {
@@ -757,8 +771,7 @@ impl Driver<'_> {
                     tool,
                     args,
                     digest,
-                    pin,
-                    level_high,
+                    tool_args,
                 });
                 self.advance(Event::DecodeCall)?;
             }
@@ -827,6 +840,12 @@ impl Driver<'_> {
 
     /// `Authorize`: capability check, then device business rules, then
     /// the durable intent commit. Denials never touch hardware.
+    ///
+    /// The normative §17.5 gate runs in order: the allowlist is
+    /// implicit (the tool name resolved against the static catalog at
+    /// decode), then `authorize` checks the seed's capability set,
+    /// then the device's business rules run. Only a call that clears
+    /// all three is dispatched.
     fn do_authorize(&mut self) -> Result<(), Halt> {
         let call = self
             .pending_call
@@ -834,30 +853,29 @@ impl Driver<'_> {
             .ok_or(RuntimeError::IllegalTransition)?;
         self.fire(CrashPoint::BeforeAuthorize)?;
         let entry = lookup_by_id(ToolId::new(call.tool)).ok_or(RuntimeError::IllegalTransition)?;
-        let pin = Pin::new(call.pin).map_err(RuntimeError::Core)?;
         let is_write = matches!(entry.permission, PermissionClass::IdempotentWrite);
-        if authorize_capability(&self.seed.capabilities(), entry, pin).is_err() {
-            let (reason, summary) = if is_write {
-                (
-                    "pin_not_in_write_capabilities",
-                    // HOST-ONLY (E0/E1)
-                    format!("write to pin {} denied by policy", pin.get()),
-                )
-            } else {
-                (
-                    "pin_not_in_read_capabilities",
-                    format!("read of pin {} denied by policy", pin.get()),
-                )
-            };
+        if let Err(error) = authorize(&self.seed.capabilities, entry, &call.tool_args) {
+            // The gate's only refusal is `PermissionDenied`; any other
+            // error is an engine bug, failed closed.
+            if !matches!(error, esper_core::error::Error::PermissionDenied { .. }) {
+                return Err(RuntimeError::IllegalTransition.into());
+            }
             self.advance(Event::Denied)?;
-            let reason = reason.as_bytes().to_vec();
-            let summary = summary.into_bytes();
-            return self.enter_degraded(TerminalStatus::Denied, &reason, &summary);
+            let reason = denial_reason(call.tool_args);
+            // HOST-ONLY (E0/E1)
+            let summary = denial_summary(call.tool_args).into_bytes();
+            return self.enter_degraded(TerminalStatus::Denied, reason, &summary);
         }
-        if is_write && self.device.direction(pin) == crate::world::Direction::Input {
-            let summary = format!("write to pin {} denied by device direction", pin.get());
+        // Device business rules (SPEC §5.2 step 3): only `gpio_pin_write`
+        // carries one in E2 — the pin must be output-capable. The other
+        // tools have no device rule.
+        if let ToolArgs::GpioPinWrite { pin, .. } = call.tool_args
+            && self.device.direction(pin) == crate::world::Direction::Input
+        {
+            // HOST-ONLY (E0/E1)
+            let summary =
+                format!("write to pin {} denied by device direction", pin.get()).into_bytes();
             self.advance(Event::Denied)?;
-            let summary = summary.into_bytes();
             return self.enter_degraded(TerminalStatus::Denied, b"pin_direction_denied", &summary);
         }
         if is_write && self.budget.mutations == 0 {
@@ -884,9 +902,7 @@ impl Driver<'_> {
             tool: call.tool,
             args: args.clone(),
             digest: call.digest,
-            pin: call.pin,
             write: is_write,
-            level_high: call.level_high.unwrap_or(false),
         });
         self.advance_cursor(RecordRef::EffectScheduled {
             seq,
@@ -903,11 +919,11 @@ impl Driver<'_> {
         self.pending_intent = Some(PendingIntent {
             seq,
             tool: call.tool,
+            tool_args: call.tool_args,
             digest: call.digest,
-            pin: call.pin,
             write: is_write,
-            level_high: call.level_high.unwrap_or(false),
             attempt: 0,
+            outcome: None,
         });
         self.advance(Event::Authorized)?;
         Ok(())
@@ -963,8 +979,10 @@ impl Driver<'_> {
             .take()
             .ok_or(RuntimeError::IllegalTransition)?;
         intent.attempt += 1;
-        let pin = Pin::new(intent.pin).map_err(RuntimeError::Core)?;
-        if self.faults.consume(intent.tool, intent.pin) {
+        if self
+            .faults
+            .consume(intent.tool, dispatch_resource(intent.tool_args))
+        {
             if intent.attempt >= MAX_TRANSIENT_ATTEMPTS {
                 self.advance(Event::TransientExhausted)?;
                 // HOST-ONLY (E0/E1)
@@ -995,15 +1013,7 @@ impl Driver<'_> {
             return Ok(());
         }
         // HOST-ONLY (E0/E1)
-        let outcome = if intent.write {
-            self.device
-                .dispatch_write(pin, intent.level_high, intent.seq, intent.digest)
-                .map_err(map_world)?
-        } else {
-            self.device
-                .dispatch_read(pin, intent.seq, intent.digest)
-                .map_err(map_world)?
-        };
+        let outcome = self.dispatch_intent(&intent).map_err(map_world)?;
         self.fire(CrashPoint::AfterPhysicalBeforeObservation)?;
         let record_outcome = outcome.clone();
         self.journal.push(Frame::ToolObservation {
@@ -1017,6 +1027,9 @@ impl Driver<'_> {
             result: &record_outcome,
         })?;
         if intent.write {
+            // Stash the committed outcome: the delay verifier derives
+            // the pre-dispatch clock reading from it.
+            intent.outcome = Some(record_outcome);
             self.pending_intent = Some(intent);
             self.advance(Event::ObserveOkMutating)?;
         } else {
@@ -1030,23 +1043,39 @@ impl Driver<'_> {
         Ok(())
     }
 
+    /// Dispatch the committed intent against the fake device, routing
+    /// by the typed arguments (SPEC §17.6).
+    fn dispatch_intent(&mut self, intent: &PendingIntent) -> Result<Vec<u8>, WorldError> {
+        let seq = intent.seq;
+        let digest = intent.digest;
+        match intent.tool_args {
+            ToolArgs::GpioPinRead { pin } => self.device.dispatch_read(pin, seq, digest),
+            ToolArgs::GpioPinWrite { pin, level } => {
+                self.device
+                    .dispatch_write(pin, level == Level::High, seq, digest)
+            }
+            ToolArgs::SensorSampleRead { sensor } => {
+                self.device.dispatch_sensor_read(sensor, seq, digest)
+            }
+            ToolArgs::TimerUptimeRead => self.device.dispatch_uptime_read(seq, digest),
+            ToolArgs::TimerDelayWait { ms } => self.device.dispatch_delay_wait(ms, seq, digest),
+            ToolArgs::DeviceStatusReport { detail } => {
+                self.device.dispatch_status_report(detail, seq, digest)
+            }
+        }
+    }
+
     /// `Verify`: the independent read-back every mutation must pass.
     ///
-    /// The verifier reads the pin's physical level directly —
-    /// independent of the dispatch path — and the mutation completes
-    /// only when read-back matches the requested state.
+    /// Reads never reach this step (`Observe` routes them straight to
+    /// `Account`): only the two idempotent-write tools do.
     fn do_verify(&mut self) -> Result<(), Halt> {
         let intent = self
             .pending_intent
             .clone()
             .ok_or(RuntimeError::IllegalTransition)?;
         self.fire(CrashPoint::AfterObservationBeforeVerify)?;
-        let pin = Pin::new(intent.pin).map_err(RuntimeError::Core)?;
-        let observed_high = self.device.verify_read(pin);
-        let passed = observed_high == intent.level_high;
-        // HOST-ONLY (E0/E1)
-        let expected = pin_level_json(intent.pin, intent.level_high);
-        let observed = pin_level_json(intent.pin, observed_high);
+        let (expected, observed, passed) = self.verify_intent(&intent)?;
         self.fire(CrashPoint::BeforeVerificationCommit)?;
         self.journal.push(Frame::Verification {
             seq: intent.seq.0,
@@ -1076,6 +1105,46 @@ impl Driver<'_> {
             Event::VerifyFail
         })?;
         Ok(())
+    }
+
+    /// Run the independent read-back for a mutating tool (SPEC §9).
+    ///
+    /// Returns the expected and observed JSON plus the pass flag.
+    /// Reads never reach this step; any other tool here is an engine
+    /// bug.
+    fn verify_intent(&self, intent: &PendingIntent) -> Result<(Vec<u8>, Vec<u8>, bool), Halt> {
+        match intent.tool_args {
+            ToolArgs::GpioPinWrite { pin, level } => {
+                // The verifier reads the pin's physical level directly —
+                // independent of the dispatch path — and the mutation
+                // completes only when read-back matches.
+                let expected_high = level == Level::High;
+                let observed_high = self.device.verify_read(pin);
+                // HOST-ONLY (E0/E1)
+                let expected = pin_level_json(pin.get(), expected_high);
+                let observed = pin_level_json(pin.get(), observed_high);
+                Ok((expected, observed, observed_high == expected_high))
+            }
+            ToolArgs::TimerDelayWait { ms } => {
+                // The committed intent proves the requested `ms`; the
+                // committed observation proves the pre-dispatch reading
+                // (`t0 = uptime_ms - waited_ms`). The verifier reads the
+                // clock through its own handle — never a flag the
+                // dispatcher set — and checks the advance (SPEC §15.11).
+                let outcome = intent
+                    .outcome
+                    .as_ref()
+                    .ok_or(RuntimeError::IllegalTransition)?;
+                let (t0, _post) = parse_delay_outcome(outcome)?;
+                let target = t0.saturating_add(u64::from(ms));
+                let observed = self.device.clock_read();
+                // HOST-ONLY (E0/E1)
+                let expected = target_json(target);
+                let observed_json = observed_clock_json(observed);
+                Ok((expected, observed_json, observed >= target))
+            }
+            _ => Err(RuntimeError::IllegalTransition.into()),
+        }
     }
 
     /// `Account`: run the deterministic monitor over the completed step.
@@ -1197,14 +1266,26 @@ impl Driver<'_> {
                 (reason, summary)
             }
             TerminalStatus::Stuck if monitor_reason.contains("three identical") => {
-                let (pin, level) = intent.map_or((0, "high"), |intent| {
-                    (intent.pin, if intent.level_high { "high" } else { "low" })
-                });
-                (
-                    b"three_identical_verification_failures".to_vec(),
-                    // HOST-ONLY (E0/E1)
-                    format!("pin {pin} did not reach {level} after 3 attempts").into_bytes(),
-                )
+                let summary = match intent.map(|intent| intent.tool_args) {
+                    Some(ToolArgs::GpioPinWrite { pin, level }) => {
+                        // HOST-ONLY (E0/E1)
+                        format!(
+                            "pin {} did not reach {} after 3 attempts",
+                            pin.get(),
+                            level.name()
+                        )
+                        .into_bytes()
+                    }
+                    Some(ToolArgs::TimerDelayWait { ms }) => {
+                        // HOST-ONLY (E0/E1)
+                        format!("clock did not advance by {ms}ms after 3 attempts").into_bytes()
+                    }
+                    _ => {
+                        // HOST-ONLY (E0/E1)
+                        b"verified mutation did not take effect after 3 attempts".to_vec()
+                    }
+                };
+                (b"three_identical_verification_failures".to_vec(), summary)
             }
             _ => {
                 // HOST-ONLY (E0/E1)
@@ -1225,48 +1306,169 @@ impl Driver<'_> {
     }
 
     /// Decode one model line into owned pieces.
-    fn classify_output(line: &[u8]) -> Result<Classified, RuntimeError> {
+    ///
+    /// The whole line decodes through `esper-core`'s normative
+    /// decoder: a `CALL` arrives with the tool's numeric id, the
+    /// already-bound typed arguments, the raw validated argument
+    /// bytes, and the decode-time digest; `ASK` and `FINISH` keep
+    /// their E0/E1 decoding byte-identical.
+    fn classify_output(line: &[u8]) -> Classified {
         match decode_line(line) {
-            Ok(Decision::Call(call)) => {
-                let pin = call.pin().map_err(RuntimeError::Core)?.get();
-                let level_high = match call.level() {
-                    Ok(Level::High) => Some(true),
-                    Ok(Level::Low) => Some(false),
-                    Err(_) => None,
-                };
-                Ok(Classified::Call {
-                    tool: call.tool().get(),
-                    // HOST-ONLY (E0/E1)
-                    args: call.args().to_vec(),
-                    digest: call.args_digest().get(),
-                    pin,
-                    level_high,
-                })
-            }
-            Ok(Decision::Ask(ask)) => Ok(Classified::Ask {
+            Ok(Decision::Call(call)) => Classified::Call {
+                tool: call.tool().get(),
                 // HOST-ONLY (E0/E1)
-                prompt: ask.prompt.to_vec(),
-                schema: ask.response_schema_id,
-            }),
-            Ok(Decision::Finish(answer)) => Ok(Classified::Finish {
+                args: call.args_bytes().to_vec(),
+                digest: call.args_digest().get(),
+                tool_args: *call.args(),
+            },
+            Ok(Decision::Ask(ask)) => Classified::Ask {
                 // HOST-ONLY (E0/E1)
-                summary: answer.summary.to_vec(),
-            }),
+                prompt: ask.prompt().to_vec(),
+                schema: ask.response_schema_id(),
+            },
+            Ok(Decision::Finish(answer)) => Classified::Finish {
+                // HOST-ONLY (E0/E1)
+                summary: answer.summary().to_vec(),
+            },
             Err(error) => {
                 let variant = error.repair_variant().unwrap_or(RepairVariant::Malformed);
-                Ok(Classified::Invalid(variant))
+                Classified::Invalid(variant)
             }
         }
     }
 }
 
+/// The normative §5.2 reason bytes for a refused call, derived from
+/// the call's shape: the capability gate reports the tool and the
+/// resource, and these bytes are the run's terminal-reason vocabulary
+/// for that refusal.
+const fn denial_reason(args: ToolArgs) -> &'static [u8] {
+    match args {
+        ToolArgs::GpioPinRead { .. } => b"pin_not_in_read_capabilities",
+        ToolArgs::GpioPinWrite { .. } => b"pin_not_in_write_capabilities",
+        ToolArgs::SensorSampleRead { .. } => b"sensor_not_in_capabilities",
+        ToolArgs::TimerUptimeRead | ToolArgs::TimerDelayWait { .. } => b"timer_not_permitted",
+        ToolArgs::DeviceStatusReport { .. } => b"status_not_permitted",
+    }
+}
+
+/// The human-readable denial summary naming the refused resource.
+fn denial_summary(args: ToolArgs) -> String {
+    // HOST-ONLY (E0/E1)
+    match args {
+        ToolArgs::GpioPinRead { pin } => format!("read of pin {} denied by policy", pin.get()),
+        ToolArgs::GpioPinWrite { pin, .. } => {
+            format!("write to pin {} denied by policy", pin.get())
+        }
+        ToolArgs::SensorSampleRead { sensor } => {
+            format!("read of sensor {sensor} denied by policy")
+        }
+        ToolArgs::TimerUptimeRead => "uptime read denied by policy".to_string(),
+        ToolArgs::TimerDelayWait { .. } => "delay wait denied by policy".to_string(),
+        ToolArgs::DeviceStatusReport { .. } => "status report denied by policy".to_string(),
+    }
+}
+
+/// The fault-plan resource for a call (SPEC §17.7): the pin for the
+/// GPIO tools, the sensor id for `sensor_sample_read`, 0 for the
+/// timer and status tools.
+const fn dispatch_resource(args: ToolArgs) -> u8 {
+    match args {
+        ToolArgs::GpioPinRead { pin } | ToolArgs::GpioPinWrite { pin, .. } => pin.get(),
+        ToolArgs::SensorSampleRead { sensor } => sensor,
+        ToolArgs::TimerUptimeRead
+        | ToolArgs::TimerDelayWait { .. }
+        | ToolArgs::DeviceStatusReport { .. } => 0,
+    }
+}
+
+/// The canonical JSON for a delay target: `{"target_ms":250}`.
+fn target_json(target_ms: u64) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"target_ms\":{target_ms}}}").into_bytes()
+}
+
+/// The canonical JSON for an observed clock reading:
+/// `{"uptime_ms":250}`.
+fn observed_clock_json(uptime_ms: u64) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"uptime_ms\":{uptime_ms}}}").into_bytes()
+}
+
+/// Parse the machine-generated delay outcome
+/// `{"waited_ms":M,"uptime_ms":N}` into the pre-dispatch reading `t0`
+/// (`N - M`) and the post-dispatch reading `N`.
+///
+/// The outcome bytes were committed by the device, so any shape
+/// violation is journal corruption, failed closed.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::JournalCorrupt`] when the outcome is not
+/// the canonical delay shape.
+fn parse_delay_outcome(outcome: &[u8]) -> Result<(u64, u64), RuntimeError> {
+    use esper_protocol::json::{JsonValue, Parser};
+    let mut parser = Parser::new(outcome);
+    let JsonValue::Object(mut cursor) = parser
+        .parse_value()
+        .map_err(|_| RuntimeError::JournalCorrupt)?
+    else {
+        return Err(RuntimeError::JournalCorrupt);
+    };
+    let mut waited: Option<u64> = None;
+    let mut uptime: Option<u64> = None;
+    while let Some((key, value)) = cursor
+        .next_entry()
+        .map_err(|_| RuntimeError::JournalCorrupt)?
+    {
+        let JsonValue::Number(raw) = value else {
+            return Err(RuntimeError::JournalCorrupt);
+        };
+        let number = parse_u64_digits(raw).ok_or(RuntimeError::JournalCorrupt)?;
+        match key {
+            b"waited_ms" => waited = Some(number),
+            b"uptime_ms" => uptime = Some(number),
+            _ => return Err(RuntimeError::JournalCorrupt),
+        }
+    }
+    parser.finish().map_err(|_| RuntimeError::JournalCorrupt)?;
+    let (Some(waited), Some(uptime)) = (waited, uptime) else {
+        return Err(RuntimeError::JournalCorrupt);
+    };
+    let t0 = uptime
+        .checked_sub(waited)
+        .ok_or(RuntimeError::JournalCorrupt)?;
+    Ok((t0, uptime))
+}
+
+/// Parse plain ASCII digits into a `u64`, failing closed on anything
+/// else.
+fn parse_u64_digits(raw: &[u8]) -> Option<u64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut number: u64 = 0;
+    for byte in raw {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number = number
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(number)
+}
+
 /// Map a world-double failure to the runtime error vocabulary.
 ///
 /// An argument mismatch under a committed effect id means the replayed
-/// history disagrees with the journal: fail closed as divergence.
+/// history disagrees with the journal: fail closed as divergence. An
+/// unknown resource is unreachable (the decoder proves every range
+/// before dispatch), so it is an engine bug.
 const fn map_world(error: WorldError) -> RuntimeError {
     match error {
         WorldError::EffectArgsMismatch => RuntimeError::ReplayDiverged,
+        WorldError::UnknownResource => RuntimeError::IllegalTransition,
     }
 }
 
@@ -1339,7 +1541,16 @@ fn validate_ask_input(input: &[u8], schema: u8) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fnv1a32, pin_level_json, validate_ask_input};
+    use super::{
+        denial_reason, denial_summary, dispatch_resource, fnv1a32, parse_delay_outcome,
+        parse_u64_digits, pin_level_json, target_json, validate_ask_input,
+    };
+    use esper_core::decision::{Level, StatusDetail, ToolArgs};
+    use esper_core::ids::Pin;
+
+    fn pin(n: u8) -> Pin {
+        Pin::new(n).expect("bad pin in test")
+    }
 
     #[test]
     fn fnv1a_is_the_standard_hash() {
@@ -1378,5 +1589,97 @@ mod tests {
         // Unsupported schemas fail even for well-formed input.
         assert!(validate_ask_input(br#"{"pin": 4}"#, 2).is_err());
         assert!(validate_ask_input(br#"{"pin": 4}"#, 0).is_err());
+    }
+
+    #[test]
+    fn denial_summary_names_the_refused_resource() {
+        assert_eq!(
+            denial_summary(ToolArgs::GpioPinRead { pin: pin(4) }),
+            "read of pin 4 denied by policy"
+        );
+        assert_eq!(
+            denial_summary(ToolArgs::GpioPinWrite {
+                pin: pin(4),
+                level: Level::High
+            }),
+            "write to pin 4 denied by policy"
+        );
+        assert_eq!(
+            denial_summary(ToolArgs::SensorSampleRead { sensor: 2 }),
+            "read of sensor 2 denied by policy"
+        );
+        assert_eq!(
+            denial_summary(ToolArgs::TimerDelayWait { ms: 250 }),
+            "delay wait denied by policy"
+        );
+    }
+
+    #[test]
+    fn denial_reason_is_the_normative_section_5_2_bytes() {
+        assert_eq!(
+            denial_reason(ToolArgs::GpioPinRead { pin: pin(4) }),
+            b"pin_not_in_read_capabilities"
+        );
+        assert_eq!(
+            denial_reason(ToolArgs::GpioPinWrite {
+                pin: pin(4),
+                level: Level::High
+            }),
+            b"pin_not_in_write_capabilities"
+        );
+        assert_eq!(
+            denial_reason(ToolArgs::SensorSampleRead { sensor: 2 }),
+            b"sensor_not_in_capabilities"
+        );
+        assert_eq!(
+            denial_reason(ToolArgs::TimerUptimeRead),
+            b"timer_not_permitted"
+        );
+        assert_eq!(
+            denial_reason(ToolArgs::TimerDelayWait { ms: 250 }),
+            b"timer_not_permitted"
+        );
+        assert_eq!(
+            denial_reason(ToolArgs::DeviceStatusReport {
+                detail: StatusDetail::Summary
+            }),
+            b"status_not_permitted"
+        );
+    }
+
+    #[test]
+    fn dispatch_resource_follows_spec_17_7() {
+        assert_eq!(dispatch_resource(ToolArgs::GpioPinRead { pin: pin(4) }), 4);
+        assert_eq!(
+            dispatch_resource(ToolArgs::SensorSampleRead { sensor: 2 }),
+            2
+        );
+        assert_eq!(dispatch_resource(ToolArgs::TimerDelayWait { ms: 250 }), 0);
+        assert_eq!(dispatch_resource(ToolArgs::TimerUptimeRead), 0);
+    }
+
+    #[test]
+    fn target_json_is_canonical() {
+        assert_eq!(target_json(250), b"{\"target_ms\":250}");
+    }
+
+    #[test]
+    fn parse_delay_outcome_recovers_t0() {
+        assert_eq!(
+            parse_delay_outcome(br#"{"waited_ms":250,"uptime_ms":1250}"#).expect("canonical"),
+            (1000, 1250)
+        );
+        assert!(parse_delay_outcome(br#"{"waited_ms":250}"#).is_err());
+        assert!(parse_delay_outcome(br#"{"waited_ms":999,"uptime_ms":1}"#).is_err());
+        assert!(parse_delay_outcome(b"not json").is_err());
+    }
+
+    #[test]
+    fn parse_u64_digits_is_strict() {
+        assert_eq!(parse_u64_digits(b"0"), Some(0));
+        assert_eq!(parse_u64_digits(b"18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_u64_digits(b"18446744073709551616"), None);
+        assert_eq!(parse_u64_digits(b""), None);
+        assert_eq!(parse_u64_digits(b"12a"), None);
     }
 }

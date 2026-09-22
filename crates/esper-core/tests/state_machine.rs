@@ -4,11 +4,11 @@
 //! is an independent check on the crate's `TRANSITIONS` data: any typo on
 //! either side fails loudly.
 
+use esper_core::Error;
 use esper_core::records::RecordKind;
 use esper_core::state::{
-    committed_records, is_legal, transition, Event, State, TerminalStatus, ALL_EVENTS, ALL_STATES,
+    ALL_EVENTS, ALL_STATES, Event, State, TerminalStatus, committed_records, is_legal, transition,
 };
-use esper_core::Error;
 
 /// The §3.2 table, transcribed independently of the crate's data.
 const EXPECTED: [(State, Event, State); 25] = [

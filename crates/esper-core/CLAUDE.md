@@ -1,8 +1,8 @@
 # esper-core
 
 Pure types, decision decoder, resource budgets, and the deterministic runtime
-monitor for the Esper E0/E1 vertical slice. Authority: `SPEC.md` at the
-workspace root (§3–§8, §10).
+monitor for Esper (E0/E1 slice + E2 typed tools). Authority: `SPEC.md` at the
+workspace root (§3–§8, §10, §17).
 
 ## Non-negotiables
 
@@ -13,8 +13,9 @@ workspace root (§3–§8, §10).
   dependency. Host-side doubles (scripted model, fake device, fault
   injector, fixture runner) live in `esper-runtime` / `esper-eval`, never
   here.
-- Only dependency is `thiserror` (no_std-compatible). A CI layering gate
-  fails the build if `alloc` appears in this crate's dependency closure.
+- Dependencies are `thiserror` (no_std-compatible) and `esper-protocol`
+  (the single E2 contract source). A CI layering gate fails the build if
+  `alloc` appears in this crate's dependency closure.
 - Engineering law (per `~/memory/coding-philosophy.md`): SPEC-PROOF →
   RED → GREEN → REFACTOR. Strong newtypes over primitives. `thiserror`
   for the error vocabulary. No `unwrap`/`expect` in non-test source —

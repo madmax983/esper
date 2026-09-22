@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/esper-core", "crates/esper-runtime", "crates/esper-eval"]
+members = [
+    "crates/esper-protocol",
+    "crates/esper-core",
+    "crates/esper-runtime",
+    "crates/esper-eval",
+]
 resolver = "2"
 
 [workspace.lints.clippy]

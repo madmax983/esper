@@ -276,33 +276,17 @@ impl ResourceBudget {
 /// `const`-compatible minimums (`core::cmp::min` is not const on all
 /// toolchain versions this crate supports).
 const fn min_u16(a: u16, b: u16) -> u16 {
-    if a < b {
-        a
-    } else {
-        b
-    }
+    if a < b { a } else { b }
 }
 
 const fn min_u32(a: u32, b: u32) -> u32 {
-    if a < b {
-        a
-    } else {
-        b
-    }
+    if a < b { a } else { b }
 }
 
 const fn min_u64(a: u64, b: u64) -> u64 {
-    if a < b {
-        a
-    } else {
-        b
-    }
+    if a < b { a } else { b }
 }
 
 const fn min_u8(a: u8, b: u8) -> u8 {
-    if a < b {
-        a
-    } else {
-        b
-    }
+    if a < b { a } else { b }
 }

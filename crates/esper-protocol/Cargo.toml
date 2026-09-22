@@ -1,0 +1,12 @@
+[package]
+name = "esper-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Esper E2: the single contract source for the typed native tool catalog. no_std, allocation-free."
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true

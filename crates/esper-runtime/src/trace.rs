@@ -52,10 +52,12 @@ pub enum TraceEvent {
         seq: u32,
         /// Whether read-back matched the requested state.
         passed: bool,
-        /// The expected pin state, as JSON.
+        /// The expected state, as JSON: the requested pin level for a
+        /// GPIO write, the target clock reading for a delay.
         // HOST-ONLY (E0/E1)
         expected: Vec<u8>,
-        /// The observed pin state, as JSON.
+        /// The observed state, as JSON: the pin's physical level for a
+        /// GPIO write, the clock reading for a delay.
         // HOST-ONLY (E0/E1)
         observed: Vec<u8>,
     },

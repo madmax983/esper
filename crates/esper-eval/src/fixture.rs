@@ -17,13 +17,12 @@
 //! // HOST-ONLY (E0/E1): heap-allocated fixture model, for the host
 //! runner. Firmware code never sees fixtures.
 
-use esper_core::registry::lookup_by_name;
 use esper_core::state::TerminalStatus;
-use esper_runtime::{journal::DecisionClass, CrashPoint, Direction, WORKFLOW_VERSION};
+use esper_runtime::{CrashPoint, Direction, WORKFLOW_VERSION, journal::DecisionClass};
 use thiserror::Error;
 
 use crate::checks::{
-    parse_forbidden, parse_invariant, terminal_status_by_name, ForbiddenClause, Invariant,
+    ForbiddenClause, Invariant, parse_forbidden, parse_invariant, terminal_status_by_name,
 };
 use crate::json::{self, Value};
 
@@ -126,6 +125,15 @@ pub struct SeedSpec {
     pub read_pins: Vec<u8>,
     /// Pins the model may write.
     pub write_pins: Vec<u8>,
+    /// Sensor channels the model may sample, `0..=3` (E2). Absent in
+    /// the fixture means denied — fail closed (SPEC §17.7).
+    pub sensors: Vec<u8>,
+    /// Whether the timer tools are permitted (E2). Absent means
+    /// denied — fail closed (SPEC §17.7).
+    pub allow_timer: bool,
+    /// Whether the status tool is permitted (E2). Absent means
+    /// denied — fail closed (SPEC §17.7).
+    pub allow_status: bool,
 }
 
 /// The fake device section of a fixture.
@@ -152,26 +160,43 @@ pub struct PinSpec {
 /// A deterministic device behavior from `device.faults`.
 #[derive(Debug, Clone)]
 pub enum DeviceFault {
-    /// The tool fails transiently this many times for the pin, then
-    /// behaves. Fires before the device is touched.
+    /// The tool fails transiently this many times for the resource,
+    /// then behaves. Fires before the device is touched. The `tool`
+    /// filter is optional: absent means the fault applies to any tool
+    /// (SPEC §17.7).
     Transient {
-        /// The canonical tool name.
-        tool: String,
-        /// The pin the fault matches.
-        pin: u8,
+        /// The canonical tool name, when the fault is tool-filtered.
+        tool: Option<String>,
+        /// The device resource the fault matches (SPEC §17.7).
+        resource: FaultResource,
         /// How many dispatches fail before one succeeds.
         failures: u32,
     },
     /// The pin's actuator is stuck: writes are acknowledged but the
     /// level never moves, so the independent verifier sees the truth.
+    /// A stuck actuator is a GPIO concept, so the resource is always a
+    /// pin.
     Stuck {
-        /// The canonical tool name.
-        tool: String,
+        /// The canonical tool name, when the fault is tool-filtered.
+        tool: Option<String>,
         /// The stuck pin.
         pin: u8,
         /// The level the pin is stuck at (`true` is high).
         level_high: bool,
     },
+}
+
+/// The device resource a fault matches (SPEC §17.7): GPIO tools match
+/// on `pin`, `sensor_sample_read` on `sensor`, timer and status tools
+/// on resource 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultResource {
+    /// A GPIO pin, `0..=7`.
+    Pin(u8),
+    /// A sensor channel, `0..=3`.
+    Sensor(u8),
+    /// Resource 0: the timer and status tools.
+    Clock,
 }
 
 /// One typed human input delivery.
@@ -499,6 +524,14 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Read a boolean field.
+    fn as_bool(&self) -> Result<bool, FixtureError> {
+        match self.value {
+            Value::Bool(flag) => Ok(*flag),
+            _ => Err(self.expected("a boolean")),
+        }
+    }
+
     /// Read the raw value (for args/payload/input passthrough).
     const fn raw(&self) -> &'a Value {
         self.value
@@ -528,6 +561,22 @@ fn parse_seed(cursor: &Cursor) -> Result<SeedSpec, FixtureError> {
             format!("radio_bytes must be 0 in the slice (SPEC §7.1), found {radio_bytes}"),
         ));
     }
+    let capabilities = cursor.field("capabilities")?;
+    let sensors = match capabilities.opt("sensors") {
+        // Absent means denied: fail closed (SPEC §17.7).
+        None => Vec::new(),
+        Some(list) => parse_sensor_list(&list)?,
+    };
+    let allow_timer = match capabilities.opt("allow_timer") {
+        // HOST-ONLY (E0/E1)
+        None => false,
+        Some(flag) => flag.as_bool()?,
+    };
+    let allow_status = match capabilities.opt("allow_status") {
+        // HOST-ONLY (E0/E1)
+        None => false,
+        Some(flag) => flag.as_bool()?,
+    };
     Ok(SeedSpec {
         workflow_version,
         model_turns: budget.field("model_turns")?.as_u16()?,
@@ -535,8 +584,11 @@ fn parse_seed(cursor: &Cursor) -> Result<SeedSpec, FixtureError> {
         input_tokens: budget.field("input_tokens")?.as_u32()?,
         output_tokens: budget.field("output_tokens")?.as_u32()?,
         elapsed_ms: budget.field("elapsed_ms")?.as_u64()?,
-        read_pins: parse_pin_list(&cursor.field("capabilities")?.field("read_pins")?)?,
-        write_pins: parse_pin_list(&cursor.field("capabilities")?.field("write_pins")?)?,
+        read_pins: parse_pin_list(&capabilities.field("read_pins")?)?,
+        write_pins: parse_pin_list(&capabilities.field("write_pins")?)?,
+        sensors,
+        allow_timer,
+        allow_status,
     })
 }
 
@@ -557,6 +609,22 @@ fn parse_pin_list(cursor: &Cursor) -> Result<Vec<u8>, FixtureError> {
     Ok(pins)
 }
 
+/// Parse a sensor list like `[1]`; every sensor must be `0..=3`.
+fn parse_sensor_list(cursor: &Cursor) -> Result<Vec<u8>, FixtureError> {
+    // HOST-ONLY (E0/E1)
+    let mut sensors = Vec::new();
+    for item in cursor.items()? {
+        let sensor = item.as_u8()?;
+        if sensor > 3 {
+            return Err(item.schema_err(
+                // HOST-ONLY (E0/E1)
+                format!("sensor {sensor} is out of range 0..=3"),
+            ));
+        }
+        sensors.push(sensor);
+    }
+    Ok(sensors)
+}
 /// Parse the scripted model lines.
 fn parse_script(cursor: &Cursor) -> Result<Vec<Vec<u8>>, FixtureError> {
     // HOST-ONLY (E0/E1)
@@ -633,26 +701,29 @@ fn parse_device(cursor: &Cursor) -> Result<DeviceSpec, FixtureError> {
 }
 
 /// Parse one `device.faults` entry.
+///
+/// The `tool` filter is optional (absent means the fault applies to
+/// any tool, SPEC §17.7). The resource comes from `match_args`:
+/// `pin` for GPIO tools, `sensor` for `sensor_sample_read`, neither
+/// for timer/status tools (resource 0). A filter that disagrees with
+/// the resource fails closed.
 fn parse_device_fault(cursor: &Cursor) -> Result<DeviceFault, FixtureError> {
-    let tool = parse_tool_name(&cursor.field("tool")?)?;
-    let pin = cursor.field("match_args")?.field("pin")?.as_u8()?;
-    if pin > 7 {
-        return Err(cursor.field("match_args")?.field("pin")?.schema_err(
-            // HOST-ONLY (E0/E1)
-            format!("pin {pin} is out of range 0..=7"),
-        ));
-    }
+    let tool = cursor
+        .opt("tool")
+        .map(|name| parse_tool_name(&name))
+        .transpose()?;
+    let resource = parse_fault_resource(cursor, tool.as_deref())?;
     let transient = cursor
         .opt("class")
         .is_some_and(|class| class.as_str().is_ok_and(|text| text == "transient"));
     let stuck = cursor.opt("stuck_level");
-    match (transient, stuck) {
-        (true, None) => Ok(DeviceFault::Transient {
+    match (transient, stuck, resource) {
+        (true, None, resource) => Ok(DeviceFault::Transient {
             tool,
-            pin,
+            resource,
             failures: cursor.field("failures_before_success")?.as_u32()?,
         }),
-        (false, Some(level)) => {
+        (false, Some(level), FaultResource::Pin(pin)) => {
             let level_high = match level.as_str()? {
                 "low" => false,
                 "high" => true,
@@ -669,22 +740,89 @@ fn parse_device_fault(cursor: &Cursor) -> Result<DeviceFault, FixtureError> {
                 level_high,
             })
         }
+        (false, Some(_), _) => Err(cursor.schema_err(
+            "stuck_level is a GPIO actuator fault: `match_args` must name a `pin`".to_owned(),
+        )),
         _ => Err(cursor.schema_err(
             "a fault needs exactly one of `class: \"transient\"` (+ `failures_before_success`) or `stuck_level`".to_owned(),
         )),
     }
 }
 
-/// Resolve a canonical tool name, rejecting anything outside the
-/// slice's registry. Returns the canonical name.
+/// Parse the fault's resource from `match_args` (SPEC §17.7) and check
+/// it agrees with the optional tool filter.
+fn parse_fault_resource(
+    cursor: &Cursor,
+    tool: Option<&str>,
+) -> Result<FaultResource, FixtureError> {
+    let match_args = cursor.field("match_args")?;
+    let pin = match_args.opt("pin");
+    let sensor = match_args.opt("sensor");
+    let resource = match (pin, sensor) {
+        (Some(entry), None) => {
+            let pin = entry.as_u8()?;
+            if pin > 7 {
+                return Err(entry.schema_err(
+                    // HOST-ONLY (E0/E1)
+                    format!("pin {pin} is out of range 0..=7"),
+                ));
+            }
+            FaultResource::Pin(pin)
+        }
+        (None, Some(entry)) => {
+            let sensor = entry.as_u8()?;
+            if sensor > 3 {
+                return Err(entry.schema_err(
+                    // HOST-ONLY (E0/E1)
+                    format!("sensor {sensor} is out of range 0..=3"),
+                ));
+            }
+            FaultResource::Sensor(sensor)
+        }
+        (None, None) => FaultResource::Clock,
+        (Some(_), Some(_)) => {
+            return Err(match_args.schema_err(
+                "match_args holds both `pin` and `sensor`; name exactly one resource".to_owned(),
+            ));
+        }
+    };
+    if let Some(name) = tool {
+        let agrees = matches!(
+            (name, resource),
+            ("gpio_pin_read" | "gpio_pin_write", FaultResource::Pin(_))
+                | ("sensor_sample_read", FaultResource::Sensor(_))
+                | (
+                    "timer_uptime_read" | "timer_delay_wait" | "device_status_report",
+                    FaultResource::Clock,
+                )
+        );
+        if !agrees {
+            return Err(cursor.schema_err(
+                // HOST-ONLY (E0/E1)
+                format!(
+                    "fault tool `{name}` disagrees with the match_args resource \
+                     (gpio tools match `pin`, sensor_sample_read matches `sensor`, \
+                     timer/status tools match resource 0)"
+                ),
+            ));
+        }
+    }
+    Ok(resource)
+}
+
+/// Resolve a canonical tool name against the E2 contract catalog (SPEC
+/// §17.1: the one table every tool name comes from), rejecting
+/// anything outside it. Returns the canonical name.
 fn parse_tool_name(cursor: &Cursor) -> Result<String, FixtureError> {
     let name = cursor.as_str()?;
-    lookup_by_name(name.as_bytes())
+    esper_protocol::contract::lookup_by_name(name)
         .map(|entry| entry.name.to_owned())
         .ok_or_else(|| {
             cursor.schema_err(
                 // HOST-ONLY (E0/E1)
-                format!("unknown tool `{name}`; expected gpio_pin_read or gpio_pin_write"),
+                format!(
+                    "unknown tool `{name}`; expected one of the six E2 catalog names (SPEC §17.2)"
+                ),
             )
         })
 }
@@ -985,7 +1123,7 @@ fn parse_observation(cursor: &Cursor) -> Result<ExpectedEvent, FixtureError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fixture, FixtureError};
+    use super::{FixtureError, parse_fixture};
 
     /// A minimal well-formed fixture; broken variants are derived by
     /// string surgery on the `[TRACE]`, invariant, and forbidden slots.
@@ -1154,6 +1292,144 @@ mod tests {
         assert!(err.to_string().contains("$.crash_plan[0].at"), "got {err}");
         assert!(
             err.to_string().contains("unknown crash point `cp_nowhere`"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn absent_e2_capabilities_parse_as_denied() {
+        // SPEC §17.7: E0/E1 fixtures without the E2 capability fields
+        // keep their meaning — the fields parse as denied, fail closed.
+        let fixture = parse_fixture(&fixture_with(FINISH_TRACE)).expect("minimal fixture");
+        assert_eq!(fixture.seed.sensors, Vec::<u8>::new());
+        assert!(!fixture.seed.allow_timer);
+        assert!(!fixture.seed.allow_status);
+    }
+
+    #[test]
+    fn present_e2_capabilities_parse() {
+        let base = fixture_with(FINISH_TRACE);
+        let with_caps = base.replace(
+            "\"capabilities\": {\"read_pins\": [], \"write_pins\": []}",
+            "\"capabilities\": {\"read_pins\": [4], \"write_pins\": [4], \
+             \"sensors\": [0, 2], \"allow_timer\": true, \"allow_status\": true}",
+        );
+        let fixture = parse_fixture(&with_caps).expect("E2 capabilities");
+        assert_eq!(fixture.seed.read_pins, vec![4]);
+        assert_eq!(fixture.seed.write_pins, vec![4]);
+        assert_eq!(fixture.seed.sensors, vec![0, 2]);
+        assert!(fixture.seed.allow_timer);
+        assert!(fixture.seed.allow_status);
+    }
+
+    #[test]
+    fn sensor_out_of_range_is_rejected() {
+        let base = fixture_with(FINISH_TRACE);
+        let broken = base.replace(
+            "\"capabilities\": {\"read_pins\": [], \"write_pins\": []}",
+            "\"capabilities\": {\"read_pins\": [], \"write_pins\": [], \"sensors\": [4]}",
+        );
+        let err = parse_fixture(&broken).expect_err("sensor 4");
+        assert!(
+            err.to_string()
+                .contains("$.run_seed.capabilities.sensors[0]"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("out of range 0..=3"), "got {err}");
+    }
+
+    #[test]
+    fn fault_tool_filter_and_pin_resource_parse() {
+        use super::{DeviceFault, FaultResource};
+        let base = fixture_with(FINISH_TRACE);
+        let with_fault = base.replace(
+            "\"faults\": []",
+            "\"faults\": [{\"class\": \"transient\", \"tool\": \"gpio_pin_read\", \
+             \"match_args\": {\"pin\": 4}, \"failures_before_success\": 2}]",
+        );
+        let fixture = parse_fixture(&with_fault).expect("tool-filtered fault");
+        assert_eq!(fixture.device.faults.len(), 1);
+        match &fixture.device.faults[0] {
+            DeviceFault::Transient {
+                tool,
+                resource,
+                failures,
+            } => {
+                assert_eq!(tool.as_deref(), Some("gpio_pin_read"));
+                assert_eq!(*resource, FaultResource::Pin(4));
+                assert_eq!(*failures, 2);
+            }
+            DeviceFault::Stuck { .. } => panic!("expected a transient fault, got Stuck"),
+        }
+    }
+
+    #[test]
+    fn fault_sensor_and_clock_resources_parse() {
+        use super::{DeviceFault, FaultResource};
+        let base = fixture_with(FINISH_TRACE);
+        let with_faults = base.replace(
+            "\"faults\": []",
+            "\"faults\": [{\"class\": \"transient\", \"tool\": \"sensor_sample_read\", \
+             \"match_args\": {\"sensor\": 2}, \"failures_before_success\": 1}, \
+             {\"class\": \"transient\", \"tool\": \"timer_delay_wait\", \
+             \"match_args\": {}, \"failures_before_success\": 1}]",
+        );
+        let fixture = parse_fixture(&with_faults).expect("sensor and clock faults");
+        assert_eq!(fixture.device.faults.len(), 2);
+        match &fixture.device.faults[0] {
+            DeviceFault::Transient { resource, .. } => {
+                assert_eq!(*resource, FaultResource::Sensor(2));
+            }
+            DeviceFault::Stuck { .. } => panic!("expected a sensor fault, got Stuck"),
+        }
+        match &fixture.device.faults[1] {
+            DeviceFault::Transient { resource, .. } => {
+                assert_eq!(*resource, FaultResource::Clock);
+            }
+            DeviceFault::Stuck { .. } => panic!("expected a clock fault, got Stuck"),
+        }
+    }
+
+    #[test]
+    fn fault_tool_filter_disagreeing_with_resource_is_rejected() {
+        let base = fixture_with(FINISH_TRACE);
+        let broken = base.replace(
+            "\"faults\": []",
+            "\"faults\": [{\"class\": \"transient\", \"tool\": \"sensor_sample_read\", \
+             \"match_args\": {\"pin\": 4}, \"failures_before_success\": 1}]",
+        );
+        let err = parse_fixture(&broken).expect_err("filter/resource disagreement");
+        assert!(err.to_string().contains("$.device.faults[0]"), "got {err}");
+        assert!(err.to_string().contains("disagrees"), "got {err}");
+    }
+
+    #[test]
+    fn unknown_fault_tool_is_rejected() {
+        let base = fixture_with(FINISH_TRACE);
+        let broken = base.replace(
+            "\"faults\": []",
+            "\"faults\": [{\"class\": \"transient\", \"tool\": \"laser_cannon\", \
+             \"match_args\": {\"pin\": 4}, \"failures_before_success\": 1}]",
+        );
+        let err = parse_fixture(&broken).expect_err("unknown fault tool");
+        assert!(
+            err.to_string().contains("unknown tool `laser_cannon`"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn stuck_fault_on_non_pin_resource_is_rejected() {
+        let base = fixture_with(FINISH_TRACE);
+        let broken = base.replace(
+            "\"faults\": []",
+            "\"faults\": [{\"stuck_level\": \"low\", \"match_args\": {\"sensor\": 1}}]",
+        );
+        let err = parse_fixture(&broken).expect_err("stuck sensor");
+        assert!(err.to_string().contains("$.device.faults[0]"), "got {err}");
+        assert!(
+            err.to_string()
+                .contains("stuck_level is a GPIO actuator fault"),
             "got {err}"
         );
     }

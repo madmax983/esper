@@ -1,4 +1,4 @@
-# `esper-eval` — the golden-fixture evaluation runner (E0/E1)
+# `esper-eval` — the golden-fixture evaluation runner (E0/E1/E2)
 
 ## What this crate is
 
@@ -12,9 +12,14 @@ asserts the exact expected trace, the remaining budgets, the SPEC
 §11.3 crash-oracle invariants, and every `forbidden` clause.
 
 One `#[test]` exists per fixture file, generated at compile time by
-`build.rs` from the fixture directory: adding a ninth fixture file
-adds a ninth test with no source change (verified: a scratch ninth
-file produced `trajectory_z_temp_ninth`, then was removed).
+`build.rs` from the fixture directory: adding a fixture file adds a
+test with no source change (verified: a scratch ninth file produced
+`trajectory_z_temp_ninth`, then was removed).
+
+E2 adds the three new tool families (sensor, timer, status) to the
+fixture schema, the runner, and the checks — see "E2 surface" below —
+plus an adversarial meta-test (`tests/adversarial.rs`) that proves
+every adversarial fixture expects zero `ToolRequest` frames.
 
 ## Where things live
 
@@ -47,10 +52,40 @@ file produced `trajectory_z_temp_ninth`, then was removed).
 - `build.rs` — scans `../../spec/trajectories/*.json`, emits one
   integration test per file into `$OUT_DIR/fixture_tests.rs`.
 - `tests/fixtures.rs` — includes the generated tests.
+- `tests/adversarial.rs` — meta-test: every fixture whose file name
+  contains `adversarial` must expect zero `ToolRequest` frames in
+  its `expected.trace`. Static, document-level, independent of trace
+  equality.
+
+## E2 surface
+
+- `capabilities` gains `sensors: [0..=3]` (default `[]`),
+  `allow_timer: bool` (default `false`), `allow_status: bool`
+  (default `false`). Missing E2 fields mean denied — fail closed,
+  so the E0/E1 fixtures keep their meaning unchanged (SPEC §17.7).
+- Tool names resolve against the E2 contract catalog via
+  `esper_protocol::contract::lookup_by_name` — the one table every
+  tool name comes from (SPEC §17.1) — so the eval vocabulary is
+  exactly the six catalog names.
+- `device.faults[].tool` is optional: absent means the fault applies
+  to any tool (SPEC §17.7). The fault resource comes from
+  `match_args` per §17.7 — `pin` for GPIO tools, `sensor` for
+  `sensor_sample_read`, neither for timer/status tools (resource 0) —
+  and a tool filter that disagrees with the resource fails closed.
+  A `stuck_level` fault on a non-pin resource fails closed (a stuck
+  actuator is a GPIO concept).
+- New forbidden clause: `a {ordinal} clock advance`
+  (`Forbidden::MaxClockAdvances`) — the timer twin of the
+  physical-write bound. It fails closed until the fake device
+  exposes a clock-advance ledger (runtime API gap).
+- The runner fails closed when a fixture grants E2 capabilities the
+  runtime `RunSeed` cannot carry yet, or targets a fault at a
+  sensor/clock resource the `FaultPlan` cannot match by — both gaps
+  are named, never silently approximated.
 
 ## Authority order
 
-1. `~/workspace/esper/SPEC.md` (§§11, 14.3)
+1. `~/workspace/esper/SPEC.md` (§§11, 14.3, 17)
 2. `~/workspace/esper/spec/trajectories/` (the fixtures are the test
    list and the expected values)
 3. existing `esper-core` / `esper-runtime` APIs — never change them;
@@ -114,3 +149,14 @@ failing closed; report them, don't hide them:
   invalid-args violation vocabulary, so the `progress` annotation
   and the free-text `violation` note are parsed but not asserted
   (documented in `compare.rs`).
+- E2 wiring (landed with crews B/C): the runner builds the E2
+  `RunSeed` (`readable_sensors` bitmask, `allow_timer`,
+  `allow_status`) straight from the fixture capabilities, and installs
+  transient faults as `(tool filter, resource)` pairs via
+  `fail_transient_for` per SPEC §17.7. Two faults whose targets
+  overlap fail closed (first-match consumption), as does a
+  filter-less fault on a sensor/clock resource (the plan cannot tell
+  resource 1 the sensor from resource 1 the pin).
+- `MaxClockAdvances` counts committed `timer_delay_wait` intents in
+  the trace: each one dispatches exactly one physical advance
+  (redeliveries dedup and never re-commit).

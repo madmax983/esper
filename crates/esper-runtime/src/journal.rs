@@ -67,12 +67,14 @@ pub enum Frame {
         args: Vec<u8>,
         /// The decode-time digest of `args`.
         digest: u64,
-        /// The target pin.
-        pin: u8,
-        /// Whether the tool mutates the world.
+        /// Whether the tool mutates the world. Committed (not
+        /// re-derived from the permission class) because the
+        /// `mutations` budget was consumed against this flag at commit
+        /// time; replay must reproduce the accounting exactly. The
+        /// typed dispatch shape is re-derived on replay from `args`
+        /// via `ToolArgs::bind` (deterministic over validated bytes),
+        /// so the frame carries no per-tool replay data.
         write: bool,
-        /// The requested level (writes only).
-        level_high: bool,
     },
     /// A tool outcome committed. A transient failure keeps the intent
     /// pending: the engine redispatches under the same effect id.
@@ -92,10 +94,12 @@ pub enum Frame {
     Verification {
         /// The effect sequence that was verified.
         seq: u32,
-        /// The expected pin state, as JSON.
+        /// The expected post-effect world state, as JSON
+        /// (the requested pin level, or the delay's target clock).
         // HOST-ONLY (E0/E1)
         expected: Vec<u8>,
-        /// The observed pin state, as JSON.
+        /// The independently observed world state, as JSON
+        /// (the pin's physical level, or the clock reading).
         // HOST-ONLY (E0/E1)
         observed: Vec<u8>,
         /// Whether read-back matched the requested state.

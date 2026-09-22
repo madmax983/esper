@@ -1,7 +1,7 @@
 //! Identifier newtypes: construction, ranges, display.
 
-use esper_core::ids::{Digest, EffectId, EffectSeq, Pin, RunId, ToolId, PIN_COUNT};
 use esper_core::Error;
+use esper_core::ids::{Digest, EffectId, EffectSeq, PIN_COUNT, Pin, RunId, ToolId};
 
 #[test]
 fn run_id_round_trips() {

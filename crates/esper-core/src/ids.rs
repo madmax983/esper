@@ -11,6 +11,10 @@ use crate::error::Error;
 /// Number of GPIO pins in the slice device: pins are numbered `0..8`.
 pub const PIN_COUNT: u8 = 8;
 
+/// Number of sensor channels in the E2 device: sensors are numbered
+/// `0..4`, with the fixed raw values from SPEC §15.13.
+pub const SENSOR_COUNT: u8 = 4;
+
 /// Identifies one workflow run. A new run requires a new `RunId` (and a
 /// new `RunSeed`); run identity never changes after creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

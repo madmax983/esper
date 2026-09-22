@@ -1,9 +1,15 @@
 //! Host-only world doubles for the E0/E1 slice.
 //!
 //! `ScriptedModel` emits canned model lines, `FakeDevice` is an 8-pin
-//! GPIO double with idempotent redelivery, `FaultPlan` injects
-//! transient device hiccups, and `InputPlan` delivers typed human input
-//! for `Ask` suspension.
+//! GPIO double with idempotent redelivery plus four fixed sensor
+//! channels and a shared virtual millisecond clock (SPEC §15.13–
+//! §15.14), `FaultPlan` injects transient device hiccups, and
+//! `InputPlan` delivers typed human input for `Ask` suspension.
+//!
+//! The verifier's clock handle ([`FakeDevice::clock_read`]) is a
+//! separate `&self` method from the dispatch path: the verifier reads
+//! the clock register directly, never a flag the dispatcher set
+//! (SPEC §9.1, §17.6).
 //!
 //! The doubles model the *physical world*, not runtime memory: the
 //! [`FaultPlan`] and the [`FakeDevice`]'s pin state survive simulated
@@ -22,6 +28,8 @@
 use esper_core::decision::Level;
 use esper_core::ids::Pin;
 use waymaker_core::EffectSeq;
+
+use esper_core::decision::StatusDetail;
 
 /// A GPIO pin's direction, as reported by the device.
 ///
@@ -43,6 +51,24 @@ pub enum WorldError {
     /// intent under the same effect id. History is unambiguous, so the
     /// redelivery is refused rather than applied.
     EffectArgsMismatch,
+    /// A dispatch named a resource the device does not have.
+    /// Unreachable: the decoder proves every range before dispatch.
+    UnknownResource,
+}
+
+/// The fixed raw reading per sensor channel (SPEC §15.13): no noise,
+/// no drift.
+pub const SENSOR_VALUES: [u16; 4] = [210, 315, 1800, 42];
+
+/// The fixed raw reading of one sensor channel.
+const fn sensor_value(sensor: u8) -> Option<u16> {
+    match sensor {
+        0 => Some(SENSOR_VALUES[0]),
+        1 => Some(SENSOR_VALUES[1]),
+        2 => Some(SENSOR_VALUES[2]),
+        3 => Some(SENSOR_VALUES[3]),
+        _ => None,
+    }
 }
 
 /// The scripted model backend: emits canned lines, one per turn.
@@ -92,15 +118,16 @@ impl ScriptedModel {
 
 /// The transient-fault injector: a scripted device hiccup plan.
 ///
-/// Each planned failure fires once for a matching pin, then the
-/// device behaves. The plan is world state: it survives simulated
-/// crashes, so a reboot never replays a hiccup the first boot already
-/// consumed.
+/// Each planned failure fires once for a matching `(tool, resource)`
+/// pair, then the device behaves. A `None` tool filter matches any
+/// tool (preserving the E0/E1 pin-only behavior). The plan is world
+/// state: it survives simulated crashes, so a reboot never replays a
+/// hiccup the first boot already consumed.
 #[derive(Debug, Clone, Default)]
 pub struct FaultPlan {
-    /// `(pin, failures remaining)` entries.
+    /// `(tool filter, resource, failures remaining)` entries.
     // HOST-ONLY (E0/E1)
-    transient: Vec<(u8, u32)>,
+    transient: Vec<(Option<u8>, u8, u32)>,
 }
 
 impl FaultPlan {
@@ -113,10 +140,19 @@ impl FaultPlan {
         }
     }
 
-    /// Plan `times` transient failures for this pin's tool calls.
+    /// Plan `times` transient failures for this pin's tool calls,
+    /// whichever tool names it.
     pub fn fail_transient(&mut self, pin: Pin, times: u32) {
         // HOST-ONLY (E0/E1)
-        self.transient.push((pin.get(), times));
+        self.transient.push((None, pin.get(), times));
+    }
+
+    /// Plan `times` transient failures for one tool's resource: the
+    /// pin for the GPIO tools, the sensor id for `sensor_sample_read`,
+    /// 0 for the timer and status tools (SPEC §17.7).
+    pub fn fail_transient_for(&mut self, tool: u8, resource: u8, times: u32) {
+        // HOST-ONLY (E0/E1)
+        self.transient.push((Some(tool), resource, times));
     }
 
     /// Consume one planned failure for this dispatch, if any remains.
@@ -124,11 +160,12 @@ impl FaultPlan {
     /// Returns true when the dispatch must fail transiently. The
     /// engine consults the plan *before* touching the device, so a
     /// transient failure never reaches hardware.
-    pub fn consume(&mut self, _tool: u8, pin: u8) -> bool {
+    pub fn consume(&mut self, tool: u8, resource: u8) -> bool {
         // HOST-ONLY (E0/E1)
         for entry in &mut self.transient {
-            if entry.0 == pin && entry.1 > 0 {
-                entry.1 -= 1;
+            let tool_matches = entry.0.is_none_or(|filter| filter == tool);
+            if tool_matches && entry.1 == resource && entry.2 > 0 {
+                entry.2 -= 1;
                 return true;
             }
         }
@@ -188,12 +225,13 @@ struct EffectRecord {
     outcome: Vec<u8>,
 }
 
-/// The fake GPIO device: 8 pins with idempotent redelivery.
+/// The fake device: GPIO, sensors, and a virtual clock with idempotent
+/// redelivery.
 ///
 /// Dispatch is keyed by ([`EffectSeq`], argument digest): a redelivered
-/// intent replays its committed outcome without touching the pins, and
-/// a redelivery whose arguments disagree with the committed intent is
-/// refused. At-least-once dispatch is therefore safe (SPEC ADR:
+/// intent replays its committed outcome without touching the device,
+/// and a redelivery whose arguments disagree with the committed intent
+/// is refused. At-least-once dispatch is therefore safe (SPEC ADR:
 /// at-least-once effects).
 #[derive(Debug, Clone)]
 pub struct FakeDevice {
@@ -201,6 +239,9 @@ pub struct FakeDevice {
     pins: [(Direction, bool); 8],
     /// Per pin: stuck actuator level override, if any.
     stuck: [Option<bool>; 8],
+    /// The virtual millisecond clock shared by the timer and status
+    /// tools (SPEC §15.14).
+    clock_ms: u64,
     /// Committed effect outcomes, for redelivery dedup.
     // HOST-ONLY (E0/E1)
     effects: Vec<EffectRecord>,
@@ -210,12 +251,13 @@ pub struct FakeDevice {
 }
 
 impl FakeDevice {
-    /// All pins output, low, nothing stuck.
+    /// All pins output, low, nothing stuck, clock at zero.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             pins: [(Direction::Output, false); 8],
             stuck: [None; 8],
+            clock_ms: 0,
             // HOST-ONLY (E0/E1)
             effects: Vec::new(),
             // HOST-ONLY (E0/E1)
@@ -320,6 +362,168 @@ impl FakeDevice {
         self.pins[pin.get() as usize].1
     }
 
+    /// The verifier's independent clock read (SPEC §9.1, §17.6).
+    ///
+    /// This reads the clock register directly — a separate handle
+    /// from the dispatch path. It is `&self`: the verifier never
+    /// mutates device state, and there is no flag the dispatcher sets
+    /// for the verifier to read.
+    #[must_use]
+    pub const fn clock_read(&self) -> u64 {
+        self.clock_ms
+    }
+
+    /// Dispatch a sensor read under this effect id, deduplicating
+    /// redelivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EffectArgsMismatch`] when the same effect
+    /// id arrives with different arguments than the committed intent,
+    /// or [`WorldError::UnknownResource`] for a sensor the device does
+    /// not have (unreachable: the decoder proves `0..=3`).
+    pub fn dispatch_sensor_read(
+        &mut self,
+        sensor: u8,
+        seq: EffectSeq,
+        digest: u64,
+    ) -> Result<Vec<u8>, WorldError> {
+        if let Some(cached) = self.effect_outcome(seq, digest)? {
+            return Ok(cached);
+        }
+        let value = sensor_value(sensor).ok_or(WorldError::UnknownResource)?;
+        let outcome = sensor_json(sensor, value);
+        // HOST-ONLY (E0/E1)
+        self.effects.push(EffectRecord {
+            seq,
+            digest,
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
+    }
+
+    /// Dispatch an uptime read under this effect id, deduplicating
+    /// redelivery. Read-only: the clock is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EffectArgsMismatch`] when the same effect
+    /// id arrives with different arguments than the committed intent.
+    pub fn dispatch_uptime_read(
+        &mut self,
+        seq: EffectSeq,
+        digest: u64,
+    ) -> Result<Vec<u8>, WorldError> {
+        if let Some(cached) = self.effect_outcome(seq, digest)? {
+            return Ok(cached);
+        }
+        let outcome = uptime_json(self.clock_ms);
+        // HOST-ONLY (E0/E1)
+        self.effects.push(EffectRecord {
+            seq,
+            digest,
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
+    }
+
+    /// Dispatch a delay under this effect id: advance the virtual
+    /// clock to at least `t0 + ms`, where `t0` is the pre-dispatch
+    /// reading (SPEC §15.14).
+    ///
+    /// Redelivery under the same effect id replays the cached outcome
+    /// without advancing again: the committed effect is the
+    /// set-operation "clock reaches at least `t0 + ms`", so executing
+    /// it twice would change the world a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EffectArgsMismatch`] when the same effect
+    /// id arrives with different arguments than the committed intent.
+    pub fn dispatch_delay_wait(
+        &mut self,
+        ms: u16,
+        seq: EffectSeq,
+        digest: u64,
+    ) -> Result<Vec<u8>, WorldError> {
+        if let Some(cached) = self.effect_outcome(seq, digest)? {
+            return Ok(cached);
+        }
+        let t0 = self.clock_ms;
+        let target = t0.saturating_add(u64::from(ms));
+        self.clock_ms = target;
+        let outcome = delay_json(target - t0, target);
+        // HOST-ONLY (E0/E1)
+        self.effects.push(EffectRecord {
+            seq,
+            digest,
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
+    }
+
+    /// Dispatch a status report under this effect id, deduplicating
+    /// redelivery. Read-only: the device is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EffectArgsMismatch`] when the same effect
+    /// id arrives with different arguments than the committed intent.
+    pub fn dispatch_status_report(
+        &mut self,
+        detail: StatusDetail,
+        seq: EffectSeq,
+        digest: u64,
+    ) -> Result<Vec<u8>, WorldError> {
+        if let Some(cached) = self.effect_outcome(seq, digest)? {
+            return Ok(cached);
+        }
+        let outcome = match detail {
+            StatusDetail::Summary => status_summary_json(status_uptime(self.clock_ms)),
+            StatusDetail::Full => status_full_json(
+                status_uptime(self.clock_ms),
+                self.pin_dir_array(),
+                self.pin_level_array(),
+            ),
+        };
+        // HOST-ONLY (E0/E1)
+        self.effects.push(EffectRecord {
+            seq,
+            digest,
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
+    }
+
+    /// The pin-direction array for the full status report (SPEC
+    /// §17.6): element `i` is 1 when pin `i` is an output, 0 for an
+    /// input.
+    const fn pin_dir_array(&self) -> [u8; 8] {
+        let mut array = [0u8; 8];
+        let mut pin: u8 = 0;
+        while pin < 8 {
+            if matches!(self.pins[pin as usize].0, Direction::Output) {
+                array[pin as usize] = 1;
+            }
+            pin += 1;
+        }
+        array
+    }
+
+    /// The pin-level array for the full status report (SPEC §17.6):
+    /// element `i` is 1 when pin `i` is high, 0 when low.
+    const fn pin_level_array(&self) -> [u8; 8] {
+        let mut array = [0u8; 8];
+        let mut pin: u8 = 0;
+        while pin < 8 {
+            if self.pins[pin as usize].1 {
+                array[pin as usize] = 1;
+            }
+            pin += 1;
+        }
+        array
+    }
+
     /// How many physical writes have executed (redeliveries excluded).
     #[must_use]
     pub fn physical_writes(&self) -> u32 {
@@ -362,4 +566,143 @@ fn pin_level_json(pin: u8, level_high: bool) -> Vec<u8> {
         if level_high { "high" } else { "low" }
     )
     .into_bytes()
+}
+
+/// The canonical JSON for a sensor reading: `{"sensor":2,"value":1800}`.
+fn sensor_json(sensor: u8, value: u16) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"sensor\":{sensor},\"value\":{value}}}").into_bytes()
+}
+
+/// The canonical JSON for a clock reading: `{"uptime_ms":1250}`.
+fn uptime_json(uptime_ms: u64) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"uptime_ms\":{uptime_ms}}}").into_bytes()
+}
+
+/// The canonical JSON for a completed delay:
+/// `{"waited_ms":250,"uptime_ms":1250}`.
+fn delay_json(waited_ms: u64, uptime_ms: u64) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"waited_ms\":{waited_ms},\"uptime_ms\":{uptime_ms}}}").into_bytes()
+}
+
+/// The clock reading the status payloads report, saturated at
+/// `u32::MAX`: the status report is a bounded diagnostic (SPEC §17.6
+/// sets a 128-byte result bound), and a 49-day virtual uptime is the
+/// most a bounded payload can name. The timer tools report the raw
+/// `u64` clock; only the status payload saturates.
+fn status_uptime(clock_ms: u64) -> u32 {
+    // HOST-ONLY (E0/E1)
+    u32::try_from(clock_ms).unwrap_or(u32::MAX)
+}
+
+/// The canonical JSON for a status summary: `{"pins":8,"sensors":4,"uptime_ms":1250}`.
+fn status_summary_json(uptime_ms: u32) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    format!("{{\"pins\":8,\"sensors\":4,\"uptime_ms\":{uptime_ms}}}").into_bytes()
+}
+
+/// The canonical JSON for a full status report (SPEC §17.6): the
+/// summary plus the pin direction array (`dir`, element `i` is 1 when
+/// pin `i` is an output), the pin level array (`level`, element `i`
+/// is 1 when pin `i` is high), and the per-sensor raw values
+/// (`values`). Stays within the 128-byte result bound by
+/// construction: the clock saturates at `u32::MAX` (see
+/// [`status_uptime`]).
+fn status_full_json(uptime_ms: u32, dir: [u8; 8], level: [u8; 8]) -> Vec<u8> {
+    // HOST-ONLY (E0/E1)
+    let [s0, s1, s2, s3] = SENSOR_VALUES;
+    let [d0, d1, d2, d3, d4, d5, d6, d7] = dir;
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = level;
+    format!(
+        "{{\"pins\":8,\"sensors\":4,\"uptime_ms\":{uptime_ms},\
+         \"dir\":[{d0},{d1},{d2},{d3},{d4},{d5},{d6},{d7}],\
+         \"level\":[{l0},{l1},{l2},{l3},{l4},{l5},{l6},{l7}],\
+         \"values\":[{s0},{s1},{s2},{s3}]}}"
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{status_full_json, status_summary_json};
+    use waymaker_core::EffectSeq;
+
+    use super::FakeDevice;
+
+    #[test]
+    fn status_full_stays_within_128_bytes() {
+        // The clock saturates at `u32::MAX` in the status payload (see
+        // `status_uptime`); every pin an output and high is the widest
+        // array encoding.
+        let payload = status_full_json(u32::MAX, [1; 8], [1; 8]);
+        assert!(
+            payload.len() <= 128,
+            "full status is {} bytes",
+            payload.len()
+        );
+        assert_eq!(
+            payload,
+            br#"{"pins":8,"sensors":4,"uptime_ms":4294967295,"dir":[1,1,1,1,1,1,1,1],"level":[1,1,1,1,1,1,1,1],"values":[210,315,1800,42]}"#
+        );
+    }
+
+    #[test]
+    fn status_uptime_saturates_at_u32_max() {
+        assert_eq!(super::status_uptime(0), 0);
+        assert_eq!(super::status_uptime(1_250), 1_250);
+        assert_eq!(super::status_uptime(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(super::status_uptime(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn status_summary_is_canonical() {
+        assert_eq!(
+            status_summary_json(1250),
+            br#"{"pins":8,"sensors":4,"uptime_ms":1250}"#
+        );
+    }
+
+    #[test]
+    fn delay_redelivery_advances_the_clock_exactly_once() {
+        let mut device = FakeDevice::new();
+        let seq = EffectSeq(1);
+        let first = device
+            .dispatch_delay_wait(250, seq, 7)
+            .expect("first dispatch");
+        let second = device.dispatch_delay_wait(250, seq, 7).expect("redelivery");
+        assert_eq!(first, second);
+        assert_eq!(device.clock_read(), 250);
+        // A redelivery with different arguments is refused, not applied.
+        assert!(device.dispatch_delay_wait(100, seq, 8).is_err());
+        assert_eq!(device.clock_read(), 250);
+    }
+
+    #[test]
+    fn uptime_read_does_not_touch_the_clock() {
+        let mut device = FakeDevice::new();
+        device
+            .dispatch_delay_wait(250, EffectSeq(1), 1)
+            .expect("delay");
+        let outcome = device
+            .dispatch_uptime_read(EffectSeq(2), 2)
+            .expect("uptime");
+        assert_eq!(outcome, b"{\"uptime_ms\":250}");
+        assert_eq!(device.clock_read(), 250);
+    }
+
+    #[test]
+    fn sensor_read_returns_fixed_values() {
+        let mut device = FakeDevice::new();
+        for (sensor, value) in [(0u8, 210u16), (1, 315), (2, 1800), (3, 42)] {
+            let outcome = device
+                .dispatch_sensor_read(sensor, EffectSeq(u32::from(sensor) + 1), u64::from(sensor))
+                .expect("sensor read");
+            assert_eq!(
+                outcome,
+                format!("{{\"sensor\":{sensor},\"value\":{value}}}").into_bytes()
+            );
+        }
+    }
 }

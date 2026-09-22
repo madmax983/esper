@@ -1,6 +1,6 @@
 //! JSON parser tests: strictness rules the decoder relies on.
 
-use esper_core::json::{parse_u8, JsonError, JsonValue, Parser};
+use esper_core::json::{JsonError, JsonValue, Parser, parse_u8};
 
 fn parse_all(input: &[u8]) -> Result<(), JsonError> {
     let mut parser = Parser::new(input);

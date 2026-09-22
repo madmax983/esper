@@ -15,7 +15,7 @@
 use esper_core::ids::RunId;
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
-    drive_run, CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel,
+    CrashPoint, FakeDevice, FaultPlan, InputPlan, Journal, RunSeed, ScriptedModel, drive_run,
 };
 
 /// The success script from trajectory (a).

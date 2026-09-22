@@ -1,7 +1,7 @@
 [package]
 name = "esper-runtime"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Esper E0/E1 runtime: durable ReAct workflow over Waymaker, with host-only scripted model, fake device, independent verifier, and fault injector."
 license = "MIT"
 
@@ -16,6 +16,10 @@ host = ["dep:tokio"]
 [dependencies]
 # Workspace sibling: the decision decoder, budgets, monitor, and state machine.
 esper-core = { path = "../esper-core" }
+# Workspace sibling: the single contract source for the E2 typed tools
+# (the six-tool table, the argument validator). `no_std`-compatible, so
+# the seed and the capability gate use it without the `host` feature.
+esper-protocol = { path = "../esper-protocol" }
 # Durable record/replay kernel (crates.io, per the E0/E1 dependency direction).
 waymaker-core = "0.1.0"
 # Waymaker Embassy facade (crates.io). Declared per SPEC section 2; the E0/E1

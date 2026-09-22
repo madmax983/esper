@@ -1,137 +1,78 @@
-//! The static tool catalog, pin capabilities, and the policy gate (§5).
+//! The static tool catalog, capabilities, and the policy gate (§5, §17).
 //!
 //! The catalog is fixed at build time (ADR: static capability catalog).
-//! The decoder validates arguments against each entry's static schema;
-//! [`authorize_capability`] enforces the capability-set half of
-//! `Authorize` (allowlist + pin membership). Device business rules —
-//! e.g. whether the device reports a pin as output-capable — need the
+//! It lives in `esper-protocol` — the single contract source (SPEC
+//! §17) — and is re-exported here, so exactly one definition of each
+//! catalog type exists. The decoder validates arguments against the
+//! contract table; [`authorize`] enforces the capability half of
+//! `Authorize` (allowlist → capability, §5.2 v2). Device business rules
+//! — e.g. whether the device reports a pin as output-capable — need the
 //! device handle and stay in the runtime.
 
+use crate::decision::ToolArgs;
 use crate::error::Error;
 use crate::ids::{Pin, ToolId};
+
+// The E2 contract source: one table drives the validator, the
+// signatures, and the JSON Schema (SPEC §17.1). Re-exported so the
+// rest of the workspace names one catalog.
+pub use esper_protocol::{
+    ArgKind, ArgSpec, CATALOG, IdempotencyStrategy, PermissionClass, ToolContract,
+    VerificationStrategy, catalog,
+};
 
 /// `ToolId` of `gpio_pin_read`.
 pub const GPIO_PIN_READ_ID: u8 = 1;
 /// `ToolId` of `gpio_pin_write`.
 pub const GPIO_PIN_WRITE_ID: u8 = 2;
+/// `ToolId` of `sensor_sample_read`.
+pub const SENSOR_SAMPLE_READ_ID: u8 = 3;
+/// `ToolId` of `timer_uptime_read`.
+pub const TIMER_UPTIME_READ_ID: u8 = 4;
+/// `ToolId` of `timer_delay_wait`.
+pub const TIMER_DELAY_WAIT_ID: u8 = 5;
+/// `ToolId` of `device_status_report`.
+pub const DEVICE_STATUS_REPORT_ID: u8 = 6;
 /// Canonical registry name of the read tool.
 pub const GPIO_PIN_READ_NAME: &str = "gpio_pin_read";
 /// Canonical registry name of the write tool.
 pub const GPIO_PIN_WRITE_NAME: &str = "gpio_pin_write";
-/// Result bound of the slice tools (§5.1): 64 bytes, never truncated.
-pub const RESULT_BOUND_BYTES: u16 = 64;
-/// Schema version of the slice catalog entries.
-pub const CATALOG_SCHEMA_VERSION: u8 = 1;
+/// Canonical registry name of the sensor tool.
+pub const SENSOR_SAMPLE_READ_NAME: &str = "sensor_sample_read";
+/// Canonical registry name of the uptime tool.
+pub const TIMER_UPTIME_READ_NAME: &str = "timer_uptime_read";
+/// Canonical registry name of the delay tool.
+pub const TIMER_DELAY_WAIT_NAME: &str = "timer_delay_wait";
+/// Canonical registry name of the status tool.
+pub const DEVICE_STATUS_REPORT_NAME: &str = "device_status_report";
 /// Maximum pins in one capability set (§5.2).
 pub const MAX_PINS_PER_SET: usize = 8;
-
-/// Permission classes. `SensitiveWrite` and `Irreversible` exist as
-/// variants, but no slice tool carries them and no capability set can
-/// grant them, so `AwaitApproval` is unreachable in the slice (§1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PermissionClass {
-    /// Read-only observation; no verification needed.
-    ReadOnly,
-    /// Set-operation writes; re-dispatch with the same args is safe.
-    IdempotentWrite,
-    /// Reserved; unreachable in the slice.
-    SensitiveWrite,
-    /// Reserved; unreachable in the slice.
-    Irreversible,
-}
-
-impl PermissionClass {
-    /// The stable name.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read_only",
-            Self::IdempotentWrite => "idempotent_write",
-            Self::SensitiveWrite => "sensitive_write",
-            Self::Irreversible => "irreversible",
-        }
-    }
-}
-
-/// How a mutating tool's effect is independently confirmed (§9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VerificationStrategy {
-    /// Read-only tools: nothing to verify.
-    None,
-    /// Independent read-back of the target state.
-    ReadBack,
-}
-
-/// How re-dispatch under the same `EffectId` behaves (§10.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IdempotencyStrategy {
-    /// Read-only tools: no effect to de-duplicate.
-    NotApplicable,
-    /// Reapplication is a set-operation; safe under at-least-once.
-    SetOperation,
-}
-
-/// One static catalog entry (§5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolEntry {
-    /// Stable numeric id.
-    pub id: ToolId,
-    /// Canonical registry name (`domain_resource_verb`).
-    pub name: &'static str,
-    /// Entry schema version.
-    pub schema_version: u8,
-    /// Permission class.
-    pub permission: PermissionClass,
-    /// Verification strategy for mutating tools.
-    pub verification: VerificationStrategy,
-    /// Idempotency strategy for re-dispatch.
-    pub idempotency: IdempotencyStrategy,
-    /// Maximum result payload bytes.
-    pub result_bound: u16,
-    /// Compact model-facing description.
-    pub description: &'static str,
-}
-
-/// The slice's static catalog: exactly two tools.
-pub const CATALOG: [ToolEntry; 2] = [
-    ToolEntry {
-        id: ToolId::new(GPIO_PIN_READ_ID),
-        name: GPIO_PIN_READ_NAME,
-        schema_version: CATALOG_SCHEMA_VERSION,
-        permission: PermissionClass::ReadOnly,
-        verification: VerificationStrategy::None,
-        idempotency: IdempotencyStrategy::NotApplicable,
-        result_bound: RESULT_BOUND_BYTES,
-        description: "Read the logic level of a GPIO pin.",
-    },
-    ToolEntry {
-        id: ToolId::new(GPIO_PIN_WRITE_ID),
-        name: GPIO_PIN_WRITE_NAME,
-        schema_version: CATALOG_SCHEMA_VERSION,
-        permission: PermissionClass::IdempotentWrite,
-        verification: VerificationStrategy::ReadBack,
-        idempotency: IdempotencyStrategy::SetOperation,
-        result_bound: RESULT_BOUND_BYTES,
-        description: "Set the logic level of a GPIO pin. Set-operation: re-dispatch is safe.",
-    },
-];
+/// Maximum sensors in one capability set (§5.2 v2).
+pub const MAX_SENSORS_PER_SET: usize = 4;
 
 /// Look up a catalog entry by id.
 #[must_use]
-pub fn lookup_by_id(id: ToolId) -> Option<&'static ToolEntry> {
-    CATALOG.iter().find(|entry| entry.id == id)
+pub fn lookup_by_id(id: ToolId) -> Option<&'static ToolContract> {
+    esper_protocol::lookup_by_id(id.get())
 }
 
 /// Look up a catalog entry by canonical name.
+///
+/// The name arrives as bytes from the line grammar; it must be UTF-8 to
+/// match a catalog name, and anything else is simply unknown.
 #[must_use]
-pub fn lookup_by_name(name: &[u8]) -> Option<&'static ToolEntry> {
-    CATALOG.iter().find(|entry| entry.name.as_bytes() == name)
+pub fn lookup_by_name(name: &[u8]) -> Option<&'static ToolContract> {
+    let name = core::str::from_utf8(name).ok()?;
+    esper_protocol::lookup_by_name(name)
 }
 
-/// The fixed capability set carried by the `RunSeed` (§5.2).
+/// The fixed capability set carried by the `RunSeed` (§5.2 v2).
 ///
-/// Pins are stored with explicit counts (`read_pins[..read_count]`);
-/// counts beyond the storage fail closed wherever they are read.
+/// Pins and sensors are stored with explicit counts
+/// (`read_pins[..read_count]`); counts beyond the storage fail closed
+/// wherever they are read. Absent grants mean denied: a capability set
+/// without `sensors`, `allow_timer`, or `allow_status` refuses those
+/// tools (§17.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     /// Pins the run may read.
@@ -142,10 +83,19 @@ pub struct Capabilities {
     pub write_pins: [u8; MAX_PINS_PER_SET],
     /// How many of `write_pins` are valid.
     pub write_count: u8,
+    /// Sensors the run may sample.
+    pub sensors: [u8; MAX_SENSORS_PER_SET],
+    /// How many of `sensors` are valid.
+    pub sensor_count: u8,
+    /// Whether the run may use the timer tools.
+    pub allow_timer: bool,
+    /// Whether the run may use the status tool.
+    pub allow_status: bool,
 }
 
 impl Capabilities {
-    /// An empty capability set: nothing may be read or written.
+    /// An empty capability set: nothing may be read, written, sampled,
+    /// timed, or reported.
     #[must_use]
     pub const fn empty() -> Self {
         Self {
@@ -153,19 +103,29 @@ impl Capabilities {
             read_count: 0,
             write_pins: [0; MAX_PINS_PER_SET],
             write_count: 0,
+            sensors: [0; MAX_SENSORS_PER_SET],
+            sensor_count: 0,
+            allow_timer: false,
+            allow_status: false,
         }
     }
 
     /// Whether `pin` is in the read set.
     #[must_use]
     pub fn can_read(&self, pin: Pin) -> bool {
-        set_contains(self.read_pins, self.read_count, pin.get())
+        set_contains(&self.read_pins, self.read_count, pin.get())
     }
 
     /// Whether `pin` is in the write set.
     #[must_use]
     pub fn can_write(&self, pin: Pin) -> bool {
-        set_contains(self.write_pins, self.write_count, pin.get())
+        set_contains(&self.write_pins, self.write_count, pin.get())
+    }
+
+    /// Whether `sensor` is in the sample set.
+    #[must_use]
+    pub fn can_sample(&self, sensor: u8) -> bool {
+        set_contains(&self.sensors, self.sensor_count, sensor)
     }
 
     /// Whether `self` grants anything `baseline` does not.
@@ -175,72 +135,97 @@ impl Capabilities {
     #[must_use]
     pub fn widens(&self, baseline: &Self) -> bool {
         set_widens(
-            self.read_pins,
+            &self.read_pins,
             self.read_count,
-            baseline.read_pins,
+            &baseline.read_pins,
             baseline.read_count,
         ) || set_widens(
-            self.write_pins,
+            &self.write_pins,
             self.write_count,
-            baseline.write_pins,
+            &baseline.write_pins,
             baseline.write_count,
-        )
+        ) || set_widens(
+            &self.sensors,
+            self.sensor_count,
+            &baseline.sensors,
+            baseline.sensor_count,
+        ) || (self.allow_timer && !baseline.allow_timer)
+            || (self.allow_status && !baseline.allow_status)
     }
 }
 
-/// The valid prefix of a pin set, or `None` when `count` claims more
-/// pins than the storage holds (fail closed at every reader).
-fn valid_set(set: &[u8; MAX_PINS_PER_SET], count: u8) -> Option<&[u8]> {
+/// The valid prefix of a counted set, or `None` when `count` claims
+/// more entries than the storage holds (fail closed at every reader).
+fn valid_set(set: &[u8], count: u8) -> Option<&[u8]> {
     set.get(..usize::from(count))
 }
-// (kept by reference: this one only reborrows for `get`)
 
-/// Membership test over a counted pin set.
-fn set_contains(set: [u8; MAX_PINS_PER_SET], count: u8, pin: u8) -> bool {
-    valid_set(&set, count).is_some_and(|slice| slice.contains(&pin))
+/// Membership test over a counted set.
+fn set_contains(set: &[u8], count: u8, value: u8) -> bool {
+    valid_set(set, count).is_some_and(|slice| slice.contains(&value))
 }
 
-/// True when `set` holds any pin absent from `baseline`.
-fn set_widens(
-    set: [u8; MAX_PINS_PER_SET],
-    count: u8,
-    baseline: [u8; MAX_PINS_PER_SET],
-    baseline_count: u8,
-) -> bool {
-    match (valid_set(&set, count), valid_set(&baseline, baseline_count)) {
-        (Some(current), Some(base)) => current.iter().any(|pin| !base.contains(pin)),
+/// True when `set` holds any entry absent from `baseline`.
+fn set_widens(set: &[u8], count: u8, baseline: &[u8], baseline_count: u8) -> bool {
+    match (valid_set(set, count), valid_set(baseline, baseline_count)) {
+        (Some(current), Some(base)) => current.iter().any(|value| !base.contains(value)),
         // Malformed counts are treated as widening: fail closed.
         _ => true,
     }
 }
 
-/// The static half of `Authorize`.
+/// Allowlist → capability (§5.2 v2) → device business rules, in the
+/// normative check order. Denial is terminal `Denied`, never a repair turn.
 ///
-/// Allowlist, pin range (already proven by holding a [`Pin`]), and
-/// capability-set membership, in the normative check order (§5.2:
-/// capability first, then device truth, so denials never touch
-/// hardware). Device business rules (pin direction as reported by the
-/// device) are the runtime's `Authorize` step; this gate never sees the
-/// device.
+/// This gate does the allowlist and capability steps only: it never
+/// sees the device, so device business rules (pin direction, sensor
+/// present, clock sane) are the runtime's `Authorize` step, composed
+/// after this one. Both capability and device truth must hold; the
+/// model cannot grant itself resources.
 ///
 /// # Errors
 ///
 /// Returns [`Error::PermissionDenied`] when the capability set refuses
-/// the call — terminal `Denied`, never a repair turn.
-pub fn authorize_capability(caps: &Capabilities, tool: &ToolEntry, pin: Pin) -> Result<(), Error> {
-    let allowed = match tool.permission {
-        PermissionClass::ReadOnly => caps.can_read(pin),
-        PermissionClass::IdempotentWrite => caps.can_write(pin),
-        // No capability set can grant these in the slice (§5.2): deny by
-        // construction, keeping AwaitApproval unreachable.
-        PermissionClass::SensitiveWrite | PermissionClass::Irreversible => false,
+/// the call.
+pub fn authorize(caps: &Capabilities, entry: &ToolContract, args: &ToolArgs) -> Result<(), Error> {
+    // Allowlist: the six E2 tools, all phases (§5.2). Each arm pairs a
+    // stable tool id with its `ToolArgs` shape; an unknown id, or args
+    // that do not belong to the tool, fails closed. (Unreachable when
+    // the decoder built both halves.)
+    let granted = match (entry.id, args) {
+        (GPIO_PIN_READ_ID, ToolArgs::GpioPinRead { pin }) => caps.can_read(*pin),
+        (GPIO_PIN_WRITE_ID, ToolArgs::GpioPinWrite { pin, .. }) => caps.can_write(*pin),
+        (SENSOR_SAMPLE_READ_ID, ToolArgs::SensorSampleRead { sensor }) => caps.can_sample(*sensor),
+        (TIMER_UPTIME_READ_ID, ToolArgs::TimerUptimeRead)
+        | (TIMER_DELAY_WAIT_ID, ToolArgs::TimerDelayWait { .. }) => caps.allow_timer,
+        (DEVICE_STATUS_REPORT_ID, ToolArgs::DeviceStatusReport { .. }) => caps.allow_status,
+        _ => false,
     };
-    if allowed {
+    // Permission classes with no grant path deny by construction, so
+    // `AwaitApproval` stays unreachable (§5.2).
+    let granted = granted
+        && !matches!(
+            entry.permission,
+            PermissionClass::SensitiveWrite | PermissionClass::Irreversible
+        );
+    if granted {
         Ok(())
     } else {
         Err(Error::PermissionDenied {
-            tool: tool.id,
-            pin: pin.get(),
+            tool: ToolId::new(entry.id),
+            resource: resource_of(*args),
         })
+    }
+}
+
+/// The resource a denial names (§15.16): the pin for GPIO tools, the
+/// sensor id for `sensor_sample_read`, 0 for timer and status tools.
+const fn resource_of(args: ToolArgs) -> u8 {
+    match args {
+        ToolArgs::GpioPinRead { pin } | ToolArgs::GpioPinWrite { pin, .. } => pin.get(),
+        ToolArgs::SensorSampleRead { sensor } => sensor,
+        ToolArgs::TimerUptimeRead
+        | ToolArgs::TimerDelayWait { .. }
+        | ToolArgs::DeviceStatusReport { .. } => 0,
     }
 }

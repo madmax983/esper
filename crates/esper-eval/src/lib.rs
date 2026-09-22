@@ -28,5 +28,5 @@ pub mod json;
 pub mod runner;
 
 pub use esper_runtime::RunSeed;
-pub use fixture::{parse_fixture, Fixture, FixtureError};
-pub use runner::{run_fixture, run_fixture_file, FixtureReport};
+pub use fixture::{Fixture, FixtureError, parse_fixture};
+pub use runner::{FixtureReport, run_fixture, run_fixture_file};
