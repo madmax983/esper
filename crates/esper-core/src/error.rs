@@ -318,6 +318,37 @@ pub enum Error {
         /// The rejected code.
         code: u8,
     },
+
+    // --- Context lifecycle (E4, SPEC §20) ---
+    /// The mask output buffer is smaller than `mask_bound(input_len)`.
+    #[error("mask output buffer too small")]
+    MaskOutputTooSmall,
+    /// A compact-state note, fact, or subgoal text exceeds its bound.
+    #[error("compact text exceeds its bound")]
+    CompactFieldTooLong,
+    /// A compact-state list that must never drop entries (failed paths,
+    /// open obligations) is full.
+    #[error("compact state list full")]
+    CompactStateFull,
+    /// The snapshot encode buffer is smaller than `encoded_len(state)`.
+    #[error("snapshot buffer too small")]
+    SnapshotBufferTooSmall,
+    /// Snapshot bytes end before the header or a field completes.
+    #[error("snapshot truncated")]
+    SnapshotTruncated,
+    /// Snapshot integrity check failed: the bytes do not match the digest.
+    #[error("snapshot checksum mismatch")]
+    SnapshotChecksumMismatch,
+    /// The snapshot version byte is not `SNAPSHOT_VERSION`.
+    #[error("snapshot version mismatch: found {found}")]
+    SnapshotVersionMismatch {
+        /// The version byte found in the snapshot.
+        found: u8,
+    },
+    /// Snapshot bytes pass the integrity check but do not decode to a
+    /// valid state.
+    #[error("snapshot payload invalid")]
+    SnapshotCorrupt,
 }
 
 impl Error {

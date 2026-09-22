@@ -29,14 +29,19 @@
 //! - [`registry`]: the static tool catalog (re-exported from
 //!   `esper-protocol`), capabilities, and the policy gate.
 //! - [`budget`]: the resource budget model (part of run identity).
+//! - [`compact`]: bounded context compaction into a durable compact state.
 //! - [`monitor`]: the deterministic runtime monitor (loop and guard rules).
 //! - [`records`]: logical journal record kinds and the terminal result type.
+//! - [`lineage`]: run lineage for `continue_as_new`.
+//! - [`mask`]: secret and PII masking before prompts, durability, logging.
+//! - [`snapshot`]: versioned, integrity-checked compact-state snapshots.
 
 #![no_std]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod budget;
+pub mod compact;
 pub mod decision;
 pub mod error;
 pub mod ids;
@@ -45,14 +50,24 @@ pub mod ids;
 // dependency cycle (SPEC §17.4). Re-exported here, so every existing
 // `crate::json::…` and `esper_core::json::…` path keeps working.
 pub use esper_protocol::json;
+pub mod lineage;
+pub mod mask;
 pub mod monitor;
 pub mod records;
 pub mod registry;
+pub mod snapshot;
 pub mod state;
 
 // Convenience re-exports of the types the runtime crew reaches for most.
 pub use budget::ResourceBudget;
+pub use compact::{
+    compact, should_compact, CompactState, CompactionPolicy, CompactionReport, FailedPath, Fact,
+    FrameSummary, Note, PendingItem, PendingKind, VersionSet, DEFAULT_POLICY,
+};
 pub use decision::{Decision, StatusDetail, ToolArgs};
 pub use error::{Error, ErrorCode};
 pub use ids::{Digest, EffectId, EffectSeq, Pin, RunId, ToolId};
+pub use lineage::{continue_as_new, ContinuedRun, Lineage};
+pub use mask::{fnv1a64, mask_bound, mask_bytes, mask_report, MaskClass, MaskReport};
+pub use snapshot::{decode, encode, encoded_len, verify, SNAPSHOT_VERSION};
 pub use state::{Event, State, TerminalStatus, committed_records, is_legal, transition};
