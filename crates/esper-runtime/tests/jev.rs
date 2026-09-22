@@ -18,8 +18,8 @@ use esper_core::ids::{Pin, RunId};
 use esper_core::state::TerminalStatus;
 use esper_runtime::{
     CrashPoint, Direction, FakeDevice, FaultPlan, InputPlan, JEV_ENDPOINT, JEV_MODEL_VERSION,
-    JevBackend, JevError, JevTransport, Journal, MockTransport, ModelBackend, RecordedAnswer,
-    RunSeed, drive_run, fnv1a64, synthesize_response,
+    JevBackend, JevError, JevTransport, Journal, LiveTransport, MockTransport, ModelBackend,
+    RecordedAnswer, RunSeed, drive_run, fnv1a64, synthesize_response,
 };
 
 /// The record-mode capture log: `(request_hash, response)` pairs.
@@ -361,4 +361,35 @@ fn jev_crash_before_commit() {
     assert_eq!(trace.terminal_status(), Some(TerminalStatus::Completed));
     assert_eq!(device.physical_writes(), 1);
     assert_eq!(backend.receipts().len(), 3);
+}
+
+/// One real System One turn through the full adapter: request,
+/// HTTPS, parse, gate, template line. Runs only when `JEV_BEARER`
+/// holds a bearer key; otherwise it skips. Never runs in CI or by
+/// default — a live call spends a real turn against the API.
+#[test]
+fn jev_live_turn_end_to_end() {
+    let key = std::env::var("JEV_BEARER").unwrap_or_default();
+    if key.trim().is_empty() {
+        eprintln!("skipping jev_live_turn_end_to_end: JEV_BEARER is not set");
+        return;
+    }
+    let transport = LiveTransport::new(JEV_ENDPOINT, key.trim());
+    let mut backend = JevBackend::new(Box::new(transport), JEV_MODEL_VERSION, JEV_ENDPOINT);
+    let prompt = b"TOOLS call_sensor_sample_read\nSTATE 1\nLAST {\"sensor\": 0}\nEMIT one line\n";
+    let mut out = [0u8; 4096];
+    let written = backend
+        .infer(prompt, &mut out)
+        .expect("the live turn should answer");
+    let line = &out[..written];
+    assert_eq!(backend.receipts().len(), 1);
+    let receipt = &backend.receipts()[0];
+    assert_eq!(receipt.answer.choice_probs_bps.len(), 8);
+    assert!(receipt.answer.noul_p_bps <= 10_000);
+    assert!((1_000..=4_000).contains(&receipt.answer.score_milli));
+    let text = core::str::from_utf8(line).expect("the line is ASCII");
+    assert!(
+        text.starts_with("CALL ") || text.starts_with("ASK ") || text.starts_with("FINISH "),
+        "unexpected line: {text}"
+    );
 }

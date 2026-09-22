@@ -1876,10 +1876,10 @@ templates do not act on partial evidence.
   The seed binds this bundle exactly like §18's: a version change is
   a different bundle, and a response naming a different version than
   the backend was constructed with fails closed (`VersionMismatch`).
-  The adapter pins `jev-1.13.0` so the digest is reproducible;
-  the value is what public material resolves `jev-latest` to
-  (2026-09-18), unverified against official documentation — the pin
-  is a label, not a discovery.
+  The adapter pins `jev-1.13.0`. The pin was what public material
+  resolved `jev-latest` to (2026-09-18), and a live call on
+  2026-09-22 returned `"model": "jev-1.13.0"` in the response — the
+  label is confirmed against the API itself.
 - **Per-turn evidence.** Every inference appends a `JevReceipt`:
   the parsed answer (raw choice, gated choice, the gate bit, the
   eight choice probabilities, the Noul probability, the fractional
@@ -1897,7 +1897,7 @@ templates do not act on partial evidence.
   caveat. Replay of a live run is evidence review, not
   bit-reproduction.
 
-### 19.6 Transports: mock now, live deferred
+### 19.6 Transports: mock for fixtures, live for real
 
 - **`MockTransport`** replays recorded System One responses from a
   cassette: `{"model_version", "endpoint",
@@ -1910,14 +1910,31 @@ templates do not act on partial evidence.
   `spec/jev-cassettes/` as reviewed fixtures, authored by record
   mode (`ESPER_JEV_RECORD=1` drives the scenarios through a
   directing transport and writes the pairs).
-- **`LiveTransport`** builds the documented `POST` (bearer auth,
-  JSON body) but defers the send: without an API key — and without
-  TLS in this host profile — every call fails with `LiveDeferred`.
-  The request bytes it *would* send are exactly what
-  `build_request_json` produces, pinned by golden tests, so the day
-  a key arrives only the socket layer is new. **No API key is
-  available; live verification is deferred until Mark provides one,
-  and he is not being asked for it now.**
+- **`LiveTransport`** performs the real call. `LiveTransport::new`
+  takes the endpoint and the bearer key; `LiveTransport::unconfigured`
+  builds the keyless form, which fails every call with
+  `LiveDeferred`. The key is supplied by the caller — it comes from
+  secure storage at the call site, is never hardcoded, and the
+  library never reads it from disk or the environment itself. The
+  client opens HTTPS to the endpoint (a blocking TLS client over
+  `rustls` with the Mozilla root set — it stays behind the `host`
+  feature with the rest of the adapter, never in the `no_std`
+  crates), sends `POST` with `Authorization: Bearer <key>`,
+  `Content-Type: application/json`, `Accept: application/json`,
+  and the `build_request_json` body, then parses the `answers` out
+  of the response. A non-200 status fails closed as `HttpStatus`;
+  anything the response does not shape correctly is the usual
+  `BadResponse` family.
+
+  The wire shape is verified live, not just designed. On
+  2026-09-22 the direct API accepted `POST
+  https://api.typesafe.ai/v1/systemone` with a *top-level* body —
+  `state`, `model`, and `questions` as siblings. Nesting them
+  under an `input` object returns HTTP 400: that nesting belongs
+  to the Cloudflare envelope, not the direct API. The response
+  shape the adapter parses (`model`, `answers` with the three
+  typed answers and their distributions, `usage`) is what the
+  live endpoint actually returned.
 
 ### 19.7 Why the 19 byte-exact fixtures stay scripted+tiny
 
@@ -1941,10 +1958,42 @@ in it enters the `no_std`/`no_alloc` crates, the firmware story, or
 the §18 target measurements: there is no Xtensa size, no RAM
 budget, and no energy claim for a cloud call. Per-call cost follows
 the Jev pricing ($0.042/MTok input, output unmetered) against the
-measured input bytes on the receipts; stated latency is 70–500 ms
-per the docs, unmeasured here. `cargo check/test -p esper-runtime
+measured input bytes on the receipts; measured latency is about
+880–950 ms per turn (two live calls, 2026-09-22 — the docs' 70–500 ms
+figure did not hold for these calls). `cargo check/test -p esper-runtime
 --no-default-features` stays green, and no Jev symbol is reachable
 without `host`.
+
+### 19.9 Live evidence (2026-09-22)
+
+The findings above are measured, not assumed:
+
+- **Endpoint and auth.** `POST https://api.typesafe.ai/v1/systemone`
+  with `Authorization: Bearer <key>`. The key travels through
+  secure storage at the call site; the library never sees where
+  it is kept.
+- **Wire shape.** The body is the top-level object
+  `{"state", "model", "questions"}`. Nesting `state`/`questions`
+  under `input` returns HTTP 400 — that nesting belongs to the
+  Cloudflare envelope, not the direct API.
+- **Model.** The API answered as `jev-1.13.0`, confirming the
+  §19.5 pin.
+- **Latencies.** A simple Noul call completed in about 952 ms; an
+  Esper-shaped turn (the §19.1 schema, pump-goal state) in about
+  879 ms.
+- **Esper-shaped turn.** `decision` chose
+  `call_sensor_sample_read` at confidence 0.99 — the right call
+  for the pump-goal state — over all eight options;
+  `should_ask` returned 0.13, below the §19.2 gate, so no ask;
+  `confidence` returned score 0.67 with the level legend and the
+  four per-level probabilities. The answer shapes matched the
+  adapter's `Choice`/`Noul`/`Score` models exactly.
+
+Honest gaps that remain true after the live wiring: the
+`JevReceipt`s are not yet journaled into `Frame::ModelDecision`
+or the `RunTrace`; the §19.3 `ScoreBand` escalation mapping is
+still not consumed by the deterministic monitor; the 19
+byte-exact §14 fixtures still run scripted+tiny only (§19.7).
 
 ## 20. Rung E4: context lifecycle
 

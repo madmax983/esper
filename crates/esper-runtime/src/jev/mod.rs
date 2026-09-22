@@ -13,7 +13,7 @@
 //! The adapter maps one `ReAct` turn to one Jev call (§19):
 //!
 //! - `decision`: a `Choice` over the turn's eight-option decision
-//!   space — one [`Candidate`] per catalog tool plus `ask` and
+//!   space — one `Candidate` per catalog tool plus `ask` and
 //!   `finish`.
 //! - `should_ask`: a `Noul` gate. At or above [`NOUL_GATE_BPS`] the
 //!   adapter overrides the choice with the `ask` candidate: the run
@@ -40,11 +40,16 @@
 //!
 //! Host-only: this module is a network client. It lives behind the
 //! `host` feature and never enters the `no_std`/`no_alloc` crates or
-//! the firmware story. Without an API key only the transports ship:
-//! [`MockTransport`] replays recorded API responses (the cassette
-//! format, with a record mode for authoring), and [`LiveTransport`]
-//! builds the documented request but defers the send until a key is
-//! configured — live verification waits for Mark's key.
+//! the firmware story. Two transports ship: [`MockTransport`]
+//! replays recorded API responses (the cassette format, with a
+//! record mode for authoring), and [`LiveTransport`] performs the
+//! real HTTPS `POST` when built with a bearer key — the key comes
+//! from secure storage at the call site, never from the library
+//! itself. [`LiveTransport::unconfigured`] builds the keyless form,
+//! which fails every call with [`JevError::LiveDeferred`]. The wire
+//! shape (top-level `state`/`model`/`questions`) and the response
+//! shapes were verified against the live API on 2026-09-22; see
+//! SPEC §19.9 for the measured evidence.
 //!
 //! [`ModelBackend`]: crate::backend::ModelBackend
 //! [`Choice`]: https://docs.typesafe.ai/api#choice
@@ -54,9 +59,12 @@
 // HOST-ONLY (E3+jev): a network client; never compiled without `host`.
 #![cfg(feature = "host")]
 
+mod https;
+
 use std::collections::HashMap;
 
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::backend::{BackendError, BundleId, ModelBackend, TokenUsage, fnv1a64};
 use esper_protocol::json::{JsonValue, Parser, parse_u8};
@@ -68,9 +76,9 @@ pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 ///
 /// Pins the version so the bundle digest — and any evaluation —
 /// is reproducible. The value (`jev-1.13.0`) is what public material
-/// resolves `jev-latest` to (2026-09-18); it is *not* verified against
-/// official documentation, so treat it as a pinned label until a key
-/// and the official endpoint confirm it. A version change is a
+/// resolved `jev-latest` to (2026-09-18), and a live call on
+/// 2026-09-22 answered as exactly this version, so the pin is
+/// confirmed against the API itself. A version change is a
 /// different bundle by construction.
 pub const JEV_MODEL_VERSION: &str = "jev-1.13.0";
 
@@ -205,7 +213,7 @@ impl Candidate {
             .copied()
     }
 
-    /// The candidate's position in [`CANDIDATES`].
+    /// The candidate's position in `CANDIDATES`.
     fn index(self) -> u8 {
         let position = CANDIDATES
             .iter()
@@ -330,7 +338,7 @@ fn push_escaped(out: &mut Vec<u8>, text: &[u8]) {
 ///
 /// The prompt travels as `state`, plus the pinned model version and
 /// the three typed questions — `decision` (`Choice` over
-/// [`CANDIDATES`]), `should_ask` (`Noul`), `confidence` (`Score`).
+/// `CANDIDATES`), `should_ask` (`Noul`), `confidence` (`Score`).
 /// Field order is fixed so the bytes — and therefore the mock
 /// cassette keys — are deterministic.
 #[must_use]
@@ -365,14 +373,14 @@ pub fn build_request_json(prompt: &[u8], model_version: &str) -> Vec<u8> {
 /// score is thousandths of a rubric level (1000–4000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JevAnswer {
-    /// The chosen option's position in [`CANDIDATES`], before gating.
+    /// The chosen option's position in `CANDIDATES`, before gating.
     pub raw_choice: u8,
     /// The emitted option's position, after the [`NOUL_GATE_BPS`]
     /// gate may have overridden it with `ask`.
     pub choice: u8,
     /// Whether the `Noul` gate overrode the choice.
     pub gated: bool,
-    /// The `Choice` distribution, in [`CANDIDATES`] order.
+    /// The `Choice` distribution, in `CANDIDATES` order.
     pub choice_probs_bps: [u16; 8],
     /// P(the run cannot proceed safely without human input).
     pub noul_p_bps: u16,
@@ -890,9 +898,15 @@ pub enum JevError {
     /// version; a silent version change would break that binding.
     #[error("the Jev model version changed mid-run")]
     VersionMismatch,
-    /// A live call was attempted without a configured key. Live
-    /// verification is deferred until Mark provides one.
-    #[error("live Jev calls are deferred until an API key is configured")]
+    /// The live endpoint answered with a non-200 HTTP status: 4xx is
+    /// our request or our key, 5xx is the server. Either way the turn
+    /// came back with no answer.
+    #[error("the Jev API returned HTTP status {0}")]
+    HttpStatus(u16),
+    /// A live call was attempted on a transport built without a key
+    /// ([`LiveTransport::unconfigured`]). Configure one with
+    /// [`LiveTransport::new`] instead of retrying the deferral.
+    #[error("live Jev calls need an API key: use LiveTransport::new")]
     LiveDeferred,
 }
 
@@ -1015,7 +1029,7 @@ fn parse_decimal_u64(digits: &[u8]) -> Result<u64, JevError> {
 
 /// Re-emit a parsed JSON value canonically (for cassette loading).
 /// Numbers round-trip through `f64`, so `0.9000` becomes `0.9`: the
-/// meaning is identical and [`parse_response`] only reads the meaning.
+/// meaning is identical and `parse_response` only reads the meaning.
 fn emit_jval(value: &JVal, out: &mut Vec<u8>) {
     match value {
         JVal::Null => out.extend_from_slice(b"null"),
@@ -1051,18 +1065,25 @@ fn emit_jval(value: &JVal, out: &mut Vec<u8>) {
     }
 }
 
-/// The live transport: builds the documented `POST`, send deferred.
+/// The live transport: the real HTTPS `POST` to the System One endpoint.
 ///
-/// Without an API key (and without TLS in this host profile)
-/// there is nothing honest to send with, so every call fails with
-/// [`JevError::LiveDeferred`]. The request bytes it *would* send are
-/// exactly what [`build_request_json`] produces — the golden tests
-/// pin them, so the day a key arrives only the socket layer is new.
+/// Built with a bearer key ([`LiveTransport::new`]), `ask` performs
+/// one blocking HTTPS call per turn: `POST {endpoint}` with
+/// `Authorization: Bearer <key>`, `Content-Type: application/json`,
+/// and the [`build_request_json`] body. The TLS client is `rustls`
+/// with the Mozilla root set; it honors `HTTPS_PROXY` like a
+/// conventional client. A non-200 status fails closed as
+/// [`JevError::HttpStatus`].
+///
+/// Built without a key ([`LiveTransport::unconfigured`]), every call
+/// fails with [`JevError::LiveDeferred`] — the honest stub for
+/// keyless contexts (unit tests, cassette authoring).
 pub struct LiveTransport {
     /// The endpoint, usually [`JEV_ENDPOINT`].
     pub endpoint: String,
-    /// The bearer key; `None` until Mark provides one.
-    pub api_key: Option<String>,
+    /// The bearer key; `None` on the unconfigured form. Supplied by
+    /// the caller, zeroized on drop, never logged.
+    api_key: Option<String>,
 }
 
 impl LiveTransport {
@@ -1074,14 +1095,43 @@ impl LiveTransport {
             api_key: None,
         }
     }
+
+    /// Build a live transport with a bearer key: calls perform the
+    /// real HTTPS `POST`.
+    ///
+    /// The key is supplied by the caller — from secure storage at
+    /// the call site. It is never hardcoded, never read from disk
+    /// or the environment by the library, and never logged: it
+    /// travels only in the `Authorization` header, and its bytes are
+    /// zeroized when the transport drops.
+    #[must_use]
+    pub fn new(endpoint: &str, api_key: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            api_key: Some(api_key.to_string()),
+        }
+    }
+}
+
+impl Drop for LiveTransport {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
 }
 
 impl JevTransport for LiveTransport {
-    fn ask(&mut self, _request_json: &[u8]) -> Result<Vec<u8>, JevError> {
+    fn ask(&mut self, request_json: &[u8]) -> Result<Vec<u8>, JevError> {
         // The documented call: POST {endpoint} with
         // `Authorization: Bearer <key>` and `Content-Type:
-        // application/json`. Deferred: no key, no TLS here.
-        Err(JevError::LiveDeferred)
+        // application/json`. The key comes from the caller; without
+        // one the call defers honestly instead of failing obscurely.
+        let api_key = self.api_key.as_deref().ok_or(JevError::LiveDeferred)?;
+        let endpoint = https::parse_endpoint(&self.endpoint)?;
+        let response = https::post(&endpoint, api_key, request_json)?;
+        if response.status != 200 {
+            return Err(JevError::HttpStatus(response.status));
+        }
+        Ok(response.body)
     }
 }
 
@@ -1103,7 +1153,7 @@ pub struct RecordedAnswer {
 }
 
 /// Render a [`RecordedAnswer`] as System One response JSON: the shape
-/// the mock cassettes record and [`parse_response`] consumes. Used to
+/// the mock cassettes record and `parse_response` consumes. Used to
 /// author cassettes without a live key.
 #[must_use]
 pub fn synthesize_response(answer: &RecordedAnswer, model_version: &str) -> Vec<u8> {
@@ -1217,10 +1267,17 @@ impl JevBackend {
     fn answer(&mut self, prompt: &[u8], out: &mut [u8]) -> Result<usize, BackendError> {
         let request = build_request_json(prompt, &self.model_version);
         let response = self.transport.ask(&request).map_err(|error| match error {
+            // A 4xx is our request or our key: a client-side defect,
+            // not a missing answer. (The nested-`input` shape the API
+            // 400s on was exactly this class of bug.)
+            JevError::HttpStatus(status) if (400..500).contains(&status) => {
+                BackendError::PolicyMismatch
+            }
             // The mock never guesses: an unrecorded request is the
             // same fail-closed outcome as the tiny backend's missing
-            // distill entry.
-            JevError::Transport(_) => BackendError::UnknownPrompt,
+            // distill entry. A live network failure or any other
+            // status is the same shape: no answer came back.
+            JevError::Transport(_) | JevError::HttpStatus(_) => BackendError::UnknownPrompt,
             // A malformed or unshaped response fails the adapter's
             // integrity check, like a tampered distill entry; a
             // deferred live call is a configuration dead end with the
@@ -1239,9 +1296,12 @@ impl JevBackend {
                 JevError::UnknownChoice | JevError::Transport(_) | JevError::LiveDeferred => {
                     BackendError::UnknownPrompt
                 }
-                JevError::BadResponse | JevError::BadProbability | JevError::VersionMismatch => {
-                    BackendError::PolicyMismatch
-                }
+                // `HttpStatus` cannot reach here — the transport
+                // consumed it — but the match must stay exhaustive.
+                JevError::HttpStatus(_)
+                | JevError::BadResponse
+                | JevError::BadProbability
+                | JevError::VersionMismatch => BackendError::PolicyMismatch,
             })?;
         let choice = CANDIDATES
             .get(usize::from(answer.choice))
@@ -1514,10 +1574,72 @@ mod tests {
     }
 
     #[test]
+    fn request_json_has_top_level_wire_shape() {
+        // Verified live 2026-09-22: the direct API takes `state`,
+        // `model`, and `questions` as top-level siblings. Nesting
+        // them under `input` returns HTTP 400.
+        let bytes = build_request_json(b"X", "jev-1.13.0");
+        let mut reader = JReader::new(&bytes);
+        let root = reader.parse_document().expect("valid request");
+        let mut keys: Vec<&str> = root
+            .as_obj()
+            .expect("top-level object")
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["model", "questions", "state"]);
+    }
+
+    #[test]
     fn live_transport_defers_without_a_key() {
         let mut transport = LiveTransport::unconfigured(JEV_ENDPOINT);
         let error = transport.ask(b"{}").expect_err("must defer");
         assert_eq!(error, JevError::LiveDeferred);
+    }
+
+    #[test]
+    fn live_transport_new_takes_the_endpoint_and_a_key() {
+        let transport = LiveTransport::new(JEV_ENDPOINT, "bearer-key");
+        assert_eq!(transport.endpoint, JEV_ENDPOINT);
+        // The key is not readable back: it travels only in the
+        // `Authorization` header, and is zeroized on drop.
+    }
+
+    /// A transport that fails with a fixed HTTP status, for the
+    /// error-mapping tests.
+    struct StatusTransport(u16);
+
+    impl JevTransport for StatusTransport {
+        fn ask(&mut self, _request_json: &[u8]) -> Result<Vec<u8>, JevError> {
+            Err(JevError::HttpStatus(self.0))
+        }
+    }
+
+    #[test]
+    fn http_4xx_from_the_transport_maps_to_policy_mismatch() {
+        // A client-side defect (bad request shape, bad key) is an
+        // integrity failure, not a missing answer.
+        let mut backend =
+            JevBackend::new(Box::new(StatusTransport(400)), "jev-1.13.0", JEV_ENDPOINT);
+        let mut out = [0u8; 64];
+        let error = backend
+            .infer(b"STATE 1\nEMIT one line\n", &mut out)
+            .expect_err("must fail");
+        assert_eq!(error, BackendError::PolicyMismatch);
+    }
+
+    #[test]
+    fn http_5xx_from_the_transport_maps_to_unknown_prompt() {
+        // A server-side failure means no answer came back: the same
+        // fail-closed bucket as a dead transport.
+        let mut backend =
+            JevBackend::new(Box::new(StatusTransport(503)), "jev-1.13.0", JEV_ENDPOINT);
+        let mut out = [0u8; 64];
+        let error = backend
+            .infer(b"STATE 1\nEMIT one line\n", &mut out)
+            .expect_err("must fail");
+        assert_eq!(error, BackendError::UnknownPrompt);
     }
 
     #[test]

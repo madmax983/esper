@@ -34,13 +34,17 @@ verification, per-segment journal ownership, and the
   root (`ScriptedBackend` only under `cfg(feature = "host")`).
   E4: `PriorCtx` (the folded-history summary) and the
   `[stale:folded@epoch=N]` marker rendering.
-- `src/jev.rs` — the E3+jev `System One` adapter (host-only):
-  `JevBackend` over the `JevTransport` trait, `MockTransport`
-  (request-hash cassettes) / `LiveTransport` (deferred, no key),
-  `build_request_json`, typed response parsing with the `Noul` ask
-  gate, deterministic arg templates, `JevReceipt` per-turn evidence,
-  `Prob` / `ScoreBand` / `RecordedAnswer` / `synthesize_response`.
-  SPEC §19.
+- `src/jev/mod.rs` (+ `src/jev/https.rs`) — the E3+jev `System One`
+  adapter (host-only): `JevBackend` over the `JevTransport` trait,
+  `MockTransport` (request-hash cassettes) / `LiveTransport` (real
+  blocking HTTPS POST via `rustls` + Mozilla roots; caller-supplied
+  key, zeroized on drop; `unconfigured()` still fails honestly as
+  `LiveDeferred`), `build_request_json`, typed response parsing with
+  the `Noul` ask gate, deterministic arg templates, `JevReceipt`
+  per-turn evidence, `Prob` / `ScoreBand` / `RecordedAnswer` /
+  `synthesize_response`. SPEC §19 (live-verified 2026-09-22:
+  `api.typesafe.ai`, top-level `{state, model, questions}`,
+  `jev-1.13.0`, ~880–950 ms/turn).
 - `src/engine.rs` — the boundary loop: turn → authorize → dispatch →
   verify → account, with crash recovery as journal replay. E3: the
   `Infer` step drives a `&mut dyn ModelBackend`; the engine builds

@@ -11,7 +11,7 @@ default = ["host"]
 # the Tokio-based async driver entry point, and the human-readable trace.
 # Without it the crate is `#![no_std]` and exposes only the allocation-free
 # engine core (journal trait, codecs, boundary loop) for firmware ports.
-host = ["dep:tokio"]
+host = ["dep:tokio", "dep:rustls", "dep:webpki-root-certs", "dep:zeroize"]
 
 [dependencies]
 # Workspace sibling: the decision decoder, budgets, monitor, and state machine.
@@ -31,6 +31,14 @@ waymaker-embassy = "0.1.0"
 thiserror = "2"
 # HOST-ONLY (E0/E1): async host driver entry point.
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+# HOST-ONLY (E3+jev live transport): blocking HTTPS client for the real
+# System One call. `rustls` with the `ring` provider does TLS 1.2/1.3;
+# `webpki-root-certs` pins the Mozilla root set (deterministic, no
+# system store); `zeroize` wipes the bearer key on drop. All three stay
+# behind `host` — the `no_std` build never sees them.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-root-certs = { version = "1", optional = true }
+zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
 # Host-only fixture parsing for the E3 resource-measurement harness.
