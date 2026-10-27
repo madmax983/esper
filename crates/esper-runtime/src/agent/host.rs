@@ -10,38 +10,42 @@
 //!   persistent-clock deadlines, `continue_as_new`, and fault injection
 //!   at four boundary kinds ([`CrashAt`]). The device's journal is
 //!   Waymaker's flash-backed driver.
-//! * [`HostAgent`] — the dispatcher: senses scheduled operator
-//!   commands and input deliveries, drives goal runs through
-//!   [`crate::drive_segment`] over the world doubles, harvests with
-//!   [`esper_core::harvest::Harvester`], and keeps checkpoint items.
+//! * [`HostAgent`] — the product board dispatcher
+//!   ([`super::device::Device`]) over host doubles: [`HostRuns`] (one
+//!   in-memory journal per run, the run harness's crash points armed in
+//!   the next spawned run) and [`HostPortsDevice`] (scheduled operator
+//!   commands and input deliveries, the world doubles, the item store).
 //! * [`drive`] — polls the workflow with a no-op waker, the way an
 //!   Embassy executor would, advancing the clocks whenever the
 //!   heartbeat deadline has not passed, and rebooting on an injected
 //!   crash or a `continue_as_new`.
 
+use core::convert::Infallible;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use esper_core::beat::Beat;
+use esper_core::decision::ToolArgs;
 use esper_core::goal::GoalId;
-use esper_core::harvest::{HarvestSet, Harvester};
-use esper_core::ids::{RunId as EsperRunId, ToolId};
-use esper_core::memory::Provenance;
+use esper_core::ids::{Pin, RunId as EsperRunId, ToolId};
 use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Answer, Ctx, Halted, Handoff, Journal, NoAlarm};
 
-use super::wire::{self, Command, HarvestEntry, PAGE_RECORD_MAX, RunReport, RunRequest, Sense};
+use super::device::{Device, DevicePorts, RunStore, StoreFault};
+use super::wire::{Command, PAGE_RECORD_MAX, Sense, WireError};
 use super::{AgentError, AgentSeed, AgentState, Pulse, PulseSink, supervise};
 use crate::backend::ModelBackend;
 use crate::error::CrashPoint;
-use crate::journal::Journal as RunJournal;
-use crate::run::host::{RolloverHandoff, SegmentOutcome, drive_segment};
+use crate::journal::Record as RunRecord;
+use crate::run::RunState;
+use crate::run::device::{Attempt, RunPorts};
+use crate::run::host::{Boundary, HostPorts, crash_point};
+use crate::run::wire::{Check, Fault, RunStart};
 use crate::seed::RunSeed;
-use crate::trace::{RunTrace, TraceEvent};
 use crate::world::{FakeDevice, FaultPlan, InputPlan};
 
 /// Why the last poll of the workflow stopped.
@@ -419,37 +423,394 @@ impl Journal for MemJournal<'_> {
     }
 }
 
-/// One goal run the host dispatcher owns: its segments and, once
-/// settled, its harvest.
+/// One supervised run's journal on the host: its current segment's
+/// Waymaker records, every segment's seed, and its terminal record.
 #[derive(Debug, Clone)]
 pub struct HostRun {
     /// The goal served.
     pub goal: GoalId,
-    /// `(seed, journal, handoff)` per segment, root first.
+    /// Every segment's seed, root first: one more per `continue_as_new`.
     // HOST-ONLY (E4+aon)
-    pub segments: Vec<(RunSeed, RunJournal, Option<RolloverHandoff>)>,
-    /// The harvest, once the run settled.
-    pub harvest: Option<HarvestSet>,
+    pub segments: Vec<RunSeed>,
+    // HOST-ONLY (E4+aon)
+    input: Vec<u8>,
+    // HOST-ONLY (E4+aon)
+    records: Vec<RunRecord>,
+    // HOST-ONLY (E4+aon)
+    terminal: Option<(bool, Vec<u8>)>,
+    crash: Option<CrashPoint>,
 }
 
-/// The host dispatcher double: the device's half of the supervisor's
-/// activities.
-pub struct HostAgent<'w> {
+/// The host's [`RunStore`]: one in-memory Waymaker journal per run, with
+/// the run harness's crash points armed in the next spawned run. Its
+/// own [`Journal`] implementation serves the selected run.
+pub struct HostRuns<'s> {
+    signals: &'s Signals,
+    // HOST-ONLY (E4+aon)
+    runs: BTreeMap<u64, HostRun>,
+    selected: Option<u64>,
+    pos: usize,
+    armed: Option<CrashPoint>,
+    /// An inference's answer was lost to a reset: the model re-emits.
+    unemit: bool,
+    /// Crashes fired inside runs.
+    fired: usize,
+}
+
+impl HostRuns<'_> {
+    fn run(&self) -> Option<&HostRun> {
+        self.runs.get(&self.selected?)
+    }
+
+    fn run_mut(&mut self) -> Option<&mut HostRun> {
+        self.runs.get_mut(&self.selected?)
+    }
+
+    /// Fire the selected run's armed crash if `point` matches it.
+    fn fire(&mut self, point: Option<CrashPoint>) -> bool {
+        let Some(run) = self.run_mut() else {
+            return false;
+        };
+        if point.is_none() || run.crash != point {
+            return false;
+        }
+        run.crash = None;
+        self.fired += 1;
+        if point == Some(CrashPoint::BeforeDecisionCommit) {
+            self.unemit = true;
+        }
+        self.signals.stop(Stop::Crash);
+        true
+    }
+
+    fn records(&self) -> &[RunRecord] {
+        self.run().map_or(&[], |run| run.records.as_slice())
+    }
+}
+
+impl RunStore for HostRuns<'_> {
+    type Journal = Self;
+
+    fn select(&mut self, run: EsperRunId, start: Option<&[u8]>) -> Result<(), StoreFault> {
+        if !self.runs.contains_key(&run.get()) {
+            let start = start.ok_or(StoreFault::Unknown)?;
+            let seed = RunStart::decode(start)
+                .map_err(|_| StoreFault::Unknown)?
+                .seed;
+            let goal = super::goal_of(run).ok_or(StoreFault::Unknown)?;
+            // HOST-ONLY (E4+aon)
+            self.runs.insert(
+                run.get(),
+                HostRun {
+                    goal,
+                    segments: vec![seed],
+                    input: start.to_vec(),
+                    records: Vec::new(),
+                    terminal: None,
+                    crash: self.armed.take(),
+                },
+            );
+        }
+        self.selected = Some(run.get());
+        Ok(())
+    }
+
+    fn input(&self, out: &mut [u8]) -> Result<usize, StoreFault> {
+        let input = &self.run().ok_or(StoreFault::Unknown)?.input;
+        out.get_mut(..input.len())
+            .ok_or(StoreFault::Unknown)?
+            .copy_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn boot(&mut self) -> &mut Self {
+        self.pos = 0;
+        self
+    }
+
+    fn terminal(&self, out: &mut [u8]) -> Option<(bool, usize)> {
+        let (completed, bytes) = self.run()?.terminal.as_ref()?;
+        out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some((*completed, bytes.len()))
+    }
+
+    fn conclude(&mut self, completed: bool, record: &[u8]) -> Result<(), StoreFault> {
+        if self.fire(Some(CrashPoint::BeforeTerminalCommit)) {
+            return Err(StoreFault::Halted);
+        }
+        // HOST-ONLY (E4+aon)
+        self.run_mut().ok_or(StoreFault::Unknown)?.terminal = Some((completed, record.to_vec()));
+        if self.fire(Some(CrashPoint::AfterTerminalCommit)) {
+            return Err(StoreFault::Halted);
+        }
+        Ok(())
+    }
+}
+
+impl Journal for HostRuns<'_> {
+    fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Halted> {
+        let run = self.selected.ok_or(Halted)?;
+        let pos = self.pos;
+        let records = self.records();
+        if pos < records.len() {
+            let Some(RunRecord::Scheduled {
+                kind: k,
+                input: i,
+                seq,
+            }) = records.get(pos)
+            else {
+                self.signals.stop(Stop::Diverged);
+                return Err(Halted);
+            };
+            if *k != kind.0 || i != input {
+                self.signals.stop(Stop::Diverged);
+                return Err(Halted);
+            }
+            let seq = *seq;
+            self.pos += 1;
+            let id = EffectId {
+                run: RunId(run),
+                seq: EffectSeq(seq),
+            };
+            return match self.records().get(self.pos) {
+                None => Ok(Handoff::Dispatch {
+                    id,
+                    result_bytes: PAGE_RECORD_MAX,
+                }),
+                Some(RunRecord::Resolved { .. }) => {
+                    let at = self.pos;
+                    self.pos += 1;
+                    match self.records().get(at) {
+                        Some(RunRecord::Resolved {
+                            completed: true,
+                            bytes,
+                        }) => Ok(Handoff::Replayed(Outcome::Completed(bytes))),
+                        Some(RunRecord::Resolved { bytes, .. }) => {
+                            Ok(Handoff::Replayed(Outcome::Failed(bytes)))
+                        }
+                        _ => Err(Halted),
+                    }
+                }
+                Some(RunRecord::Scheduled { .. }) => {
+                    self.signals.stop(Stop::Diverged);
+                    Err(Halted)
+                }
+            };
+        }
+        let seq = u32::try_from(
+            records
+                .iter()
+                .filter(|r| matches!(r, RunRecord::Scheduled { .. }))
+                .count()
+                + 1,
+        )
+        .unwrap_or(u32::MAX);
+        let record = self.run_mut().ok_or(Halted)?;
+        // HOST-ONLY (E4+aon)
+        record.records.push(RunRecord::Scheduled {
+            kind: kind.0,
+            input: input.to_vec(),
+            seq,
+        });
+        self.pos += 1;
+        let point = crash_point(self.records(), Boundary::AfterSchedule, None);
+        if self.fire(point) {
+            return Err(Halted);
+        }
+        Ok(Handoff::Dispatch {
+            id: EffectId {
+                run: RunId(run),
+                seq: EffectSeq(seq),
+            },
+            result_bytes: PAGE_RECORD_MAX,
+        })
+    }
+
+    fn resolve(&mut self, answer: Answer<'_>) -> Result<Outcome<'_>, Halted> {
+        let point = crash_point(self.records(), Boundary::BeforeResolve, None);
+        if self.fire(point) {
+            return Err(Halted);
+        }
+        let (completed, bytes) = match answer {
+            Answer::Completed(bytes) => (true, bytes.to_vec()),
+            Answer::Failed(bytes) => (false, bytes.to_vec()),
+            Answer::Exhausted => (false, Vec::new()),
+        };
+        let record = self.run_mut().ok_or(Halted)?;
+        // HOST-ONLY (E4+aon)
+        record.records.push(RunRecord::Resolved {
+            completed,
+            bytes: bytes.clone(),
+        });
+        self.pos += 1;
+        if completed {
+            let point = crash_point(self.records(), Boundary::AfterResolve, Some(&bytes));
+            if self.fire(point) {
+                return Err(Halted);
+            }
+        }
+        match self.records().last() {
+            Some(RunRecord::Resolved {
+                completed: true,
+                bytes,
+            }) => Ok(Outcome::Completed(bytes)),
+            Some(RunRecord::Resolved { bytes, .. }) => Ok(Outcome::Failed(bytes)),
+            _ => Err(Halted),
+        }
+    }
+
+    fn wait(&mut self, _spec: TimerSpec) -> Result<(), Halted> {
+        // A run keeps no deadlines.
+        self.signals.stop(Stop::Diverged);
+        Err(Halted)
+    }
+
+    fn continue_as_new(&mut self, input: &[u8]) -> Halted {
+        let seed = RunStart::decode(input).map(|start| start.seed);
+        if let (Some(run), Ok(seed)) = (self.run_mut(), seed) {
+            // HOST-ONLY (E4+aon)
+            run.records.clear();
+            run.input = input.to_vec();
+            run.segments.push(seed);
+        }
+        self.pos = 0;
+        Halted
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        None
+    }
+}
+
+/// The host's [`DevicePorts`]: the world doubles, the operator's
+/// schedule, and the item and snapshot stores.
+pub struct HostPortsDevice<'w> {
     signals: &'w Signals,
-    /// The model every goal run shares.
-    pub model: &'w mut dyn ModelBackend,
-    /// The device.
-    pub device: &'w mut FakeDevice,
-    /// The device fault plan.
-    pub faults: &'w mut FaultPlan,
+    model: &'w mut dyn ModelBackend,
+    device: &'w mut FakeDevice,
+    faults: &'w mut FaultPlan,
     // HOST-ONLY (E4+aon)
     inbox: BTreeMap<u16, InputPlan>,
     operator: BTreeMap<u64, Vec<Command>>,
     deliveries: BTreeMap<u64, Vec<(GoalId, Vec<u8>)>>,
     delivered: BTreeSet<u64>,
-    runs: BTreeMap<u64, HostRun>,
-    store: BTreeMap<(u64, u16), Vec<u8>>,
-    run_crash: Option<CrashPoint>,
+    items: BTreeMap<(u64, u16), Vec<u8>>,
+    chunks: BTreeMap<(u64, u8), Vec<u8>>,
+    goal: Option<GoalId>,
+    /// An empty inbox, for a run whose goal has none.
+    none: InputPlan,
+}
+
+impl HostPortsDevice<'_> {
+    /// The run harness's ports over the same doubles, with the selected
+    /// goal's inbox.
+    fn ports(&mut self) -> HostPorts<'_> {
+        let inputs = match self.goal {
+            Some(goal) => self.inbox.entry(goal.get()).or_default(),
+            None => &mut self.none,
+        };
+        HostPorts {
+            model: &mut *self.model,
+            device: &mut *self.device,
+            faults: &mut *self.faults,
+            inputs,
+            store: &mut self.chunks,
+            #[cfg(test)]
+            injected_outcome: None,
+        }
+    }
+}
+
+impl RunPorts for HostPortsDevice<'_> {
+    fn model(&mut self) -> &mut dyn ModelBackend {
+        &mut *self.model
+    }
+
+    fn tool(
+        &mut self,
+        effect: EffectId,
+        tool: ToolId,
+        digest: u64,
+        args: ToolArgs,
+        raw: &mut [u8],
+    ) -> Result<Attempt, Fault> {
+        self.ports().tool(effect, tool, digest, args, raw)
+    }
+
+    fn pin_is_output(&mut self, pin: Pin) -> bool {
+        self.ports().pin_is_output(pin)
+    }
+
+    fn read_back(&mut self, check: Check) -> u64 {
+        self.ports().read_back(check)
+    }
+
+    fn operator_input(&mut self, out: &mut [u8]) -> Result<Option<usize>, Fault> {
+        self.ports().operator_input(out)
+    }
+
+    fn store_chunk(&mut self, digest: u64, index: u8, chunk: &[u8]) -> Result<(), Fault> {
+        self.ports().store_chunk(digest, index, chunk)
+    }
+
+    fn load_chunk(&mut self, digest: u64, index: u8, out: &mut [u8]) -> Result<usize, Fault> {
+        self.ports().load_chunk(digest, index, out)
+    }
+}
+
+impl DevicePorts for HostPortsDevice<'_> {
+    fn sense(&mut self, beat: Beat) -> Result<Sense, WireError> {
+        let beat = beat.get();
+        // Deliveries land once, even if this SENSE is redelivered.
+        if self.delivered.insert(beat) {
+            for (goal, bytes) in self.deliveries.get(&beat).cloned().unwrap_or_default() {
+                self.inbox.entry(goal.get()).or_default().push(bytes);
+            }
+        }
+        let mut sense = Sense::at(self.signals.persistent());
+        for (goal, plan) in &self.inbox {
+            if plan.has_pending()
+                && let Some(goal) = GoalId::new(*goal)
+            {
+                sense.ready(goal)?;
+            }
+        }
+        for command in self.operator.get(&beat).into_iter().flatten() {
+            sense.command(*command)?;
+        }
+        Ok(sense)
+    }
+
+    fn select_goal(&mut self, goal: GoalId) {
+        self.goal = Some(goal);
+    }
+
+    fn store_item(&mut self, digest: u64, index: u16, item: &[u8]) -> Result<(), StoreFault> {
+        // HOST-ONLY (E4+aon)
+        self.items.insert((digest, index), item.to_vec());
+        Ok(())
+    }
+
+    fn load_item(&mut self, digest: u64, index: u16, out: &mut [u8]) -> Result<usize, StoreFault> {
+        let item = self
+            .items
+            .get(&(digest, index))
+            .ok_or(StoreFault::Unknown)?;
+        out.get_mut(..item.len())
+            .ok_or(StoreFault::Unknown)?
+            .copy_from_slice(item);
+        Ok(item.len())
+    }
+}
+
+/// The host dispatcher double: the product board dispatcher
+/// ([`Device`]) over the host's [`HostRuns`] and [`HostPortsDevice`].
+pub struct HostAgent<'w> {
+    ports: HostPortsDevice<'w>,
+    runs: HostRuns<'w>,
+    // HOST-ONLY (E4+aon): a `static` on the device.
+    state: Box<RunState>,
+    // HOST-ONLY (E4+aon)
     errors: Vec<String>,
 }
 
@@ -462,244 +823,105 @@ impl<'w> HostAgent<'w> {
         faults: &'w mut FaultPlan,
     ) -> Self {
         Self {
-            signals,
-            model,
-            device,
-            faults,
-            inbox: BTreeMap::new(),
-            operator: BTreeMap::new(),
-            deliveries: BTreeMap::new(),
-            delivered: BTreeSet::new(),
-            runs: BTreeMap::new(),
-            store: BTreeMap::new(),
-            run_crash: None,
+            ports: HostPortsDevice {
+                signals,
+                model,
+                device,
+                faults,
+                inbox: BTreeMap::new(),
+                operator: BTreeMap::new(),
+                deliveries: BTreeMap::new(),
+                delivered: BTreeSet::new(),
+                items: BTreeMap::new(),
+                chunks: BTreeMap::new(),
+                goal: None,
+                none: InputPlan::new(Vec::new()),
+            },
+            runs: HostRuns {
+                signals,
+                runs: BTreeMap::new(),
+                selected: None,
+                pos: 0,
+                armed: None,
+                unemit: false,
+                fired: 0,
+            },
+            state: Box::new(RunState::new()),
             errors: Vec::new(),
         }
     }
 
-    /// Deliver `command` in the [`wire::SENSE`] answer of `beat`.
+    /// Deliver `command` in the [`super::wire::SENSE`] answer of `beat`.
     pub fn command_at(&mut self, beat: u64, command: Command) {
         // HOST-ONLY (E4+aon)
-        self.operator.entry(beat).or_default().push(command);
+        self.ports.operator.entry(beat).or_default().push(command);
     }
 
     /// Queue `input` for `goal`'s parked run, arriving at `beat`.
     pub fn deliver_at(&mut self, beat: u64, goal: GoalId, input: &[u8]) {
         // HOST-ONLY (E4+aon)
-        self.deliveries
+        self.ports
+            .deliveries
             .entry(beat)
             .or_default()
             .push((goal, input.to_vec()));
     }
 
-    /// Fire `point` inside the next goal run the dispatcher drives.
+    /// Fire `point` inside the next goal run the dispatcher spawns.
     pub const fn crash_next_run(&mut self, point: CrashPoint) {
-        self.run_crash = Some(point);
+        self.runs.armed = Some(point);
     }
 
     /// The goal runs, by run id.
     #[must_use]
     pub fn run(&self, run: EsperRunId) -> Option<&HostRun> {
-        self.runs.get(&run.get())
+        self.runs.runs.get(&run.get())
     }
 
-    /// Runtime failures the dispatcher reported as failed activities.
+    /// Why activities failed, as the board dispatcher reported it.
     #[must_use]
     pub fn errors(&self) -> &[String] {
         &self.errors
     }
 
+    /// Crashes [`HostAgent::crash_next_run`] fired inside runs.
+    #[must_use]
+    pub const fn run_crashes(&self) -> usize {
+        self.runs.fired
+    }
+
     /// Stored checkpoint items.
     #[must_use]
     pub fn stored_items(&self) -> usize {
-        self.store.len()
+        self.ports.items.len()
     }
-
-    fn sense(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, String> {
-        let beat =
-            u64::from_le_bytes(<[u8; 8]>::try_from(input).map_err(|_| "sense input".to_string())?);
-        // Deliveries land once, even if this SENSE is redelivered.
-        if self.delivered.insert(beat) {
-            for (goal, bytes) in self.deliveries.get(&beat).cloned().unwrap_or_default() {
-                self.inbox.entry(goal.get()).or_default().push(bytes);
-            }
-        }
-        let mut sense = Sense::at(self.signals.persistent());
-        for (goal, plan) in &self.inbox {
-            if plan.has_pending()
-                && let Some(goal) = GoalId::new(*goal)
-            {
-                sense.ready(goal).map_err(|e| e.to_string())?;
-            }
-        }
-        for command in self.operator.get(&beat).into_iter().flatten() {
-            sense.command(*command).map_err(|e| e.to_string())?;
-        }
-        sense.encode(out).map_err(|e| e.to_string())
-    }
-
-    fn run_activity(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, String> {
-        let request = RunRequest::decode(input).map_err(|e| e.to_string())?;
-        let goal = request.goal();
-        let id = request.run();
-        if let RunRequest::Spawn { seed, .. } = request {
-            // HOST-ONLY (E4+aon): a redelivered spawn finds its run.
-            self.runs.entry(id.get()).or_insert_with(|| HostRun {
-                goal,
-                segments: vec![(seed, RunJournal::new(), None)],
-                harvest: None,
-            });
-        }
-        let record = self
-            .runs
-            .get_mut(&id.get())
-            .ok_or_else(|| "resume of an unknown run".to_string())?;
-        let inputs = self.inbox.entry(goal.get()).or_default();
-        let mut crash = self.run_crash.take();
-        let trace = loop {
-            let (seed, journal, handoff) = record
-                .segments
-                .last_mut()
-                .ok_or_else(|| "run without a segment".to_string())?;
-            let outcome = drive_segment(
-                seed,
-                journal,
-                &mut *self.model,
-                self.device,
-                self.faults,
-                inputs,
-                crash.take(),
-                handoff.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-            match outcome {
-                SegmentOutcome::Completed(trace) => break Some(trace),
-                SegmentOutcome::Suspended(_) => break None,
-                SegmentOutcome::Rollover(_, next) => {
-                    let child = next.child_seed(seed);
-                    // HOST-ONLY (E4+aon)
-                    record.segments.push((child, RunJournal::new(), Some(next)));
-                }
-            }
-        };
-        let report = match trace {
-            None => RunReport::Parked,
-            Some(trace) => {
-                let status = trace
-                    .terminal_status()
-                    .ok_or_else(|| "terminal without status".to_string())?;
-                if record.harvest.is_none() {
-                    record.harvest = Some(harvest(record, goal, id, &trace)?);
-                }
-                RunReport::Settled {
-                    status,
-                    refund_turns: trace.turns_remaining(),
-                    refund_mutations: trace.mutations_remaining(),
-                    harvest: record
-                        .harvest
-                        .as_ref()
-                        .map_or(0, |h| u8::try_from(h.len()).unwrap_or(u8::MAX)),
-                }
-            }
-        };
-        report.encode(out).map_err(|e| e.to_string())
-    }
-
-    fn harvest_activity(&self, input: &[u8], out: &mut [u8]) -> Result<usize, String> {
-        let (run, index) = wire::read_harvest_query(input).map_err(|e| e.to_string())?;
-        let entry = self
-            .runs
-            .get(&run.get())
-            .and_then(|r| r.harvest.as_ref())
-            .and_then(|h| h.get(usize::from(index)))
-            .ok_or_else(|| "no such harvest entry".to_string())?;
-        HarvestEntry(*entry).encode(out).map_err(|e| e.to_string())
-    }
-}
-
-/// Feed every segment's committed trace to a [`Harvester`].
-fn harvest(
-    record: &HostRun,
-    goal: GoalId,
-    run: EsperRunId,
-    last: &RunTrace,
-) -> Result<HarvestSet, String> {
-    let mut harvester = Harvester::new(Provenance {
-        goal: Some(goal),
-        run: Some(run),
-        beat: Beat::ZERO,
-    });
-    for (segment, (seed, journal, _)) in record.segments.iter().enumerate() {
-        let trace = RunTrace::from_journal(journal, seed).map_err(|e| e.to_string())?;
-        // Effect sequences restart per segment; keep them distinct.
-        let base = u32::try_from(segment).unwrap_or(0) << 24;
-        for event in trace.events() {
-            match event {
-                TraceEvent::ToolRequest { seq, tool, args } => {
-                    harvester.request(base | seq, ToolId::new(*tool), args);
-                }
-                TraceEvent::ToolObservation { seq, ok, payload } => {
-                    harvester.observation(base | seq, *ok, payload);
-                }
-                TraceEvent::Verification { seq, passed, .. } => {
-                    harvester.verification(base | seq, *passed);
-                }
-                _ => {}
-            }
-        }
-    }
-    let status = last
-        .terminal_status()
-        .ok_or_else(|| "terminal without status".to_string())?;
-    harvester
-        .finish(goal, status, last.summary().unwrap_or(&[]))
-        .map_err(|e| e.to_string())
 }
 
 impl ActivityDispatcher for HostAgent<'_> {
-    type Error = ();
+    type Error = Infallible;
 
     fn poll_dispatch(
         &mut self,
-        _task: &mut Context<'_>,
-        _id: EffectId,
+        task: &mut Context<'_>,
+        id: EffectId,
         kind: ActivityKind,
         input: &[u8],
         out: &mut [u8],
-    ) -> Poll<Result<Produced, ()>> {
-        let answered = match kind {
-            wire::SENSE => self.sense(input, out),
-            wire::RUN => self.run_activity(input, out),
-            wire::HARVEST => self.harvest_activity(input, out),
-            wire::STORE => wire::read_item_key(input).map_err(|e| e.to_string()).map(
-                |(digest, index, item)| {
-                    // HOST-ONLY (E4+aon)
-                    self.store.insert((digest, index), item.to_vec());
-                    0
-                },
-            ),
-            wire::LOAD => wire::read_item_key(input)
-                .map_err(|e| e.to_string())
-                .and_then(|(digest, index, _)| {
-                    let item = self
-                        .store
-                        .get(&(digest, index))
-                        .ok_or_else(|| "no such checkpoint item".to_string())?;
-                    out.get_mut(..item.len())
-                        .ok_or_else(|| "item over the page".to_string())?
-                        .copy_from_slice(item);
-                    Ok(item.len())
-                }),
-            _ => return Poll::Ready(Ok(Produced::Unserviceable)),
+    ) -> Poll<Result<Produced, Infallible>> {
+        let (polled, error) = {
+            let mut device = Device::new(&mut self.runs, &mut self.ports, &mut self.state);
+            let polled = device.poll_dispatch(task, id, kind, input, out);
+            (polled, device.last_error().map(ToString::to_string))
         };
-        Poll::Ready(match answered {
-            Ok(len) => Ok(Produced::Completed(len)),
-            Err(error) => {
-                // HOST-ONLY (E4+aon)
-                self.errors.push(error);
-                Err(())
-            }
-        })
+        if let Some(error) = error {
+            // HOST-ONLY (E4+aon)
+            self.errors.push(error);
+        }
+        if self.runs.unemit {
+            self.runs.unemit = false;
+            self.ports.model.unemit();
+        }
+        polled
     }
 }
 
@@ -800,4 +1022,237 @@ pub fn drive(
         }
     }
     Err(DriveError::TooManyBoots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::wire::{HarvestEntry, RunReport, RunRequest, harvest_query};
+    use crate::agent::{AgentSeed, run_id};
+    use crate::backend::{InferenceSettings, ScriptedBackend};
+    use esper_core::brief::Brief;
+    use esper_core::compact::Note;
+    use esper_core::memory::{Memory, recall};
+    use esper_core::state::TerminalStatus;
+    use waymaker_embassy::Decode;
+
+    const READ: &str = r#"CALL gpio_pin_read {"pin": 3}"#;
+    const ASK: &str = r#"ASK {"prompt": "which pin?", "schema": 1}"#;
+    const FINISH: &str = r#"FINISH {"status": "completed", "summary": "read pin 3"}"#;
+
+    fn backend(script: &[&str]) -> ScriptedBackend {
+        ScriptedBackend::new(
+            script.iter().map(|line| line.as_bytes().to_vec()).collect(),
+            InferenceSettings::briefed_settings(),
+        )
+    }
+
+    fn spawn(goal: u16, model: &ScriptedBackend) -> Vec<u8> {
+        let goal = GoalId::new(goal).unwrap();
+        let mut seed = AgentSeed::default_slice().template;
+        seed.id = run_id(goal, 0);
+        seed.model_bundle = model.bundle_id().0;
+        seed.brief = Some(Brief::compose(
+            &Note::from_bytes(b"watch pin 3").unwrap(),
+            &recall(&Memory::new(), goal),
+        ));
+        let mut buf = [0u8; PAGE_RECORD_MAX];
+        let n = RunRequest::Spawn { goal, seed }.encode(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn dispatch(agent: &mut HostAgent<'_>, kind: ActivityKind, input: &[u8]) -> Produced {
+        let mut out = [0u8; PAGE_RECORD_MAX];
+        let mut task = Context::from_waker(Waker::noop());
+        let id = EffectId {
+            run: RunId(1),
+            seq: EffectSeq(1),
+        };
+        match agent.poll_dispatch(&mut task, id, kind, input, &mut out) {
+            Poll::Ready(Ok(produced)) => produced,
+            Poll::Ready(Err(never)) => match never {},
+            Poll::Pending => panic!("the run halted"),
+        }
+    }
+
+    fn report(agent: &mut HostAgent<'_>, input: &[u8]) -> RunReport {
+        let mut out = [0u8; PAGE_RECORD_MAX];
+        let mut task = Context::from_waker(Waker::noop());
+        let id = EffectId {
+            run: RunId(1),
+            seq: EffectSeq(1),
+        };
+        let Poll::Ready(Ok(Produced::Completed(n))) =
+            agent.poll_dispatch(&mut task, id, wire_run(), input, &mut out)
+        else {
+            panic!("RUN did not complete: {:?}", agent.errors());
+        };
+        RunReport::decode(&out[..n]).unwrap()
+    }
+
+    const fn wire_run() -> ActivityKind {
+        crate::agent::wire::RUN
+    }
+
+    /// A redelivered `RUN` re-drives the same run from its own journal:
+    /// the same report, with nothing dispatched again (the script holds
+    /// one pass, so a second inference would fail).
+    #[test]
+    fn a_redelivered_run_settles_from_its_own_journal() {
+        let signals = Signals::new();
+        let mut model = backend(&[READ, FINISH]);
+        let request = spawn(1, &model);
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut faults);
+        let first = report(&mut agent, &request);
+        let RunReport::Settled {
+            status, harvest, ..
+        } = first
+        else {
+            panic!("expected a settled run");
+        };
+        assert_eq!(status, TerminalStatus::Completed);
+        assert_eq!(harvest, 2, "one observation and the outcome");
+        assert_eq!(report(&mut agent, &request), first);
+        assert!(agent.errors().is_empty(), "{:?}", agent.errors());
+    }
+
+    /// `HARVEST` reads the concluded run's entries, in order; past the
+    /// end it fails.
+    #[test]
+    fn harvest_reads_the_concluded_runs_entries() {
+        let signals = Signals::new();
+        let mut model = backend(&[READ, FINISH]);
+        let request = spawn(1, &model);
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut faults);
+        let _ = report(&mut agent, &request);
+        let run = run_id(GoalId::new(1).unwrap(), 0);
+        let mut out = [0u8; PAGE_RECORD_MAX];
+        let mut task = Context::from_waker(Waker::noop());
+        let id = EffectId {
+            run: RunId(1),
+            seq: EffectSeq(1),
+        };
+        let mut keys = Vec::new();
+        for index in 0..2 {
+            let Poll::Ready(Ok(Produced::Completed(n))) = agent.poll_dispatch(
+                &mut task,
+                id,
+                crate::agent::wire::HARVEST,
+                &harvest_query(run, index),
+                &mut out,
+            ) else {
+                panic!("HARVEST {index} failed");
+            };
+            keys.push(HarvestEntry::decode(&out[..n]).unwrap().0.key);
+        }
+        assert!(matches!(
+            keys[0],
+            esper_core::memory::MemoryKey::Observation { .. }
+        ));
+        assert!(matches!(
+            keys[1],
+            esper_core::memory::MemoryKey::Outcome { .. }
+        ));
+        assert_eq!(
+            dispatch(
+                &mut agent,
+                crate::agent::wire::HARVEST,
+                &harvest_query(run, 2)
+            ),
+            Produced::Failed(0)
+        );
+    }
+
+    /// A parked run reports `Parked`; it has no harvest yet; once its
+    /// input arrives, a `Resume` settles it.
+    #[test]
+    fn a_parked_run_resumes_when_its_input_arrives() {
+        let signals = Signals::new();
+        let mut model = backend(&[ASK, FINISH]);
+        let request = spawn(2, &model);
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut faults);
+        assert_eq!(report(&mut agent, &request), RunReport::Parked);
+        let goal = GoalId::new(2).unwrap();
+        let run = run_id(goal, 0);
+        assert_eq!(
+            dispatch(
+                &mut agent,
+                crate::agent::wire::HARVEST,
+                &harvest_query(run, 0)
+            ),
+            Produced::Failed(0),
+            "a parked run has no harvest"
+        );
+        agent.deliver_at(1, goal, br#"{"pin": 4}"#);
+        let _ = agent.ports.sense(Beat::new(1)).unwrap();
+        let mut resume = [0u8; PAGE_RECORD_MAX];
+        let n = RunRequest::Resume { goal, run }
+            .encode(&mut resume)
+            .unwrap();
+        assert!(matches!(
+            report(&mut agent, &resume[..n]),
+            RunReport::Settled {
+                status: TerminalStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    /// Resuming a run the device never spawned fails, with a reason.
+    #[test]
+    fn resuming_an_unknown_run_fails() {
+        let signals = Signals::new();
+        let mut model = backend(&[]);
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut faults);
+        let goal = GoalId::new(3).unwrap();
+        let mut resume = [0u8; PAGE_RECORD_MAX];
+        let n = RunRequest::Resume {
+            goal,
+            run: run_id(goal, 0),
+        }
+        .encode(&mut resume)
+        .unwrap();
+        assert_eq!(
+            dispatch(&mut agent, crate::agent::wire::RUN, &resume[..n]),
+            Produced::Failed(0)
+        );
+        assert_eq!(agent.errors().len(), 1);
+    }
+
+    /// Replay that reaches a different ending than the one recorded
+    /// fails closed instead of reporting either.
+    #[test]
+    fn a_terminal_that_disagrees_with_replay_fails_closed() {
+        let signals = Signals::new();
+        let mut model = backend(&[READ, FINISH]);
+        let request = spawn(1, &model);
+        let mut device = FakeDevice::new();
+        let mut faults = FaultPlan::new();
+        let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut faults);
+        let _ = report(&mut agent, &request);
+        let run = run_id(GoalId::new(1).unwrap(), 0);
+        if let Some(record) = agent.runs.runs.get_mut(&run.get())
+            && let Some((_, bytes)) = record.terminal.as_mut()
+            && let Some(last) = bytes.last_mut()
+        {
+            *last ^= 0x01;
+        }
+        assert_eq!(
+            dispatch(&mut agent, crate::agent::wire::RUN, &request),
+            Produced::Failed(0)
+        );
+        assert!(
+            agent.errors().iter().any(|e| e.contains("diverged")),
+            "{:?}",
+            agent.errors()
+        );
+    }
 }

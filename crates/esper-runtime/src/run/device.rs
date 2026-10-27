@@ -9,14 +9,21 @@
 //! answered** — live in one place. The host dispatcher double calls the
 //! same functions.
 
+use core::task::{Context, Poll};
+
 use esper_core::brief::Brief;
 use esper_core::decision::ToolArgs;
-use esper_core::ids::ToolId;
+use esper_core::ids::{Pin, RunId, ToolId};
 use esper_core::mask::{mask_bound, mask_report};
 use esper_core::registry::lookup_by_id;
+use waymaker_core::{ActivityKind, EffectId, EffectSeq, RunId as WaymakerRunId};
+use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::dispatch::Produced;
 
-use super::wire::{Fault, InferRequest, Inferred, Observed, ToolRequest};
+use super::wire::{
+    AskInput, AskRequest, Check, Fault, InferRequest, Inferred, MAX_ASK_INPUT, Observed, Probed,
+    SNAPSHOT_CHUNK, ToolRequest, Verified, VerifyRequest, read_snapshot_key,
+};
 use crate::agent::wire::WireError;
 use crate::backend::{
     BRIEFED_PROMPT_CAP, BackendError, ModelBackend, OUTPUT_CAP, PromptCtx, build_prompt,
@@ -263,6 +270,208 @@ pub fn parse_delay_outcome(outcome: &[u8]) -> Result<(u64, u64), RuntimeError> {
         .checked_sub(waited)
         .ok_or(RuntimeError::JournalCorrupt)?;
     Ok((t0, uptime))
+}
+
+/// What one tool attempt did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// A transient fault: the device was never touched; a later
+    /// attempt under the same effect may succeed.
+    Transient,
+    /// The device acted; its raw outcome is the first `len` bytes of
+    /// the buffer it was handed.
+    Done(usize),
+}
+
+/// The device ports a run's activities reach: the board's model, pins,
+/// clock, operator channel and snapshot store.
+///
+/// Implementations do the physical work only. [`RunDispatcher`] owns the
+/// rules that make an answer safe to record — decoding, argument
+/// re-validation, masking — so a board cannot skip them.
+pub trait RunPorts {
+    /// The model backend.
+    fn model(&mut self) -> &mut dyn ModelBackend;
+
+    /// Perform one attempt of a committed intent, writing the raw
+    /// outcome into `raw` (at most [`MAX_RAW_OUTCOME`] bytes).
+    ///
+    /// A redelivered `effect` must not act twice: return the first
+    /// attempt's outcome.
+    ///
+    /// # Errors
+    ///
+    /// The [`Fault`] to record (`EffectArgsMismatch` when `effect` was
+    /// seen with other arguments).
+    fn tool(
+        &mut self,
+        effect: EffectId,
+        tool: ToolId,
+        digest: u64,
+        args: ToolArgs,
+        raw: &mut [u8],
+    ) -> Result<Attempt, Fault>;
+
+    /// Whether `pin` is configured as an output (SPEC §5.2's device
+    /// rule for a write).
+    fn pin_is_output(&mut self, pin: Pin) -> bool;
+
+    /// The verifier's independent reading for `check`: the pin's level
+    /// (`1` high) read directly, or the clock in milliseconds.
+    fn read_back(&mut self, check: Check) -> u64;
+
+    /// The operator's typed input for the run being driven, written into
+    /// `out`, or `None` while none has arrived.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::BadInput`] when the input does not fit `out`.
+    fn operator_input(&mut self, out: &mut [u8]) -> Result<Option<usize>, Fault>;
+
+    /// Store one snapshot chunk under `(digest, index)`.
+    ///
+    /// # Errors
+    ///
+    /// The [`Fault`] to record when the store refuses.
+    fn store_chunk(&mut self, digest: u64, index: u8, chunk: &[u8]) -> Result<(), Fault>;
+
+    /// Load the snapshot chunk stored under `(digest, index)` into `out`.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::SnapshotMissing`] when there is none.
+    fn load_chunk(&mut self, digest: u64, index: u8, out: &mut [u8]) -> Result<usize, Fault>;
+}
+
+/// The run activities' dispatcher, over a board's [`RunPorts`]. Product
+/// code: the board, the emulated image and the host double all
+/// dispatch through it.
+pub struct RunDispatcher<'a, P: RunPorts + ?Sized> {
+    ports: &'a mut P,
+    /// The run being driven: the device deduplicates on `(run, seq)`.
+    run: RunId,
+}
+
+impl<'a, P: RunPorts + ?Sized> RunDispatcher<'a, P> {
+    /// A dispatcher for `run`'s activities over `ports`.
+    pub const fn new(ports: &'a mut P, run: RunId) -> Self {
+        Self { ports, run }
+    }
+
+    fn tool(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
+        let Ok(request) = ToolRequest::decode(input) else {
+            return fail(Fault::BadRequest, out);
+        };
+        let args = match bind(&request) {
+            Ok(args) => args,
+            Err(fault) => return fail(fault, out),
+        };
+        let effect = EffectId {
+            run: WaymakerRunId(self.run.get()),
+            seq: EffectSeq(request.seq),
+        };
+        let mut raw = [0u8; MAX_RAW_OUTCOME];
+        match self.ports.tool(
+            effect,
+            ToolId::new(request.tool),
+            request.digest,
+            args,
+            &mut raw,
+        ) {
+            Ok(Attempt::Transient) => transient(out),
+            Ok(Attempt::Done(len)) => match raw.get(..len) {
+                Some(raw) => observe(raw, out),
+                None => fail(Fault::OutcomeTooLarge, out),
+            },
+            Err(fault) => fail(fault, out),
+        }
+    }
+
+    fn probe(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
+        let pin = match input {
+            [pin] => Pin::new(*pin).ok(),
+            _ => None,
+        };
+        let Some(pin) = pin else {
+            return fail(Fault::BadRequest, out);
+        };
+        let output = self.ports.pin_is_output(pin);
+        produced((Probed { output }).encode(out), Fault::BadRequest, out)
+    }
+
+    fn verify(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
+        let Ok(request) = VerifyRequest::decode(input) else {
+            return fail(Fault::BadRequest, out);
+        };
+        let observed = self.ports.read_back(request.check);
+        produced((Verified { observed }).encode(out), Fault::BadRequest, out)
+    }
+
+    fn ask(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
+        if AskRequest::decode(input).is_err() {
+            return fail(Fault::BadRequest, out);
+        }
+        let mut buf = [0u8; MAX_ASK_INPUT];
+        match self.ports.operator_input(&mut buf) {
+            // No input yet: the activity stays outstanding, durably.
+            Ok(None) => Produced::Unserviceable,
+            Ok(Some(len)) => produced(
+                buf.get(..len)
+                    .ok_or(WireError::Invalid)
+                    .and_then(AskInput::new)
+                    .and_then(|answer| answer.encode(out)),
+                Fault::BadInput,
+                out,
+            ),
+            Err(fault) => fail(fault, out),
+        }
+    }
+
+    fn snapshot(&mut self, kind: ActivityKind, input: &[u8], out: &mut [u8]) -> Produced {
+        let Ok((digest, index, chunk)) = read_snapshot_key(input) else {
+            return fail(Fault::BadRequest, out);
+        };
+        if kind == super::wire::SNAP_STORE {
+            return match self.ports.store_chunk(digest, index, chunk) {
+                Ok(()) => Produced::Completed(0),
+                Err(fault) => fail(fault, out),
+            };
+        }
+        let mut buf = [0u8; SNAPSHOT_CHUNK];
+        match self.ports.load_chunk(digest, index, &mut buf) {
+            Ok(len) => match (buf.get(..len), out.get_mut(..len)) {
+                (Some(src), Some(dst)) => {
+                    dst.copy_from_slice(src);
+                    Produced::Completed(len)
+                }
+                _ => fail(Fault::BadRequest, out),
+            },
+            Err(fault) => fail(fault, out),
+        }
+    }
+}
+
+impl<P: RunPorts + ?Sized> ActivityDispatcher for RunDispatcher<'_, P> {
+    type Error = core::convert::Infallible;
+
+    fn poll_dispatch(
+        &mut self,
+        _task: &mut Context<'_>,
+        _id: EffectId,
+        kind: ActivityKind,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Poll<Result<Produced, Self::Error>> {
+        Poll::Ready(Ok(match kind {
+            super::wire::INFER => infer(self.ports.model(), input, out),
+            super::wire::PROBE => self.probe(input, out),
+            super::wire::TOOL => self.tool(input, out),
+            super::wire::VERIFY => self.verify(input, out),
+            super::wire::ASK => self.ask(input, out),
+            super::wire::SNAP_STORE | super::wire::SNAP_LOAD => self.snapshot(kind, input, out),
+            _ => Produced::Unserviceable,
+        }))
+    }
 }
 
 #[cfg(test)]

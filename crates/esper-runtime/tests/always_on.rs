@@ -83,6 +83,7 @@ struct Outcome {
     errors: Vec<String>,
     spawned: Vec<RunSeed>,
     segments: Vec<usize>,
+    run_crashes: usize,
     pin4: Level,
 }
 
@@ -122,7 +123,7 @@ fn simulate(
     }
     let mut state = AgentState::new();
     let log = PulseLog::new();
-    let (errors, spawned, segments) = {
+    let (errors, spawned, segments, run_crashes) = {
         let mut agent = HostAgent::new(&signals, &mut model, &mut device, &mut device_faults);
         plan(&mut agent);
         if let Some(point) = faults.run_crash {
@@ -144,12 +145,17 @@ fn simulate(
             for spawn in 0..64u64 {
                 let run = esper_core::ids::RunId::new((goal << 48) | (spawn << 16));
                 if let Some(record) = agent.run(run) {
-                    spawned.push(record.segments[0].0);
+                    spawned.push(record.segments[0]);
                     segments.push(record.segments.len());
                 }
             }
         }
-        (agent.errors().to_vec(), spawned, segments)
+        (
+            agent.errors().to_vec(),
+            spawned,
+            segments,
+            agent.run_crashes(),
+        )
     };
     Ok(Outcome {
         state,
@@ -162,6 +168,7 @@ fn simulate(
         errors,
         spawned,
         segments,
+        run_crashes,
         pin4: device.read(Pin::new(4).expect("pin")),
     })
 }
@@ -817,6 +824,7 @@ fn a_run_crash_inside_a_supervised_run_is_invisible_to_the_agent() {
             },
         )
         .unwrap_or_else(|e| panic!("{}: {e}", point.name()));
+        assert_eq!(got.run_crashes, 1, "{} never fired", point.name());
         assert_same(point.name(), &got, &baseline);
     }
     assert_eq!(baseline.writes.len(), 1, "the physical write happened once");

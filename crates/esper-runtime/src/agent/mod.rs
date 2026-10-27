@@ -36,6 +36,7 @@
 //! [`host::HostAgent`] drives [`crate::drive_segment`] over the test
 //! doubles.
 
+pub mod device;
 pub mod wire;
 
 #[cfg(feature = "host")]
@@ -552,9 +553,7 @@ async fn beat<D: ActivityDispatcher, J: Journal>(
         Pick::Idle => {}
         Pick::Spawn(goal) => {
             let reservation = state.checkpoint.ledger.reservation(goal)?;
-            let run = RunId::new(
-                (u64::from(goal.get()) << 48) | (u64::from(state.checkpoint.spawn_seq) << 16),
-            );
+            let run = run_id(goal, state.checkpoint.spawn_seq);
             let run_seed = spawn_seed(seed, state, goal, reservation, run)?;
             state.checkpoint.ledger.spawn(goal, run, reservation)?;
             state.checkpoint.spawn_seq = state
@@ -588,6 +587,20 @@ async fn beat<D: ActivityDispatcher, J: Journal>(
     state.pulse = Some(pulse);
     sink.pulse(&pulse);
     Ok(())
+}
+
+/// The id of `goal`'s run spawned at `spawn_seq`: the goal in the top
+/// 16 bits, the spawn sequence below it, the low 16 bits clear (a
+/// continued segment's id derives from its parent's, SPEC §20.6).
+#[must_use]
+pub const fn run_id(goal: GoalId, spawn_seq: u32) -> RunId {
+    RunId::new(((goal.get() as u64) << 48) | ((spawn_seq as u64) << 16))
+}
+
+/// The goal a supervised run serves, from its id ([`run_id`]).
+#[must_use]
+pub const fn goal_of(run: RunId) -> Option<GoalId> {
+    GoalId::new((run.get() >> 48) as u16)
 }
 
 /// The seed a spawn of `goal` takes: the template with the run id, the

@@ -39,7 +39,8 @@ supervisor (ADR 0002) already ran as a `no_std` `Ctx` workflow but its
   observation in that trace).
 - A device outcome must mask into 448 B (raw outcomes ≤ 256 B); a larger
   one fails closed.
-- `RunState` is 10,808 B on the host; the snapshot buffer (2,688 B) and
-  two compact folds dominate.
+- `RunState` is 10,808 B on the host (11,920 B once ADR 0004 moved the
+  harvester in); the snapshot buffer (2,688 B) and two compact folds
+  dominate.
 - The emulated image runs the workflow on two ARM cores. The ESP32-S3
   and the flash-backed journal remain unexercised in CI.

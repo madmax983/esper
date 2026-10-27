@@ -2681,24 +2681,25 @@ pinned by a regression test.)
 ### 21.7 Drivers
 
 **Device.** An Embassy task owns a `Ctx` over the flash-backed
-Waymaker journal and the device dispatcher (whose `RUN` drives the run
-engine) and awaits `supervise`. The executor polls it; the
+Waymaker journal and the board dispatcher (`agent::device::Device`,
+§23, whose `RUN` drives `run::run`) and awaits `supervise`. The executor polls it; the
 `TimerFuture` arms the board's `Alarm` so the core sleeps between
 beats. No async runtime, no heap.
 
 **Host (doubles only, `agent::host`).** `MemJournal` (an in-memory
 `Journal`: replay, redelivery under the original `EffectId`, both
 clocks, `continue_as_new`, crash injection at the four boundary kinds),
-`HostAgent` (the dispatcher: scheduled operator commands and input
-deliveries, runs through `drive_segment`, the `Harvester`, a checkpoint
-item store), and `drive` (polls with a no-op waker, advancing the
+`HostAgent` (the product board dispatcher, §23, over host doubles:
+scheduled operator commands and input deliveries, one in-memory journal
+per run with the run harness's crash points, a checkpoint item store),
+and `drive` (polls with a no-op waker, advancing the
 clocks whenever the deadline has not passed).
 
 ### 21.8 What this rung does not claim
 
-- **The board's `RUN` dispatcher is not written.** The run itself is a
-  firmware workflow (§22); wiring `RUN` to it over the board's flash
-  journal is the device crate's job.
+- **The board's flash binding is the board's.** The board dispatcher
+  (§23) is product code generic over a `RunStore`; plugging in
+  Waymaker's flash-backed façade bridge is the board crate's job.
 - **No wall-clock semantics beyond the declared clock.** A boot-clock
   heartbeat restarts its interval after a reset.
 - **Recall is recency, not relevance.**
@@ -2724,7 +2725,8 @@ the invariants run against it unchanged.
 The workflow walks the same normative machine (§3, `transition`). Its
 derived state — budget, monitor, effect allocator, counters, the
 pending call/intent/ask/finish, the parent fold and this segment's fold —
-is a caller-owned `RunState` (10,808 B on `x86_64`, pinned ≤ 11 KiB),
+is a caller-owned `RunState` (11,920 B on `x86_64` with the harvester
+of §23.3, pinned ≤ 12 KiB),
 reset on every boot. Recovery is Waymaker replay: the workflow runs
 again from its input and every recorded answer is handed back, so the
 machine lands exactly where the committed prefix left it.
@@ -2802,3 +2804,86 @@ digest.
   emulated run uses a scripted model double.
 - **RAM is measured on the host only** (`RunState`); board figures
   await the board.
+
+## 23. The board dispatcher
+
+`agent::device::Device` is the dispatcher behind the supervisor (§21)
+on the device: product code, `no_std`, allocation-free, compiled into
+the firmware. It serves `SENSE`, `RUN`, `HARVEST`, `STORE` and `LOAD`
+over two board traits (ADR 0004):
+
+- **`RunStore`** — one Waymaker `Journal` per run. `select(run, start)`
+  creates a run's journal from its `RunStart` the first time and finds
+  it after; `input()` is the current segment's input (it changes when
+  the run continues as new); `boot()` rewinds and lends the journal;
+  `terminal()` / `conclude()` read and write the terminal record. On the
+  board the journals are flash-backed behind Waymaker's façade bridge
+  (`waymaker-drive` + `waymaker-facade-demo::Bridge`, not yet published
+  to crates.io, so the binding lives in the board crate).
+- **`DevicePorts: RunPorts`** — the run's ports (§23.2) plus `sense`,
+  `select_goal` (route operator input to the goal's inbox), and the
+  checkpoint item store.
+
+### 23.1 `RUN` is a nested workflow
+
+A `RUN` dispatch selects the run (spawn: create from the committed seed;
+resume: find) and drives `run::run` over its journal inside the
+supervisor's activity, with a caller-owned `RunState`. The run's future
+is rebuilt on every poll and replays its journal, so a redelivered `RUN`
+re-drives the same run and never starts a second one. A segment that
+continues as new is followed into the next (at most 64).
+
+| The run… | The `RUN` answer |
+|---|---|
+| concludes | `Settled` (status, unspent turns and mutations, harvest count); the terminal record is written, or — on a redelivery — must equal the recorded one (`ReplayDiverged` otherwise) |
+| waits for operator input | `Parked` |
+| halted (its journal stopped this boot, or the world is still working) | nothing: `Poll::Pending`, the answer stays outstanding |
+| faults | failed, without a payload; the supervisor settles a storage fault |
+
+`HARVEST(run, index)` replays the concluded run to its end and answers
+entry `index` of the workflow's own harvest. A run's goal is read from
+its id (`agent::run_id` / `agent::goal_of`).
+
+### 23.2 One run dispatcher
+
+`run::device::RunDispatcher` is the only dispatcher for the run's
+activities. It owns decoding, argument re-validation and masking; a
+board's `RunPorts` does only the physical work (the model, one tool
+attempt — deduplicated on `(run, seq)` — the pin direction, the
+independent read-back, operator input, snapshot chunks). The board, the
+emulated image and the host double all dispatch through it.
+
+### 23.3 Harvest moves into the run
+
+On the device a segment's records are retired by `continue_as_new`, so
+the dispatcher cannot re-read them afterwards. The run workflow feeds a
+`Harvester` as effects commit (request, observation, verification) —
+rebuilt on replay like every other piece of `RunState` — and at a
+rollover seals it and stores the kept entries as snapshot items
+(`HARVEST_ITEM_BASE` up, one page each); the child resumes from them.
+The result equals one harvester fed every segment's events (pinned in
+`esper-core`), which is what the host computed before.
+
+### 23.4 Evidence
+
+- The whole always-on suite (17 tests, including the crash sweep at
+  every supervisor boundary and every run crash point inside a
+  supervised run, each proven to fire) runs on `Device` via the host
+  double; the board dispatcher's own contract — redelivery settles from
+  the run's journal, harvest by index, park and resume, unknown runs,
+  terminal divergence — has direct tests.
+- The emulated image's `agent` stage runs `supervise` + `Device` +
+  `run::run` on Cortex-M3 and Cortex-M4: an operator command adds a
+  goal, the beat spawns its run, a reset lands after the run's write
+  acted and before its answer was recorded, and the beat settles the
+  goal and harvests memory with exactly one physical write; both cores
+  agree with the host. Mutation-checked.
+
+### 23.5 What this does not claim
+
+- **Not the board's flash.** The board crate supplies the flash-backed
+  `RunStore`; this repository proves the dispatcher over RAM journals.
+- **One run journal per run, kept until the board reclaims it.**
+  Reclaiming a settled run's journal (after its harvest is read) is the
+  board store's policy.
+

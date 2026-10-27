@@ -49,16 +49,18 @@ verification, per-segment journal ownership, and the
 - `src/run/mod.rs` — SPEC §22: **the run, in the firmware build.**
   `run` is an `async fn` over `waymaker_embassy::Ctx` walking the
   normative machine; every world touch is an activity; state is the
-  caller-owned `RunState` (pinned ≤ 11 KiB). The 80% rollover folds
+  caller-owned `RunState` (pinned ≤ 12 KiB; it carries the run's
+  `Harvester`, SPEC §23.3). The 80% rollover folds
   frame by frame, stores the snapshot in chunks and
   `continue_as_new`s; the failed-path guard is in `authorize_call`.
 - `src/run/wire.rs` — the run's activity kinds (`INFER`, `PROBE`,
   `TOOL`, `VERIFY`, `ASK`, `SNAP_STORE`, `SNAP_LOAD`), `RunStart`,
   `TerminalRecord`, `Fault`; every maximum `const`-asserted ≤ 480.
-- `src/run/device.rs` — the dispatcher's product half: `infer`
-  (prompt rendering + backend), `bind` (re-validation), `observe`
-  (mask before answering), `validate_ask_input`,
-  `parse_delay_outcome`.
+- `src/run/device.rs` — the run's dispatcher: `RunDispatcher` over a
+  board's `RunPorts` (model, one tool attempt, pin direction,
+  read-back, operator input, snapshot chunks) — it alone decodes,
+  re-validates (`bind`) and masks (`observe`) — plus `infer`,
+  `validate_ask_input`, `parse_delay_outcome`.
 - `src/run/host.rs` — HOST-ONLY: the journal double with the crash
   point → boundary table, the dispatcher over the world doubles,
   `drive_segment` / `drive_run` / `drive_run_with_reset`, the derived
@@ -75,9 +77,15 @@ verification, per-segment journal ownership, and the
   `RUN`, `HARVEST`, `STORE`, `LOAD`) and page-bounded codecs
   (`Sense`/`Command`, `RunRequest`/`RunReport`, `HarvestEntry`, item
   keys). Every maximum is `const`-asserted `≤ PAGE_RECORD_MAX` (480).
+- `src/agent/device.rs` — SPEC §23: **the board dispatcher**, product
+  code. `Device` serves `SENSE`/`RUN`/`HARVEST`/`STORE`/`LOAD` over a
+  `RunStore` (one Waymaker journal per run; flash on the board) and
+  `DevicePorts`; `RUN` drives `run::run` as a nested workflow.
 - `src/agent/host.rs` — HOST-ONLY doubles: `MemJournal` (replay,
   redelivery, both clocks, `continue_as_new`, `CrashAt` injection),
-  `HostAgent` (dispatcher over `drive_segment`), `PulseLog`, `drive`.
+  `HostAgent` (the product `Device` over `HostRuns` +
+  `HostPortsDevice`, run crash points armed per spawn), `PulseLog`,
+  `drive`.
 - `src/journal.rs` — HOST-ONLY: `Journal` holds a segment's Waymaker
   records; `Frame` is the golden-trace view **derived** from them.
   Waymaker's journal is the durable state.
@@ -238,8 +246,8 @@ or an operator queue directly.
 recorded. Harvested entries are masked by the `Harvester`.
 
 **At least once.** A redelivered `RUN` names a run the dispatcher
-already holds: it re-drives that run from its own journal (the engine
-replays the terminal) — never a fresh one.
+already holds: `Device` re-drives that run from its own journal (replay
+reaches the recorded terminal, which must match) — never a fresh one.
 
 **Briefs.** A spawned seed carries `brief: Some(..)` and
 `InferenceSettings::briefed_settings()` (1536-byte prompt). The brief
