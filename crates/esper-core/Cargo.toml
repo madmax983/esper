@@ -3,7 +3,7 @@ name = "esper-core"
 version = "0.1.0"
 edition = "2024"
 description = "Esper E0/E1 harness core: state machine, decision decoder, budgets, monitor. no_std, allocation-free."
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 thiserror = "2"

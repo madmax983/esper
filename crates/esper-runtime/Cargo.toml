@@ -3,7 +3,7 @@ name = "esper-runtime"
 version = "0.1.0"
 edition = "2024"
 description = "Esper E0/E1 runtime: durable ReAct workflow over Waymaker, with host-only scripted model, fake device, independent verifier, and fault injector."
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["host"]

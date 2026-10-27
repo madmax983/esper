@@ -3,7 +3,7 @@ name = "esper-eval"
 version = "0.1.0"
 edition = "2024"
 description = "Esper E0/E1 eval: host-only golden-fixture runner, fault injector, scoring."
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Workspace siblings: the runtime under test and its core types.
