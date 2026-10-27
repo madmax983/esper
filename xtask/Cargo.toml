@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+description = "Esper's host-only task runner: `cargo xtask emulate` links the firmware image and boots it under QEMU."
+license = "MIT"
+publish = false
+
+# Host-only tooling: it spawns processes and reads files. The firmware
+# crates never depend on it.
+[dependencies]
+# The harness runs the emulated image's workload on the host as a third
+# machine, so the digest both cores must reach is computed, not
+# transcribed.
+esper-core = { path = "../crates/esper-core" }
+esper-runtime = { path = "../crates/esper-runtime" }
+waymaker-embassy = "0.1.0"
+
+[lints]
+workspace = true

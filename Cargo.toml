@@ -4,6 +4,8 @@ members = [
     "crates/esper-core",
     "crates/esper-runtime",
     "crates/esper-eval",
+    "crates/esper-emu",
+    "xtask",
 ]
 resolver = "2"
 

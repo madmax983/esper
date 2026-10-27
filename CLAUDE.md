@@ -50,6 +50,12 @@ cargo clippy --workspace --all-targets -- -D warnings      # pedantic + nursery
 cargo test --workspace
 cargo check -p esper-runtime --no-default-features         # the firmware build
 RUSTDOCFLAGS="-D missing-docs" cargo doc --workspace --no-deps
+cargo xtask emulate                                        # links and boots the image under QEMU
 ```
+
+CI (`.github/workflows/ci.yml`) runs these plus release-mode tests and
+bare-metal builds for `thumbv6m`/`thumbv7m`/`thumbv7em-none-eabi`. The
+emulated boot needs `qemu-system-arm`; it boots `crates/esper-emu` on a
+Cortex-M3 and a Cortex-M4 and requires both to agree with the host.
 
 Do not publish any crate (Mark's call).

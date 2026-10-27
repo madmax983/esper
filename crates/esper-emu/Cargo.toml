@@ -1,0 +1,37 @@
+[package]
+name = "esper-emu"
+version = "0.1.0"
+edition = "2024"
+description = "Esper firmware linked, started and run under QEMU so the harness executes on the instruction sets it is written for. An execution fixture: never published, never shipped, never a substitute for a board."
+license = "MIT"
+publish = false
+
+# Behind `required-features`: without it `cargo build --workspace` and
+# `cargo clippy --all-targets` would try to link a `#![no_main]` firmware
+# binary for the host, where there is no reset vector to place.
+[[bin]]
+name = "esper-emu"
+path = "src/main.rs"
+required-features = ["emu"]
+
+[dependencies]
+# The subjects: the firmware crates, with no `host` feature.
+esper-core = { path = "../esper-core", optional = true }
+esper-runtime = { path = "../esper-runtime", default-features = false, optional = true }
+# The façade's `Decode`, for reading a `SENSE` answer the way the
+# supervisor does.
+waymaker-embassy = { version = "0.1.0", optional = true }
+
+# The reset vector, the vector table, and the semihosting channel the
+# harness reads. Target-gated so no host build ever sees them.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m-rt = "0.7"
+cortex-m-semihosting = "0.5"
+
+[features]
+default = []
+# Builds the binary at all. `cargo xtask emulate` always passes it.
+emu = ["dep:esper-core", "dep:esper-runtime", "dep:waymaker-embassy"]
+
+[lints]
+workspace = true

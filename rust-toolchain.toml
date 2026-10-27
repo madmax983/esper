@@ -1,0 +1,18 @@
+# Pinned rather than floating. The workspace denies clippy's `pedantic` and
+# `nursery` groups and CI runs with `-D warnings`; `nursery` gains lints
+# every six weeks, so a floating channel turns an unrelated pull request
+# red for a lint nobody in the change ever saw. Bump this deliberately,
+# with the clippy fixes in the same commit.
+#
+# `targets` is pinned here rather than installed by a CI step so a local
+# checkout runs the firmware builds too. `thumbv6m-none-eabi` (Cortex-M0)
+# is Waymaker's budget architecture and is built; `thumbv7m-none-eabi`
+# (Cortex-M3) and `thumbv7em-none-eabi` (Cortex-M4) are built and booted
+# under QEMU by `cargo xtask emulate`. The ESP32-S3's
+# `xtensa-esp32s3-none-elf` exists only in the Espressif fork toolchain,
+# which no channel this file can name ships.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv6m-none-eabi", "thumbv7m-none-eabi", "thumbv7em-none-eabi"]
+profile = "minimal"

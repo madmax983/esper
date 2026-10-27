@@ -127,7 +127,20 @@ cargo check -p esper-runtime --no-default-features      # 4. no_std firmware cor
 RUSTDOCFLAGS="-D missing-docs" cargo doc --workspace --no-deps   # 5. public API docs
 cargo test -p esper-runtime --test crash_matrix          # 6. crash matrix
 cargo test -p esper-eval                                # 7. fixture runner
+cargo xtask emulate                                     # 8. link + boot under QEMU
 ```
+
+Gate 8 needs `qemu-system-arm`. It links `crates/esper-emu` (a
+`cortex-m-rt` image with 512 KiB of RAM, about the ESP32-S3's SRAM)
+for a Cortex-M3 and a Cortex-M4, boots both, and requires each core to
+pass every stage — briefed prompt, tiny-backend inference, decode,
+secret masking, item-wise checkpoint restore, `SENSE` codec — with the
+same digest the workload computes on the host. CI
+(`.github/workflows/ci.yml`) runs all eight, release-mode tests, and
+bare-metal builds of the firmware crates for
+`thumbv6m`/`thumbv7m`/`thumbv7em-none-eabi`. The toolchain and targets
+are pinned in `rust-toolchain.toml`. QEMU is not an S3: the Xtensa
+target needs the Espressif fork toolchain, which no clean runner has.
 
 Test counts (E4+aon): 443 hand-written test functions — 195 in
 `esper-core` (45 of them E4+aon: the exhaustive 8×10 goal
