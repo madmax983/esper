@@ -15,7 +15,7 @@ use esper_core::beat::Beat;
 use esper_core::decision::{Level, ToolArgs};
 use esper_core::goal::{Cadence, Envelope, GoalId};
 use esper_core::ids::{Pin, RunId, ToolId};
-use esper_runtime::agent::device::{Device, DevicePorts, RunStore, StoreFault};
+use esper_runtime::agent::device::{Device, DevicePorts, RunBody, RunStore, StoreFault};
 use esper_runtime::agent::wire::{Command, PAGE_RECORD_MAX, Sense, WireError};
 use esper_runtime::agent::{AgentSeed, AgentState, MAX_START_BYTES, Pulse, PulseSink, supervise};
 use esper_runtime::run::device::{Attempt, RunDispatcher, RunPorts};
@@ -418,8 +418,6 @@ pub struct EmuRuns {
 }
 
 impl RunStore for EmuRuns {
-    type Journal = EmuJournal;
-
     fn select(&mut self, run: RunId, start: Option<&[u8]>) -> Result<(), StoreFault> {
         match self.selected {
             Some(selected) if selected == run.get() => Ok(()),
@@ -451,9 +449,13 @@ impl RunStore for EmuRuns {
         Ok(input.len())
     }
 
-    fn boot(&mut self) -> &mut EmuJournal {
+    fn boot(&mut self, body: &mut dyn RunBody) -> Result<(), StoreFault> {
         self.journal.pos = 0;
-        &mut self.journal
+        let mut out = [0u8; PAGE_RECORD_MAX];
+        // `conclude` records the terminal record: what the body returns
+        // is the dispatcher's to settle.
+        let _end = body.drive(&mut self.journal, &mut out);
+        Ok(())
     }
 
     fn terminal(&self, out: &mut [u8]) -> Option<(bool, usize)> {

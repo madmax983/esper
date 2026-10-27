@@ -37,7 +37,10 @@ Waymaker workflow, shipped on the device (target: ESP32-S3,
   `async fn`s over `Ctx` in the firmware build, and `agent::device::Device`
   drives one from the other over a board's `RunStore` and `DevicePorts`
   (SPEC §21–23, ADR 0002–0004). A board supplies those two traits —
-  never its own dispatcher. `journal.rs` (the derived `Frame`
+  never its own dispatcher. The ESP32-S3's are `crates/esper-board`
+  (SPEC §24, ADR 0005): every journal a Waymaker bank pair driven by
+  `waymaker_drive::Driver` and lent through `waymaker_bridge::Bridge`;
+  `boards/esp32s3` is glue only. `journal.rs` (the derived `Frame`
   view), `world.rs` and `run::host` / `agent::host` are host-only
   doubles and harnesses — never product logic.
 
@@ -54,6 +57,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings      # pedantic + nursery
 cargo test --workspace
 cargo check -p esper-runtime --no-default-features         # the firmware build
+cargo check -p esper-board --no-default-features           # the board, without its RAM chip
 RUSTDOCFLAGS="-D missing-docs" cargo doc --workspace --no-deps
 cargo xtask emulate                                        # links and boots the image under QEMU
 ```
@@ -62,5 +66,18 @@ CI (`.github/workflows/ci.yml`) runs these plus release-mode tests and
 bare-metal builds for `thumbv6m`/`thumbv7m`/`thumbv7em-none-eabi`. The
 emulated boot needs `qemu-system-arm`; it boots `crates/esper-emu` on a
 Cortex-M3 and a Cortex-M4 and requires both to agree with the host.
+CI's `board` job installs Espressif's toolchain with `espup` and builds
+`boards/esp32s3` for `xtensa-esp32s3-none-elf`; locally, without that
+toolchain, lint the image against the ESP32-C3 on the pinned one:
+
+```bash
+cd boards/esp32s3
+cargo +1.97 clippy --no-default-features --features esp32c3 --target riscv32imc-unknown-none-elf -- -D warnings
+```
+
+Every Waymaker crate comes from crates.io, `waymaker-drive` and
+`waymaker-bridge` included. Never mix a git source with a registry one:
+the types would not unify. Bump them together, in the root workspace and
+in `boards/esp32s3` (a workspace of its own).
 
 Do not publish any crate (Mark's call).

@@ -80,7 +80,10 @@ verification, per-segment journal ownership, and the
 - `src/agent/device.rs` — SPEC §23: **the board dispatcher**, product
   code. `Device` serves `SENSE`/`RUN`/`HARVEST`/`STORE`/`LOAD` over a
   `RunStore` (one Waymaker journal per run; flash on the board) and
-  `DevicePorts`; `RUN` drives `run::run` as a nested workflow.
+  `DevicePorts`; `RUN` drives `run::run` as a nested workflow. The store
+  lends a journal per boot to a `RunBody` (`boot(body)`, answering
+  `BodyEnd`) — a flash driver owns its boot loop, so the store calls
+  the run (`esper-board`, SPEC §24).
 - `src/agent/host.rs` — HOST-ONLY doubles: `MemJournal` (replay,
   redelivery, both clocks, `continue_as_new`, `CrashAt` injection),
   `HostAgent` (the product `Device` over `HostRuns` +

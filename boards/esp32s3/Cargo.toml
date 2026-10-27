@@ -1,0 +1,65 @@
+[package]
+name = "esper-s3"
+version = "0.1.0"
+edition = "2024"
+description = "The ESP32-S3 image: Esper's supervisor and runs on the chip's SPI flash, its GPIOs and its UART. Glue only — the product logic is esper-board."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A workspace of its own: the Espressif toolchain and `build-std` are this
+# image's alone, and the root workspace's host builds never see esp-hal.
+[workspace]
+
+[[bin]]
+name = "esper-s3"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+esper-board = { path = "../../crates/esper-board", default-features = false }
+esper-core = { path = "../../crates/esper-core" }
+esper-runtime = { path = "../../crates/esper-runtime", default-features = false }
+waymaker-core = "0.1.0"
+waymaker-drive = "0.1.0"
+esp-hal = { version = "1.2.2", features = ["unstable"] }
+esp-storage = { version = "0.10.0", features = ["embedded-storage"] }
+esp-backtrace = { version = "0.20.0", features = ["panic-handler", "println"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["critical-section", "jtag-serial"] }
+esp-bootloader-esp-idf = { version = "0.6.0" }
+embedded-storage = "0.3.1"
+
+[features]
+default = ["esp32s3"]
+# The board this image is for.
+esp32s3 = [
+    "esp-hal/esp32s3",
+    "esp-storage/esp32s3",
+    "esp-backtrace/esp32s3",
+    "esp-println/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+]
+# A compile check on stable Rust, where the Xtensa toolchain is not
+# installed: the same glue against the ESP32-C3's RISC-V core. Never
+# flashed; the pin map below names C3 pins only so that it compiles.
+esp32c3 = [
+    "esp-hal/esp32c3",
+    "esp-storage/esp32c3",
+    "esp-backtrace/esp32c3",
+    "esp-println/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+]
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
+
+# The root workspace's lints, repeated: this is a workspace of its own.
+[lints.clippy]
+pedantic = "deny"
+nursery = "deny"

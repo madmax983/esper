@@ -111,6 +111,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
+name = "embedded-storage"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c815b3ed4213d85d6cfd274b871f430c0681084e28dfd4a537877f47f844ec83"
+
+[[package]]
+name = "esper-board"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "esper-core",
+ "esper-runtime",
+ "thiserror",
+ "waymaker-bridge",
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+ "waymaker-flash",
+]
+
+[[package]]
 name = "esper-core"
 version = "0.1.0"
 dependencies = [
@@ -418,10 +439,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "waymaker-bridge"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2248b62b34dfc393596e83d32bc353a26fa6b5f838bd3633ca6dddf95d245365"
+dependencies = [
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+]
+
+[[package]]
 name = "waymaker-core"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7a87f8767aca4143ed665476a743b65c03991863f5e859a790974b5fba1044e"
+
+[[package]]
+name = "waymaker-drive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adf32618a5131efadb1794b11f1f9819934310df2b6e14347a06a54d1adcb169"
+dependencies = [
+ "waymaker-core",
+ "waymaker-flash",
+]
 
 [[package]]
 name = "waymaker-embassy"

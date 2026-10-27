@@ -124,6 +124,7 @@ cargo fmt --all -- --check                              # 1. format
 cargo clippy --workspace --all-targets -- -D warnings   # 2. lint (pedantic + nursery)
 cargo test --workspace                                  # 3. full test suite
 cargo check -p esper-runtime --no-default-features      # 4. no_std firmware core
+cargo check -p esper-board --no-default-features        #    and the board crate
 RUSTDOCFLAGS="-D missing-docs" cargo doc --workspace --no-deps   # 5. public API docs
 cargo test -p esper-runtime --test crash_matrix          # 6. crash matrix
 cargo test -p esper-eval                                # 7. fixture runner
@@ -143,7 +144,12 @@ same digest the workload computes on the host. CI
 bare-metal builds of the firmware crates for
 `thumbv6m`/`thumbv7m`/`thumbv7em-none-eabi`. The toolchain and targets
 are pinned in `rust-toolchain.toml`. QEMU is not an S3: the Xtensa
-target needs the Espressif fork toolchain, which no clean runner has.
+target needs the Espressif fork toolchain. CI's `board` job installs it
+with `espup` and builds the real image, `boards/esp32s3` (SPEC §24):
+`esper-board` — the supervisor and its runs on Waymaker bank pairs in
+the S3's SPI flash, the item logs, the UART operator channel, the six
+tools over eight GPIOs — swept on the host under a power cut before and
+inside every storage mutation.
 
 Test counts (E4+aon): 443 hand-written test functions — 195 in
 `esper-core` (45 of them E4+aon: the exhaustive 8×10 goal
@@ -154,7 +160,7 @@ truncation, bit-flip, and item-wise restore sweeps), 163 in
 `esper-runtime` (21 of them E4+aon, including the 17-test supervisor
 suite and its crash matrix), 63 in `esper-eval`, 22 in
 `esper-protocol` — plus one generated test per golden fixture;
-`cargo test --workspace` runs 496 (E4+aon, the SPEC §22 run port — reset sweep, crash-point and page-bound tests, run codecs — and the SPEC §23 board dispatcher). Zero warnings from clippy
+`cargo test --workspace` runs 514 (E4+aon, the SPEC §22 run port — reset sweep, crash-point and page-bound tests, run codecs — the SPEC §23 board dispatcher, and the SPEC §24 board). Zero warnings from clippy
 (pedantic + nursery, denied workspace-wide). All crates target Rust
 edition 2024.
 
@@ -281,8 +287,8 @@ Things this environment cannot verify, stated plainly:
 - **E4+aon on the board.** The supervisor, the run (SPEC §22) and the
   board dispatcher that drives one from the other (SPEC §23) are all
   `no_std` and run together on two emulated ARM cores. The
-  flash-backed `RunStore` is the board crate's: Waymaker's façade
-  bridge is not published to crates.io.
+  flash-backed `RunStore` is the board crate's (SPEC §24), over
+  Waymaker's published driver and bridge.
   A boot-clock heartbeat restarts its interval after a reset; only a
   persistent-clock heartbeat survives power loss. Recall is
   recency-ordered, not relevance-ranked. One run at a time.
@@ -313,7 +319,7 @@ Things this environment cannot verify, stated plainly:
 - **Coverage tooling unavailable.** `cargo-llvm-cov` and
   `cargo-tarpaulin` are not installed (on 2026-10-27 the install was
   not permitted in the sandbox). The SPEC's ≥85% gate is therefore
-  unmeasured here. The suite runs 496 tests and the contract surface
+  unmeasured here. The suite runs 514 tests and the contract surface
   is exercised by the golden trajectories and the agent crash matrix,
   but line coverage is an open number.
 - **No mechanized proofs.** The user's SPEC-PROOF step names Verus; no
