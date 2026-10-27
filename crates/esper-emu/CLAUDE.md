@@ -10,6 +10,10 @@ directly as its oracle).
 
 ## Rules
 
+- **`src/workload.rs`** holds the `run` stage's doubles (a
+  fixed-capacity journal, an 8-pin device, a scripted model) and drives
+  `esper_runtime::run::run` through one reset. `xtask` includes it next
+  to `boot.rs`; keep both target-independent.
 - **`src/boot.rs` is target-independent.** It runs on the host as the
   oracle and on each core. No `cfg(target_arch)` in it; anything
   ARM-specific lives in `src/arm.rs`.

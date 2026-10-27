@@ -1327,8 +1327,8 @@ Rung E3 puts a real model interface behind the engine's `Infer`
 step. Two backends implement one object-safe trait: the scripted host
 backend (the E0/E1 `ScriptedModel` behavior, formalized) and the tiny
 local backend (a distillation stand-in: a recorded prompt→line table
-keyed by the prompt fingerprint, ADR 0001). The engine crew owns the rewiring of
-`engine.rs` to this interface; this section is the contract they code
+keyed by the prompt fingerprint, ADR 0001). The engine (since §22 the
+`run` workflow's `INFER` activity) codes
 against. Nothing here changes settled sections; deltas are called out
 as ambiguity resolutions in §18.10.
 
@@ -2696,9 +2696,9 @@ clocks whenever the deadline has not passed).
 
 ### 21.8 What this rung does not claim
 
-- **The run engine is still host-only.** `RUN` on the board needs the
-  engine port (`esper-device`); the supervisor itself is
-  firmware-clean today and compiled into the firmware build.
+- **The board's `RUN` dispatcher is not written.** The run itself is a
+  firmware workflow (§22); wiring `RUN` to it over the board's flash
+  journal is the device crate's job.
 - **No wall-clock semantics beyond the declared clock.** A boot-clock
   heartbeat restarts its interval after a reset.
 - **Recall is recency, not relevance.**
@@ -2709,3 +2709,96 @@ clocks whenever the deadline has not passed).
 - **RAM is measured on the host only.** `AgentState` is 7,384 B and
   the `supervise` future 2,280 B on `x86_64` (pinned by test); the
   Xtensa figures await the board measurement.
+
+## 22. The run as a Waymaker workflow (firmware port)
+
+The run engine is no longer a host-only loop over a private journal.
+`run::run` is an `async fn` over `waymaker_embassy::Ctx` — `no_std`,
+allocation-free, polled by Embassy's executor — and Waymaker's journal
+is the run's only store (ADR 0003). Every golden fixture (23 × scripted
+and tiny backends), the crash matrix, the context lifecycle suite and
+the invariants run against it unchanged.
+
+### 22.1 State and replay
+
+The workflow walks the same normative machine (§3, `transition`). Its
+derived state — budget, monitor, effect allocator, counters, the
+pending call/intent/ask/finish, the parent fold and this segment's fold —
+is a caller-owned `RunState` (10,808 B on `x86_64`, pinned ≤ 11 KiB),
+reset on every boot. Recovery is Waymaker replay: the workflow runs
+again from its input and every recorded answer is handed back, so the
+machine lands exactly where the committed prefix left it.
+
+### 22.2 Activities
+
+Every world touch is an activity; every input and answer is
+`const`-bounded ≤ `PAGE_RECORD_MAX` (480 B) and pinned by test.
+
+| Kind | Input | Answer |
+|---|---|---|
+| `INFER` (0x0200) | prompt context: settings, turns/mutations left, last observation (≤128 B), repair hint, prior fold marker, brief | the line, measured tokens, rendered prompt size |
+| `PROBE` (0x0201) | a pin | its direction (the §5.2 device rule) |
+| `TOOL` (0x0202) | Esper effect seq, attempt, tool, write flag, digest, validated args | transient flag, **masked** outcome (≤448 B), secret digest |
+| `VERIFY` (0x0203) | effect seq + the check (pin level, or clock target `t0 + ms`) | the independent reading |
+| `ASK` (0x0204) | schema + prompt | the operator's input; **unserviceable** until it arrives |
+| `SNAP_STORE` / `SNAP_LOAD` (0x0205/6) | snapshot digest + chunk index (+ chunk) | ack / chunk (≤448 B) |
+
+A dispatcher that cannot answer records one `Fault` byte as a failed
+activity; replay fails the same way. The product half of every
+dispatcher — prompt rendering from the recorded context, argument
+re-validation before hardware, masking **before** answering — is
+`run::device`, shared by the board and the host double.
+
+### 22.3 Effects, retries, suspension
+
+- An Esper effect id is allocated when a call is authorized; every
+  `TOOL` attempt carries it, so the device deduplicates a redelivered
+  attempt (one physical write, whatever the resets).
+- A transient fault is a **recorded attempt**; the retry is a new
+  `TOOL` activity under the same Esper effect id. Change from E2: the
+  third, exhausting attempt is now in the trace too
+  (`transient faults exhausted after 3 attempts`, three failed
+  observations), because the attempt happened and Waymaker recorded it.
+- `Ask` suspends as an outstanding, unserviceable `ASK`; the boot whose
+  dispatcher has the input completes it.
+
+### 22.4 Terminal and rollover
+
+The terminal result is `ctx.complete` (Completed) or `ctx.fail` (every
+other status) with a `TerminalRecord` (status, reason ≤48 B, summary).
+At 80% of the context budget the workflow encodes its fold, read-back
+verifies it, checks no-widen with `continue_as_new` (core lineage),
+stores it in ≤448-byte chunks and calls `ctx.continue_as_new` over a
+`RunStart` (151-byte seed binding + brief + snapshot reference, ≤421 B).
+The child loads the chunks, checks the digest, decodes, and refuses to
+start on anything that does not verify. The fold is built frame by
+frame as records commit; at `Gather` no obligation is open, so it equals
+the old whole-journal fold.
+
+### 22.5 The frame view and crash points
+
+`Frame` is a host-only view **derived** from the records (`journal.rs`),
+so fixtures, evaluation and traces read the history the workflow
+replays. The eleven crash points map to Waymaker boundaries
+(`run::host` documents the table); each costs exactly one extra boot,
+proven by test. An exhaustive sweep injects a reset before and after
+every record of seven run shapes (including rollover, ask, repair,
+stuck actuator, delay and direction denial) and requires the identical
+trace, budgets and physical writes.
+
+### 22.6 On the core
+
+`cargo xtask emulate` boots the run workflow on Cortex-M3 and Cortex-M4
+under QEMU (stage `run`): a read, a write and a finish through a reset
+after the write acted and before its answer was recorded, completing
+with exactly one physical write; both cores and the host agree on the
+digest.
+
+### 22.7 What this does not claim
+
+- **Not an ESP32-S3.** The emulated cores are ARM; the Xtensa build and
+  the flash-backed Waymaker journal on the board are not exercised here.
+- **The tiny backend on the core is exercised by its own stage**; the
+  emulated run uses a scripted model double.
+- **RAM is measured on the host only** (`RunState`); board figures
+  await the board.

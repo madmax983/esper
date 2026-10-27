@@ -19,6 +19,7 @@
 #![no_main]
 
 mod boot;
+mod workload;
 
 #[cfg(target_arch = "arm")]
 mod arm;

@@ -172,6 +172,12 @@ impl InputPlan {
         self.next += 1;
         Some(input)
     }
+
+    /// Put the last taken input back: a reset lost the record of its
+    /// delivery, so the operator's channel delivers it again.
+    pub(crate) const fn untake(&mut self) {
+        self.next = self.next.saturating_sub(1);
+    }
 }
 
 /// One physical write, for the harness ledger.

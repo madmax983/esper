@@ -72,7 +72,7 @@ fn segment(
 /// committed observation and the prompt-byte meter runs. (The
 /// byte-level proof — a `sk-live-...` secret plus an email redacted
 /// before the journal, the prompt, and the cursor — lives in
-/// `engine::tests::masking_boundary_redacts_secret_and_pii_before_journal_and_prompt`.)
+/// `run::host::tests::masking_boundary_redacts_secret_and_pii_before_the_record`.)
 #[test]
 fn masking_trace_carries_per_observation_digests_and_prompt_bytes() {
     let mut backend = make_backend(vec![

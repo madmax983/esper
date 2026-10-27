@@ -12,6 +12,10 @@
 //! 5. `checkpoint` — a goal and a memory entry survive an item-wise
 //!    store and restore with their digest.
 //! 6. `wire` — an operator command crosses the `SENSE` codec intact.
+//! 7. `run` — the run workflow drives a read, a write and a finish
+//!    through a reset that lands after the write acted and before its
+//!    answer was recorded: it must complete with exactly one physical
+//!    write ([`crate::workload`]).
 
 use esper_core::beat::{Beat, BeatSpan};
 use esper_core::brief::Brief;
@@ -31,7 +35,15 @@ use esper_runtime::{
 use waymaker_embassy::Decode;
 
 /// Stages a boot reports.
-const STAGES: [&str; 6] = ["prompt", "infer", "decode", "mask", "checkpoint", "wire"];
+const STAGES: [&str; 7] = [
+    "prompt",
+    "infer",
+    "decode",
+    "mask",
+    "checkpoint",
+    "wire",
+    "run",
+];
 
 /// What a boot did: the stages it passed and the digest over every
 /// answer it computed.
@@ -99,6 +111,13 @@ pub fn run() -> Result<Report, &'static str> {
 
     let mut sense = [0u8; MAX_SENSE_BYTES];
     pass(&mut fold, wire_stage(&mut sense)?);
+
+    let outcome = run_stage()?;
+    fold.add(&outcome.records.to_le_bytes());
+    pass(
+        &mut fold,
+        outcome.terminal.get(..outcome.len).ok_or("run: terminal")?,
+    );
 
     Ok(Report {
         passed,
@@ -279,4 +298,23 @@ fn wire_stage(out: &mut [u8]) -> Result<&[u8], &'static str> {
         return Err("wire: round trip differs");
     }
     Ok(encoded)
+}
+
+/// Stage 7: the run workflow, end to end, through one reset.
+fn run_stage() -> Result<crate::workload::RunOutcome, &'static str> {
+    let outcome = crate::workload::drive()?;
+    let record = esper_runtime::run::wire::TerminalRecord::decode(
+        outcome.terminal.get(..outcome.len).ok_or("run: terminal")?,
+    )
+    .map_err(|_| "run: terminal does not decode")?;
+    if !outcome.completed || record.summary != b"pin 3 high" {
+        return Err("run: did not complete");
+    }
+    if outcome.boots != 2 {
+        return Err("run: the reset did not fire");
+    }
+    if outcome.writes != 1 || !outcome.pin3_high {
+        return Err("run: the write was lost or repeated");
+    }
+    Ok(outcome)
 }

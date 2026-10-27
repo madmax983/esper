@@ -1,20 +1,18 @@
-//! The run journal: the only durable state.
+//! HOST-ONLY: the in-memory run journal and its derived frame view.
 //!
-//! Every boundary crossing appends one [`Frame`]; everything else —
-//! budgets, the monitor, the pending-effect set, the normative state
-//! machine position — is derived by replaying the frames in order.
-//! Crash recovery is therefore just replay: the committed prefix is
-//! intact, and the engine resumes from it.
+//! The durable store of a run is Waymaker's journal: the run's input,
+//! one schedule and one outcome record per activity, and the terminal
+//! record. On the device that is Waymaker's flash-backed driver. Here
+//! [`Journal`] holds the same records in memory so the host harness can
+//! drive [`crate::run::run`] across injected resets.
 //!
-//! The frame vocabulary mirrors the golden-trace events one to one,
-//! except that [`Frame::RunStarted`] carries the seed binding (which
-//! the trace does not show) and no frame is emitted for the monitor's
-//! `Account` step (accounting is recomputed deterministically from the
-//! committed steps during replay; see `engine::Driver::reboot`).
-//!
-//! // HOST-ONLY (E0/E1): the journal is heap-allocated. The firmware
-//! port (E2) replaces this with the flash-backed journal behind the
-//! same frame vocabulary.
+//! [`Frame`] is not a store. It is a **derived view** of those records
+//! in the golden-trace vocabulary — one frame per committed boundary,
+//! [`Frame::RunStarted`] carrying the seed binding — rebuilt after every
+//! boot so fixtures, evaluation and the trace read the same history the
+//! workflow replays.
+
+use std::collections::BTreeMap;
 
 use esper_core::state::TerminalStatus;
 
@@ -151,47 +149,113 @@ pub enum Frame {
     },
 }
 
-/// The append-only journal: the run's durable state.
+/// One record of a run's Waymaker journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Record {
+    /// An activity intent.
+    Scheduled {
+        /// The activity kind.
+        kind: u16,
+        /// The activity input.
+        // HOST-ONLY
+        input: Vec<u8>,
+        /// The Waymaker effect sequence.
+        seq: u32,
+    },
+    /// An activity outcome.
+    Resolved {
+        /// Whether the effect completed (else failed).
+        completed: bool,
+        /// The outcome bytes.
+        // HOST-ONLY
+        bytes: Vec<u8>,
+    },
+}
+
+/// A run segment's journal: its Waymaker records, the snapshot chunks
+/// its dispatcher stored, and the frame view derived from them.
 ///
 /// The caller owns the journal, so suspension and crash recovery work
 /// across separate `drive_run` calls: the same journal crosses every
 /// boot, the way flash would carry it.
 #[derive(Debug, Clone, Default)]
 pub struct Journal {
-    /// The committed frames, in order.
-    // HOST-ONLY (E0/E1)
-    frames: Vec<Frame>,
+    /// The run's input (an encoded [`crate::run::wire::RunStart`]).
+    // HOST-ONLY
+    pub(crate) input: Vec<u8>,
+    /// Activity records, in commit order.
+    // HOST-ONLY
+    pub(crate) records: Vec<Record>,
+    /// The terminal record: completed (else failed) and its payload.
+    // HOST-ONLY
+    pub(crate) terminal: Option<(bool, Vec<u8>)>,
+    /// The input `continue_as_new` installed, once the segment rolled
+    /// over.
+    // HOST-ONLY
+    pub(crate) continued: Option<Vec<u8>>,
+    /// Snapshot chunks, keyed by snapshot digest and chunk index.
+    // HOST-ONLY
+    pub(crate) store: BTreeMap<(u64, u8), Vec<u8>>,
+    /// The derived frame view.
+    // HOST-ONLY
+    pub(crate) frames: Vec<Frame>,
+    /// Boots driven over this journal (an observation, not state).
+    pub(crate) boots: u32,
+    /// New records committed over this journal's life (an
+    /// observation, not state): the crash sweep's counter.
+    pub(crate) commits: usize,
 }
 
 impl Journal {
-    /// An empty journal: the next boot binds it to its seed.
+    /// An empty journal.
     #[must_use]
     pub const fn new() -> Self {
-        // HOST-ONLY (E0/E1)
-        Self { frames: Vec::new() }
+        Self {
+            input: Vec::new(),
+            records: Vec::new(),
+            terminal: None,
+            continued: None,
+            store: BTreeMap::new(),
+            frames: Vec::new(),
+            boots: 0,
+            commits: 0,
+        }
     }
 
-    /// Whether no frame has committed yet.
+    /// Boots driven over this journal: one per injected reset, plus the
+    /// boot that settled each drive.
+    #[must_use]
+    pub const fn boots(&self) -> u32 {
+        self.boots
+    }
+
+    /// New records committed over this journal's life.
+    #[must_use]
+    pub const fn commits(&self) -> usize {
+        self.commits
+    }
+
+    /// Whether nothing has been committed.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.input.is_empty()
     }
 
-    /// The number of committed frames.
+    /// The number of derived frames.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.frames.len()
     }
 
-    /// Append one committed boundary record.
-    pub fn push(&mut self, frame: Frame) {
-        // HOST-ONLY (E0/E1)
-        self.frames.push(frame);
-    }
-
-    /// The committed frames, in journal order.
+    /// The derived frame view, in commit order.
     #[must_use]
     pub fn frames(&self) -> &[Frame] {
         &self.frames
+    }
+
+    /// The Waymaker activity records, in commit order.
+    #[must_use]
+    pub fn records(&self) -> &[Record] {
+        &self.records
     }
 }

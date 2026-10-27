@@ -388,7 +388,15 @@ mod tests {
         let oracle = oracle().unwrap();
         assert_eq!(
             oracle.stages,
-            ["prompt", "infer", "decode", "mask", "checkpoint", "wire"]
+            [
+                "prompt",
+                "infer",
+                "decode",
+                "mask",
+                "checkpoint",
+                "wire",
+                "run"
+            ]
         );
     }
 

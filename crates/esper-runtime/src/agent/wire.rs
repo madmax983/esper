@@ -105,29 +105,29 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    fn u8(&mut self, v: u8) -> Result<(), WireError> {
+    pub(crate) fn u8(&mut self, v: u8) -> Result<(), WireError> {
         self.bytes(&[v])
     }
 
-    fn u16(&mut self, v: u16) -> Result<(), WireError> {
+    pub(crate) fn u16(&mut self, v: u16) -> Result<(), WireError> {
         self.bytes(&v.to_le_bytes())
     }
 
-    fn u32(&mut self, v: u32) -> Result<(), WireError> {
+    pub(crate) fn u32(&mut self, v: u32) -> Result<(), WireError> {
         self.bytes(&v.to_le_bytes())
     }
 
-    fn u64(&mut self, v: u64) -> Result<(), WireError> {
+    pub(crate) fn u64(&mut self, v: u64) -> Result<(), WireError> {
         self.bytes(&v.to_le_bytes())
     }
 
-    fn note(&mut self, note: &Note) -> Result<(), WireError> {
+    pub(crate) fn note(&mut self, note: &Note) -> Result<(), WireError> {
         let bytes = note.as_bytes();
         self.u8(u8::try_from(bytes.len()).map_err(|_| WireError::Invalid)?)?;
         self.bytes(bytes)
     }
 
-    fn capabilities(&mut self, caps: &Capabilities) -> Result<(), WireError> {
+    pub(crate) fn capabilities(&mut self, caps: &Capabilities) -> Result<(), WireError> {
         self.bytes(&caps.read_pins)?;
         self.u8(caps.read_count)?;
         self.bytes(&caps.write_pins)?;
@@ -140,44 +140,44 @@ impl<'a> Writer<'a> {
 }
 
 /// A bounded reader over borrowed bytes.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let end = self.pos.saturating_add(n);
         let slice = self.bytes.get(self.pos..end).ok_or(WireError::Truncated)?;
         self.pos = end;
         Ok(slice)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
         <[u8; N]>::try_from(self.take(N)?).map_err(|_| WireError::Truncated)
     }
 
-    fn u8(&mut self) -> Result<u8, WireError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, WireError> {
         Ok(u8::from_le_bytes(self.array()?))
     }
 
-    fn u16(&mut self) -> Result<u16, WireError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
         Ok(u16::from_le_bytes(self.array()?))
     }
 
-    fn u32(&mut self) -> Result<u32, WireError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.array()?))
     }
 
-    fn u64(&mut self) -> Result<u64, WireError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.array()?))
     }
 
-    fn flag(&mut self) -> Result<bool, WireError> {
+    pub(crate) fn flag(&mut self) -> Result<bool, WireError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -185,7 +185,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn note(&mut self) -> Result<Note, WireError> {
+    pub(crate) fn note(&mut self) -> Result<Note, WireError> {
         let len = usize::from(self.u8()?);
         if len > NOTE_MAX {
             return Err(WireError::Invalid);
@@ -225,7 +225,7 @@ impl<'a> Reader<'a> {
         Ok(caps)
     }
 
-    const fn end(&self) -> Result<(), WireError> {
+    pub(crate) const fn end(&self) -> Result<(), WireError> {
         if self.pos == self.bytes.len() {
             Ok(())
         } else {

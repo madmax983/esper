@@ -32,7 +32,7 @@
 //!   future.
 //!
 //! The dispatcher behind the activities is the device's: on the board
-//! [`wire::RUN`] drives the run engine; on the host,
+//! [`wire::RUN`] drives [`crate::run::run`]; on the host,
 //! [`host::HostAgent`] drives [`crate::drive_segment`] over the test
 //! doubles.
 
