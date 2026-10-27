@@ -166,7 +166,13 @@ jobs:
           chmod +x "$RUNNER_TEMP/espup"
           "$RUNNER_TEMP/espup" install --targets esp32s3 --export-file "$RUNNER_TEMP/export-esp.sh"
 
+      # `unset RUSTDOCFLAGS`: `xtensa-lx-rt`'s build script reads *any*
+      # `RUSTDOCFLAGS` in the environment — even an empty one — as a docs
+      # build and configures itself for the ESP32 rather than the target,
+      # emitting the ESP32's double-precision registers the S3 does not
+      # have. The workflow sets it for the docs stage.
       - name: Build the ESP32-S3 image
         run: |
+          unset RUSTDOCFLAGS
           . "$RUNNER_TEMP/export-esp.sh"
           cargo +esp build --locked --release

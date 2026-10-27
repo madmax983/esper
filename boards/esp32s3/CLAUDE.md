@@ -12,9 +12,15 @@ A workspace of its own on Espressif's `esp` toolchain
 
 ```bash
 . ~/export-esp.sh
+unset RUSTDOCFLAGS                # see below
 cargo build --release             # xtensa-esp32s3-none-elf
 cargo run --release               # espflash flash --monitor
 ```
+
+Never build the image with `RUSTDOCFLAGS` in the environment, even empty:
+`xtensa-lx-rt`'s build script takes it for a docs build and configures
+itself for the ESP32, whose double-precision registers the S3's assembler
+rejects (`invalid operand for instruction: rur a3, f64r_lo`).
 
 Without that toolchain, the same glue compiles against the ESP32-C3 on
 the root's pinned toolchain — a compile check, never flashed:
