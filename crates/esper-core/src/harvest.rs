@@ -71,6 +71,36 @@ impl Harvester {
         }
     }
 
+    /// Resume a harvester from entries an earlier segment of the same
+    /// run kept ([`Harvester::kept`] after [`Harvester::seal`]), oldest
+    /// first. A run continued as new carries its harvest this way.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MemoryFull`] for more entries than a harvester keeps.
+    pub fn resume(provenance: Provenance, entries: &[MemoryEntry]) -> Result<Self, Error> {
+        let mut harvester = Self::new(provenance);
+        if entries.len() > MAX_OBSERVATIONS {
+            return Err(Error::MemoryFull);
+        }
+        for (slot, entry) in harvester.kept.iter_mut().zip(entries) {
+            *slot = Some(*entry);
+        }
+        Ok(harvester)
+    }
+
+    /// Close the open effect now. Its outcome is fully committed (a run
+    /// seals before it continues as new), so the result is the same as
+    /// closing it at the next request.
+    pub fn seal(&mut self) {
+        self.close();
+    }
+
+    /// The entries kept so far, oldest first.
+    pub fn kept(&self) -> impl Iterator<Item = &MemoryEntry> {
+        self.kept.iter().flatten()
+    }
+
     /// A tool intent committed: close the previous effect, open this one.
     ///
     /// The label is `<tool_name> <args>`, masked.
@@ -275,4 +305,103 @@ fn goal_label(goal: GoalId, buf: &mut [u8; 10]) -> &[u8] {
         *dst = *src;
     }
     buf.get(..5 + n).unwrap_or(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beat::Beat;
+
+    /// A harvest sealed, carried as its kept entries and resumed, ends
+    /// exactly like one harvester that saw every event.
+    #[test]
+    fn a_sealed_and_resumed_harvest_matches_an_unbroken_one() {
+        let provenance = Provenance {
+            goal: None,
+            run: None,
+            beat: Beat::ZERO,
+        };
+        let read = |h: &mut Harvester, seq: u32, pin: &[u8], value: &[u8]| {
+            h.request(seq, ToolId::new(1), pin);
+            h.observation(seq, true, value);
+        };
+        let mut whole = Harvester::new(provenance);
+        read(
+            &mut whole,
+            1,
+            br#"{"pin": 3}"#,
+            br#"{"pin":3,"level":"low"}"#,
+        );
+        read(
+            &mut whole,
+            2,
+            br#"{"pin": 4}"#,
+            br#"{"pin":4,"level":"high"}"#,
+        );
+        read(
+            &mut whole,
+            3,
+            br#"{"pin": 3}"#,
+            br#"{"pin":3,"level":"high"}"#,
+        );
+
+        let mut first = Harvester::new(provenance);
+        read(
+            &mut first,
+            1,
+            br#"{"pin": 3}"#,
+            br#"{"pin":3,"level":"low"}"#,
+        );
+        read(
+            &mut first,
+            2,
+            br#"{"pin": 4}"#,
+            br#"{"pin":4,"level":"high"}"#,
+        );
+        first.seal();
+        let mut carried = [first.kept[0].unwrap(); 2];
+        for (dst, src) in carried.iter_mut().zip(first.kept()) {
+            *dst = *src;
+        }
+        assert_eq!(first.kept().count(), 2);
+        let mut second = Harvester::resume(provenance, &carried).unwrap();
+        read(
+            &mut second,
+            1,
+            br#"{"pin": 3}"#,
+            br#"{"pin":3,"level":"high"}"#,
+        );
+
+        let goal = GoalId::new(1).unwrap();
+        let whole = whole
+            .finish(goal, TerminalStatus::Completed, b"done")
+            .unwrap();
+        let resumed = second
+            .finish(goal, TerminalStatus::Completed, b"done")
+            .unwrap();
+        assert_eq!(whole, resumed);
+    }
+
+    #[test]
+    fn resume_refuses_more_than_it_keeps() {
+        let provenance = Provenance {
+            goal: None,
+            run: None,
+            beat: Beat::ZERO,
+        };
+        let entry = MemoryEntry::new(
+            MemoryKey::Outcome {
+                goal: GoalId::new(1).unwrap(),
+            },
+            b"l",
+            b"v",
+            provenance,
+        )
+        .unwrap();
+        assert!(Harvester::resume(provenance, &[entry; MAX_OBSERVATIONS]).is_ok());
+        assert_eq!(
+            Harvester::resume(provenance, &[entry; MAX_OBSERVATIONS + 1]).unwrap_err(),
+            Error::MemoryFull
+        );
+    }
 }

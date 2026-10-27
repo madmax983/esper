@@ -43,13 +43,18 @@ use core::convert::Infallible;
 use core::fmt::{self, Write as _};
 
 use esper_core::ResourceBudget;
+use esper_core::beat::Beat;
+use esper_core::checkpoint::{MAX_ENTRY_RECORD_BYTES, decode_entry, encode_entry};
 use esper_core::compact::{
     CompactState, DEFAULT_POLICY, FrameSummary, VersionSet, compact, should_compact,
 };
 use esper_core::decision::{Decision, Level, ToolArgs, decode_line};
 use esper_core::error::{ErrorCode, RepairVariant};
+use esper_core::goal::GoalId;
+use esper_core::harvest::{HarvestSet, Harvester, MAX_HARVEST};
 use esper_core::ids::{Digest, ToolId};
 use esper_core::lineage::{Lineage, continue_as_new};
+use esper_core::memory::Provenance;
 use esper_core::monitor::{Monitor, MonitorVerdict, ProgressDelta, StepOutcome, StepRecord};
 use esper_core::records::RecordKind;
 use esper_core::registry::{authorize, lookup_by_id};
@@ -65,9 +70,10 @@ use crate::backend::{OUTPUT_CAP, PriorCtx, RepairHint, fnv1a64};
 use crate::error::RuntimeError;
 use crate::seed::RunSeed;
 use wire::{
-    AskInput, AskRequest, Check, Chunk, InferRequest, Inferred, LAST_OBSERVATION_CAP, MAX_REASON,
-    Observed, Probed, RunStart, SNAPSHOT_CHUNK, SNAPSHOT_KEY_BYTES, SnapshotRef, Stored,
-    TerminalRecord, ToolRequest, Verified, VerifyRequest, fault_error, snapshot_key,
+    AskInput, AskRequest, Check, Chunk, HARVEST_ITEM_BASE, InferRequest, Inferred,
+    LAST_OBSERVATION_CAP, MAX_REASON, Observed, Probed, RunStart, SNAPSHOT_CHUNK,
+    SNAPSHOT_KEY_BYTES, SnapshotRef, Stored, TerminalRecord, ToolRequest, Verified, VerifyRequest,
+    fault_error, snapshot_key,
 };
 
 /// Invalid model lines before the run ends `ModelInvalid` (SPEC §4.4).
@@ -212,6 +218,9 @@ pub struct RunState {
     /// A fold that refused a frame: surfaced at rollover, where the old
     /// whole-journal fold would have refused it.
     fold_fault: Option<esper_core::Error>,
+    /// What the run teaches memory, fed as effects commit (SPEC §21.3)
+    /// and carried across a rollover.
+    harvester: Harvester,
     /// The next frame's index in the derived view (`RunStarted` is 0).
     frame_seq: u32,
     /// This segment's cumulative built-prompt bytes.
@@ -219,6 +228,14 @@ pub struct RunState {
     io: [u8; PAGE_RECORD_MAX],
     snapshot: [u8; MAX_SNAPSHOT_BYTES],
 }
+
+/// Harvested entries carry no provenance of their own: the supervisor,
+/// which alone knows the goal and the beat, stamps it.
+const NO_PROVENANCE: Provenance = Provenance {
+    goal: None,
+    run: None,
+    beat: Beat::ZERO,
+};
 
 const fn version_set(seed: &RunSeed) -> VersionSet {
     // The slice does not version the tool catalog or the compaction
@@ -256,6 +273,7 @@ impl RunState {
             compact: None,
             fold: CompactState::new(Digest::new(0), seed.starting_budget(), version_set(&seed)),
             fold_fault: None,
+            harvester: Harvester::new(NO_PROVENANCE),
             frame_seq: 0,
             prompt_bytes: 0,
             io: [0; PAGE_RECORD_MAX],
@@ -307,6 +325,21 @@ impl RunState {
     #[must_use]
     pub const fn prompt_bytes(&self) -> u64 {
         self.prompt_bytes
+    }
+
+    /// What the concluded run teaches memory: the kept observations and
+    /// the goal's `Outcome` entry (SPEC §21.3).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Core`] when the outcome entry cannot be built.
+    pub fn harvest(
+        &self,
+        goal: GoalId,
+        status: TerminalStatus,
+        summary: &[u8],
+    ) -> Result<HarvestSet, RuntimeError> {
+        Ok(self.harvester.finish(goal, status, summary)?)
     }
 
     /// The normative machine's position.
@@ -550,6 +583,35 @@ async fn load_snapshot<D: ActivityDispatcher, J: Journal>(
         return Err(RuntimeError::JournalCorrupt);
     }
     let fold = decode(bytes)?;
+    // The parent's harvest continues here.
+    let count = usize::from(snapshot.harvest);
+    if count > MAX_HARVEST {
+        return Err(RuntimeError::JournalCorrupt);
+    }
+    let mut carried = [None; MAX_HARVEST];
+    for (index, slot) in (0..snapshot.harvest).zip(carried.iter_mut()) {
+        let key = snapshot_key(
+            snapshot.digest,
+            HARVEST_ITEM_BASE
+                .checked_add(index)
+                .ok_or(RuntimeError::JournalCorrupt)?,
+        );
+        let chunk = ctx
+            .activity::<Chunk>(wire::SNAP_LOAD, &key)
+            .await
+            .map_err(|failure| failed(ctx, failure))?;
+        *slot = Some(decode_entry(chunk.as_bytes())?);
+    }
+    if let Some(first) = carried.first().copied().flatten() {
+        let mut entries = [first; MAX_HARVEST];
+        for (dst, src) in entries.iter_mut().zip(carried.iter().flatten()) {
+            *dst = *src;
+        }
+        state.harvester = Harvester::resume(
+            NO_PROVENANCE,
+            entries.get(..count).ok_or(RuntimeError::JournalCorrupt)?,
+        )?;
+    }
     state.compact = Some(fold);
     // The fold is cumulative across generations: this segment folds
     // into the parent's state, so ruled-out paths survive every
@@ -652,11 +714,40 @@ async fn rollover<D: ActivityDispatcher, J: Journal>(
             .await
             .map_err(|failure| failed(ctx, failure))?;
     }
+    // The harvest continues in the child: seal the last effect (its
+    // outcome is committed) and store what was kept, one item each.
+    state.harvester.seal();
+    let mut harvest: u8 = 0;
+    let kept = state.harvester;
+    for entry in kept.kept() {
+        let key = snapshot_key(
+            digest,
+            HARVEST_ITEM_BASE
+                .checked_add(harvest)
+                .ok_or(RuntimeError::BadFrame)?,
+        );
+        let (head, tail) = state.io.split_at_mut(SNAPSHOT_KEY_BYTES);
+        head.copy_from_slice(&key);
+        let n = encode_entry(
+            entry,
+            tail.get_mut(..MAX_ENTRY_RECORD_BYTES)
+                .ok_or(RuntimeError::BadFrame)?,
+        )?;
+        let input = state
+            .io
+            .get(..SNAPSHOT_KEY_BYTES + n)
+            .ok_or(RuntimeError::BadFrame)?;
+        ctx.activity::<Stored>(wire::SNAP_STORE, input)
+            .await
+            .map_err(|failure| failed(ctx, failure))?;
+        harvest += 1;
+    }
     let start = RunStart {
         seed: state.seed.child(continued.lineage),
         snapshot: Some(SnapshotRef {
             digest,
             len: u16::try_from(len).map_err(|_| RuntimeError::BadFrame)?,
+            harvest,
         }),
     };
     let n = start.encode(&mut state.io)?;
@@ -903,6 +994,9 @@ async fn authorize_call<D: ActivityDispatcher, J: Journal>(
         ProgressDelta::NoProgress,
         &[],
     );
+    state
+        .harvester
+        .request(effect.seq.0, ToolId::new(call.tool), call.args.as_bytes());
     state.intent = Some(Intent {
         seq: effect.seq.0,
         tool: call.tool,
@@ -1008,6 +1102,9 @@ async fn observe<D: ActivityDispatcher, J: Journal>(
         progress,
         outcome,
     );
+    state
+        .harvester
+        .observation(intent.seq, !observed.transient, outcome);
     if observed.transient {
         if intent.attempt >= MAX_TRANSIENT_ATTEMPTS {
             state.advance(Event::TransientExhausted)?;
@@ -1075,6 +1172,7 @@ async fn verify_intent<D: ActivityDispatcher, J: Journal>(
         .await
         .map_err(|failure| failed(ctx, failure))?;
     let passed = check.passes(verified.observed);
+    state.harvester.verification(intent.seq, passed);
     let (outcome, progress) = if passed {
         (StepOutcome::Ok, ProgressDelta::StateChanged)
     } else {
@@ -1207,7 +1305,7 @@ fn denial_summary(args: ToolArgs) -> Result<Buf<OUTPUT_CAP>, RuntimeError> {
 
 /// The pinned upper bound on [`RunState`]'s size (64-bit host).
 #[cfg(test)]
-const RUN_STATE_MAX_BYTES: usize = 11 * 1024;
+const RUN_STATE_MAX_BYTES: usize = 12 * 1024;
 
 #[cfg(test)]
 mod tests {

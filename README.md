@@ -135,7 +135,9 @@ Gate 8 needs `qemu-system-arm`. It links `crates/esper-emu` (a
 for a Cortex-M3 and a Cortex-M4, boots both, and requires each core to
 pass every stage — briefed prompt, tiny-backend inference, decode,
 secret masking, item-wise checkpoint restore, `SENSE` codec, and the
-run workflow itself through a reset with exactly one physical write — with the
+run workflow itself through a reset with exactly one physical write,
+and one heartbeat of the supervisor on the board dispatcher through the
+same reset — with the
 same digest the workload computes on the host. CI
 (`.github/workflows/ci.yml`) runs all eight, release-mode tests, and
 bare-metal builds of the firmware crates for
@@ -152,7 +154,7 @@ truncation, bit-flip, and item-wise restore sweeps), 163 in
 `esper-runtime` (21 of them E4+aon, including the 17-test supervisor
 suite and its crash matrix), 63 in `esper-eval`, 22 in
 `esper-protocol` — plus one generated test per golden fixture;
-`cargo test --workspace` runs 489 (E4+aon plus the SPEC §22 run port: the reset sweep, crash-point and page-bound tests, the run codecs). Zero warnings from clippy
+`cargo test --workspace` runs 496 (E4+aon, the SPEC §22 run port — reset sweep, crash-point and page-bound tests, run codecs — and the SPEC §23 board dispatcher). Zero warnings from clippy
 (pedantic + nursery, denied workspace-wide). All crates target Rust
 edition 2024.
 
@@ -276,10 +278,11 @@ host-only.
 
 Things this environment cannot verify, stated plainly:
 
-- **E4+aon on the board.** The supervisor and the run (SPEC §22) are
-  both `no_std` Waymaker workflows in the firmware build, and the run
-  boots on two emulated ARM cores; the board's dispatcher that wires
-  `RUN` to `run::run` over flash is not written yet.
+- **E4+aon on the board.** The supervisor, the run (SPEC §22) and the
+  board dispatcher that drives one from the other (SPEC §23) are all
+  `no_std` and run together on two emulated ARM cores. The
+  flash-backed `RunStore` is the board crate's: Waymaker's façade
+  bridge is not published to crates.io.
   A boot-clock heartbeat restarts its interval after a reset; only a
   persistent-clock heartbeat survives power loss. Recall is
   recency-ordered, not relevance-ranked. One run at a time.
@@ -310,7 +313,7 @@ Things this environment cannot verify, stated plainly:
 - **Coverage tooling unavailable.** `cargo-llvm-cov` and
   `cargo-tarpaulin` are not installed (on 2026-10-27 the install was
   not permitted in the sandbox). The SPEC's ≥85% gate is therefore
-  unmeasured here. The suite runs 489 tests and the contract surface
+  unmeasured here. The suite runs 496 tests and the contract surface
   is exercised by the golden trajectories and the agent crash matrix,
   but line coverage is an open number.
 - **No mechanized proofs.** The user's SPEC-PROOF step names Verus; no

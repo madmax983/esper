@@ -395,7 +395,8 @@ mod tests {
                 "mask",
                 "checkpoint",
                 "wire",
-                "run"
+                "run",
+                "agent"
             ]
         );
     }

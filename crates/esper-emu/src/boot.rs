@@ -16,6 +16,10 @@
 //!    through a reset that lands after the write acted and before its
 //!    answer was recorded: it must complete with exactly one physical
 //!    write ([`crate::workload`]).
+//! 8. `agent` — one heartbeat of the always-on supervisor on the board
+//!    dispatcher: the operator adds a goal, the supervisor spawns its
+//!    run, the run goes through the same reset, and the beat settles the
+//!    goal and harvests its memory — one physical write.
 
 use esper_core::beat::{Beat, BeatSpan};
 use esper_core::brief::Brief;
@@ -35,7 +39,7 @@ use esper_runtime::{
 use waymaker_embassy::Decode;
 
 /// Stages a boot reports.
-const STAGES: [&str; 7] = [
+const STAGES: [&str; 8] = [
     "prompt",
     "infer",
     "decode",
@@ -43,6 +47,7 @@ const STAGES: [&str; 7] = [
     "checkpoint",
     "wire",
     "run",
+    "agent",
 ];
 
 /// What a boot did: the stages it passed and the digest over every
@@ -118,6 +123,8 @@ pub fn run() -> Result<Report, &'static str> {
         &mut fold,
         outcome.terminal.get(..outcome.len).ok_or("run: terminal")?,
     );
+
+    pass(&mut fold, &agent_stage()?);
 
     Ok(Report {
         passed,
@@ -317,4 +324,36 @@ fn run_stage() -> Result<crate::workload::RunOutcome, &'static str> {
         return Err("run: the write was lost or repeated");
     }
     Ok(outcome)
+}
+
+/// Stage 8: one beat of the supervisor on the board dispatcher, through
+/// a reset inside its run. Returns the agent's checkpoint header (its
+/// digest covers the ledger and the harvested memory).
+fn agent_stage() -> Result<[u8; HEADER_BYTES], &'static str> {
+    let outcome = crate::workload::drive_agent()?;
+    let Some(settled) = outcome.pulse.settled else {
+        return Err("agent: the goal did not settle");
+    };
+    if settled.status != esper_core::state::TerminalStatus::Completed {
+        return Err("agent: the run did not complete");
+    }
+    if outcome.boots != 2 {
+        return Err("agent: the reset did not fire");
+    }
+    if outcome.writes != 1 || !outcome.pin3_high {
+        return Err("agent: the write was lost or repeated");
+    }
+    if settled.harvested < 2
+        || outcome.state.checkpoint.memory.len() != usize::from(settled.harvested)
+    {
+        return Err("agent: the harvest did not reach memory");
+    }
+    let mut header = [0u8; HEADER_BYTES];
+    outcome
+        .state
+        .checkpoint
+        .header()
+        .encode(&mut header)
+        .map_err(|_| "agent: header")?;
+    Ok(header)
 }

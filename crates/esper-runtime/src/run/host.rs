@@ -40,16 +40,14 @@ use esper_core::lineage::Lineage;
 use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId as WaymakerRunId};
 use waymaker_embassy::ctx::Conclusion;
-use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::{
-    ActivityDispatcher, Answer, Ctx, Decode, Halted, Handoff, Journal as WaymakerJournal,
-};
+use waymaker_embassy::{Answer, Ctx, Decode, Halted, Handoff, Journal as WaymakerJournal};
 
+use super::RunState;
+use super::device::{Attempt, RunDispatcher, RunPorts};
 use super::wire::{
-    self, AskInput, AskRequest, Check, Fault, Inferred, Observed, Probed, RunStart, SnapshotRef,
-    TerminalRecord, ToolRequest, Verified, VerifyRequest, read_snapshot_key,
+    self, AskInput, AskRequest, Check, Fault, Inferred, Observed, RunStart, SnapshotRef,
+    TerminalRecord, ToolRequest, Verified, VerifyRequest,
 };
-use super::{RunState, device};
 use crate::agent::wire::PAGE_RECORD_MAX;
 use crate::backend::{ModelBackend, fnv1a64};
 use crate::error::{CrashPoint, RuntimeError};
@@ -76,6 +74,9 @@ pub struct RolloverHandoff {
     /// The masking digest stream so far, in commit order: one digest
     /// per observation, `0` where it carried no secret.
     pub mask_digests: Vec<u64>,
+    /// The harvest the segment carried over: one encoded memory entry
+    /// per item, oldest first.
+    pub harvest: Vec<Vec<u8>>,
 }
 
 impl RolloverHandoff {
@@ -107,10 +108,52 @@ enum Stop {
 
 /// The boundary a crash point names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Boundary {
+pub(crate) enum Boundary {
     AfterSchedule,
     BeforeResolve,
     AfterResolve,
+}
+
+/// The crash point a new commit at `boundary` of `records`' last
+/// scheduled activity fires, given its answer (the table in the module
+/// docs). Shared with the supervisor's host double.
+pub(crate) fn crash_point(
+    records: &[Record],
+    boundary: Boundary,
+    answer: Option<&[u8]>,
+) -> Option<CrashPoint> {
+    let Some(Record::Scheduled { kind, input, .. }) = records
+        .iter()
+        .rev()
+        .find(|r| matches!(r, Record::Scheduled { .. }))
+    else {
+        return None;
+    };
+    let kind = ActivityKind(*kind);
+    match (kind, boundary) {
+        (wire::INFER, Boundary::AfterSchedule) => Some(CrashPoint::ModelIntent),
+        (wire::INFER, Boundary::BeforeResolve) => Some(CrashPoint::BeforeDecisionCommit),
+        (wire::INFER, Boundary::AfterResolve) => {
+            let line = Inferred::decode(answer?).ok()?;
+            matches!(decode_line(line.line()), Ok(Decision::Call(_)))
+                .then_some(CrashPoint::BeforeAuthorize)
+        }
+        (wire::TOOL, Boundary::AfterSchedule) => {
+            let request = ToolRequest::decode(input).ok()?;
+            (request.attempt == 1).then_some(CrashPoint::ToolIntent)
+        }
+        (wire::TOOL, Boundary::BeforeResolve) => Some(CrashPoint::AfterPhysicalBeforeObservation),
+        (wire::TOOL, Boundary::AfterResolve) => {
+            let request = ToolRequest::decode(input).ok()?;
+            let observed = Observed::decode(answer?).ok()?;
+            (request.write && !observed.transient)
+                .then_some(CrashPoint::AfterObservationBeforeVerify)
+        }
+        (wire::VERIFY, Boundary::BeforeResolve) => Some(CrashPoint::BeforeVerificationCommit),
+        (wire::VERIFY, Boundary::AfterResolve) => Some(CrashPoint::AfterVerification),
+        (wire::ASK, Boundary::AfterSchedule) => Some(CrashPoint::AwaitInput),
+        _ => None,
+    }
 }
 
 /// The run journal double: Waymaker's protocol over [`Journal`]'s
@@ -120,7 +163,8 @@ struct RunJournal<'j> {
     run: u64,
     crash: &'j Cell<Option<CrashPoint>>,
     reset: &'j Cell<Option<Reset>>,
-    /// Set when a reset dropped an answer the world already gave.
+    /// Set when a reset dropped the record of an operator input the
+    /// world already delivered.
     lost: &'j Cell<bool>,
     stop: &'j Cell<Option<Stop>>,
     unemit: &'j Cell<bool>,
@@ -169,45 +213,10 @@ impl RunJournal<'_> {
         })
     }
 
-    /// The crash points a new commit at `boundary` of the last
-    /// scheduled activity can fire, given its answer.
+    /// The crash point a new commit at `boundary` of the last
+    /// scheduled activity fires, given its answer.
     fn points(&self, boundary: Boundary, answer: Option<&[u8]>) -> Option<CrashPoint> {
-        let Some(Record::Scheduled { kind, input, .. }) = self
-            .journal
-            .records
-            .iter()
-            .rev()
-            .find(|r| matches!(r, Record::Scheduled { .. }))
-        else {
-            return None;
-        };
-        let kind = ActivityKind(*kind);
-        match (kind, boundary) {
-            (wire::INFER, Boundary::AfterSchedule) => Some(CrashPoint::ModelIntent),
-            (wire::INFER, Boundary::BeforeResolve) => Some(CrashPoint::BeforeDecisionCommit),
-            (wire::INFER, Boundary::AfterResolve) => {
-                let line = Inferred::decode(answer?).ok()?;
-                matches!(decode_line(line.line()), Ok(Decision::Call(_)))
-                    .then_some(CrashPoint::BeforeAuthorize)
-            }
-            (wire::TOOL, Boundary::AfterSchedule) => {
-                let request = ToolRequest::decode(input).ok()?;
-                (request.attempt == 1).then_some(CrashPoint::ToolIntent)
-            }
-            (wire::TOOL, Boundary::BeforeResolve) => {
-                Some(CrashPoint::AfterPhysicalBeforeObservation)
-            }
-            (wire::TOOL, Boundary::AfterResolve) => {
-                let request = ToolRequest::decode(input).ok()?;
-                let observed = Observed::decode(answer?).ok()?;
-                (request.write && !observed.transient)
-                    .then_some(CrashPoint::AfterObservationBeforeVerify)
-            }
-            (wire::VERIFY, Boundary::BeforeResolve) => Some(CrashPoint::BeforeVerificationCommit),
-            (wire::VERIFY, Boundary::AfterResolve) => Some(CrashPoint::AfterVerification),
-            (wire::ASK, Boundary::AfterSchedule) => Some(CrashPoint::AwaitInput),
-            _ => None,
-        }
+        crash_point(&self.journal.records, boundary, answer)
     }
 
     const fn id(&self, seq: u32) -> EffectId {
@@ -298,10 +307,13 @@ impl WaymakerJournal for RunJournal<'_> {
         }
         let reset = self.count();
         if reset == Some(true) {
-            if self.last_kind() == Some(wire::INFER) {
-                self.unemit.set(true);
+            match self.last_kind() {
+                Some(wire::INFER) => self.unemit.set(true),
+                // The operator's input was taken and its record lost:
+                // the channel delivers it again.
+                Some(wire::ASK) => self.lost.set(true),
+                _ => {}
             }
-            self.lost.set(true);
             return Err(Halted);
         }
         let (completed, bytes) = match answer {
@@ -351,19 +363,16 @@ impl WaymakerJournal for RunJournal<'_> {
     }
 }
 
-/// The dispatcher double: the device's half of the run's activities.
-struct HostDispatcher<'w> {
-    model: &'w mut dyn ModelBackend,
-    device: &'w mut FakeDevice,
-    faults: &'w mut FaultPlan,
-    inputs: &'w mut InputPlan,
-    store: &'w mut std::collections::BTreeMap<(u64, u8), Vec<u8>>,
-    /// The Esper run id: the device deduplicates on `(run, seq)`.
-    run: u64,
-    /// Whether the last dispatch took an operator input.
-    took_input: bool,
+/// The world doubles behind the run's activities: the device's half,
+/// as [`RunPorts`] for the product [`RunDispatcher`].
+pub(crate) struct HostPorts<'w> {
+    pub(crate) model: &'w mut dyn ModelBackend,
+    pub(crate) device: &'w mut FakeDevice,
+    pub(crate) faults: &'w mut FaultPlan,
+    pub(crate) inputs: &'w mut InputPlan,
+    pub(crate) store: &'w mut std::collections::BTreeMap<(u64, u8), Vec<u8>>,
     #[cfg(test)]
-    injected_outcome: Option<Vec<u8>>,
+    pub(crate) injected_outcome: Option<Vec<u8>>,
 }
 
 /// The fault-plan resource for a call (SPEC §17.7).
@@ -384,136 +393,88 @@ const fn world_fault(error: WorldError) -> Fault {
     }
 }
 
-impl HostDispatcher<'_> {
-    fn tool(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
-        let Ok(request) = ToolRequest::decode(input) else {
-            return device::fail(Fault::BadRequest, out);
-        };
-        let args = match device::bind(&request) {
-            Ok(args) => args,
-            Err(fault) => return device::fail(fault, out),
-        };
-        // The transient-fault plan is consulted before the device, so a
-        // hiccup never reaches hardware.
-        if self.faults.consume(request.tool, dispatch_resource(args)) {
-            return device::transient(out);
-        }
-        #[cfg(test)]
-        if let Some(raw) = self.injected_outcome.take() {
-            return device::observe(&raw, out);
-        }
-        let id = EffectId {
-            run: WaymakerRunId(self.run),
-            seq: EffectSeq(request.seq),
-        };
-        let digest = request.digest;
-        let raw = match args {
-            ToolArgs::GpioPinRead { pin } => self.device.dispatch_read(pin, id, digest),
-            ToolArgs::GpioPinWrite { pin, level } => {
-                self.device
-                    .dispatch_write(pin, level == Level::High, id, digest)
-            }
-            ToolArgs::SensorSampleRead { sensor } => {
-                self.device.dispatch_sensor_read(sensor, id, digest)
-            }
-            ToolArgs::TimerUptimeRead => self.device.dispatch_uptime_read(id, digest),
-            ToolArgs::TimerDelayWait { ms } => self.device.dispatch_delay_wait(ms, id, digest),
-            ToolArgs::DeviceStatusReport { detail } => {
-                self.device.dispatch_status_report(detail, id, digest)
-            }
-        };
-        match raw {
-            Ok(raw) => device::observe(&raw, out),
-            Err(error) => device::fail(world_fault(error), out),
-        }
-    }
-
-    fn verify(&self, input: &[u8], out: &mut [u8]) -> Produced {
-        let Ok(request) = VerifyRequest::decode(input) else {
-            return device::fail(Fault::BadRequest, out);
-        };
-        let observed = match request.check {
-            Check::Pin { pin, .. } => match esper_core::ids::Pin::new(pin) {
-                // The verifier reads the pin directly, independent of
-                // the dispatch path.
-                Ok(pin) => u64::from(self.device.verify_read(pin)),
-                Err(_) => return device::fail(Fault::BadRequest, out),
-            },
-            // The verifier's own clock handle.
-            Check::Clock { .. } => self.device.clock_read(),
-        };
-        device::produced((Verified { observed }).encode(out), Fault::BadRequest, out)
-    }
-
-    fn ask(&mut self, input: &[u8], out: &mut [u8]) -> Produced {
-        if AskRequest::decode(input).is_err() {
-            return device::fail(Fault::BadRequest, out);
-        }
-        // No input yet: the activity stays outstanding, durably.
-        let Some(bytes) = self.inputs.take() else {
-            return Produced::Unserviceable;
-        };
-        self.took_input = true;
-        device::produced(
-            AskInput::new(&bytes).and_then(|answer| answer.encode(out)),
-            Fault::BadInput,
-            out,
-        )
-    }
-
-    fn probe(&self, input: &[u8], out: &mut [u8]) -> Produced {
-        let pin = match input {
-            [pin] => esper_core::ids::Pin::new(*pin).ok(),
-            _ => None,
-        };
-        let Some(pin) = pin else {
-            return device::fail(Fault::BadRequest, out);
-        };
-        let output = self.device.direction(pin) == crate::world::Direction::Output;
-        device::produced((Probed { output }).encode(out), Fault::BadRequest, out)
-    }
-
-    fn snapshot(&mut self, kind: ActivityKind, input: &[u8], out: &mut [u8]) -> Produced {
-        let Ok((digest, index, chunk)) = read_snapshot_key(input) else {
-            return device::fail(Fault::BadRequest, out);
-        };
-        if kind == wire::SNAP_STORE {
-            // HOST-ONLY
-            self.store.insert((digest, index), chunk.to_vec());
-            return Produced::Completed(0);
-        }
-        let Some(chunk) = self.store.get(&(digest, index)) else {
-            return device::fail(Fault::SnapshotMissing, out);
-        };
-        if let Some(dst) = out.get_mut(..chunk.len()) {
-            dst.copy_from_slice(chunk);
-            return Produced::Completed(chunk.len());
-        }
-        device::fail(Fault::BadRequest, out)
-    }
+/// Copy `bytes` into `out`, or fail with `fault`.
+fn copy_out(bytes: &[u8], out: &mut [u8], fault: Fault) -> Result<usize, Fault> {
+    out.get_mut(..bytes.len())
+        .ok_or(fault)?
+        .copy_from_slice(bytes);
+    Ok(bytes.len())
 }
 
-impl ActivityDispatcher for HostDispatcher<'_> {
-    type Error = ();
+impl RunPorts for HostPorts<'_> {
+    fn model(&mut self) -> &mut dyn ModelBackend {
+        &mut *self.model
+    }
 
-    fn poll_dispatch(
+    fn tool(
         &mut self,
-        _task: &mut Context<'_>,
-        _id: EffectId,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Poll<Result<Produced, ()>> {
-        self.took_input = false;
-        Poll::Ready(Ok(match kind {
-            wire::INFER => device::infer(self.model, input, out),
-            wire::PROBE => self.probe(input, out),
-            wire::TOOL => self.tool(input, out),
-            wire::VERIFY => self.verify(input, out),
-            wire::ASK => self.ask(input, out),
-            wire::SNAP_STORE | wire::SNAP_LOAD => self.snapshot(kind, input, out),
-            _ => Produced::Unserviceable,
-        }))
+        effect: EffectId,
+        tool: esper_core::ids::ToolId,
+        digest: u64,
+        args: ToolArgs,
+        raw: &mut [u8],
+    ) -> Result<Attempt, Fault> {
+        // The transient-fault plan is consulted before the device, so a
+        // hiccup never reaches hardware.
+        if self.faults.consume(tool.get(), dispatch_resource(args)) {
+            return Ok(Attempt::Transient);
+        }
+        #[cfg(test)]
+        if let Some(outcome) = self.injected_outcome.take() {
+            return copy_out(&outcome, raw, Fault::OutcomeTooLarge).map(Attempt::Done);
+        }
+        let outcome = match args {
+            ToolArgs::GpioPinRead { pin } => self.device.dispatch_read(pin, effect, digest),
+            ToolArgs::GpioPinWrite { pin, level } => {
+                self.device
+                    .dispatch_write(pin, level == Level::High, effect, digest)
+            }
+            ToolArgs::SensorSampleRead { sensor } => {
+                self.device.dispatch_sensor_read(sensor, effect, digest)
+            }
+            ToolArgs::TimerUptimeRead => self.device.dispatch_uptime_read(effect, digest),
+            ToolArgs::TimerDelayWait { ms } => self.device.dispatch_delay_wait(ms, effect, digest),
+            ToolArgs::DeviceStatusReport { detail } => {
+                self.device.dispatch_status_report(detail, effect, digest)
+            }
+        }
+        .map_err(world_fault)?;
+        copy_out(&outcome, raw, Fault::OutcomeTooLarge).map(Attempt::Done)
+    }
+
+    fn pin_is_output(&mut self, pin: esper_core::ids::Pin) -> bool {
+        self.device.direction(pin) == crate::world::Direction::Output
+    }
+
+    fn read_back(&mut self, check: Check) -> u64 {
+        match check {
+            // The verifier reads the pin directly, independent of the
+            // dispatch path.
+            Check::Pin { pin, .. } => esper_core::ids::Pin::new(pin)
+                .map_or(0, |pin| u64::from(self.device.verify_read(pin))),
+            // The verifier's own clock handle.
+            Check::Clock { .. } => self.device.clock_read(),
+        }
+    }
+
+    fn operator_input(&mut self, out: &mut [u8]) -> Result<Option<usize>, Fault> {
+        self.inputs.take().map_or(Ok(None), |bytes| {
+            copy_out(&bytes, out, Fault::BadInput).map(Some)
+        })
+    }
+
+    fn store_chunk(&mut self, digest: u64, index: u8, chunk: &[u8]) -> Result<(), Fault> {
+        // HOST-ONLY
+        self.store.insert((digest, index), chunk.to_vec());
+        Ok(())
+    }
+
+    fn load_chunk(&mut self, digest: u64, index: u8, out: &mut [u8]) -> Result<usize, Fault> {
+        let chunk = self
+            .store
+            .get(&(digest, index))
+            .ok_or(Fault::SnapshotMissing)?;
+        copy_out(chunk, out, Fault::BadRequest)
     }
 }
 
@@ -691,11 +652,16 @@ fn segment_context(frames: &[Frame]) -> (Vec<u64>, u64) {
 }
 
 /// Encode the run's input for `seed` (and its parent fold).
-fn run_start(seed: &RunSeed, snapshot: Option<&[u8]>) -> Result<Vec<u8>, RuntimeError> {
+fn run_start(
+    seed: &RunSeed,
+    snapshot: Option<&[u8]>,
+    harvest: usize,
+) -> Result<Vec<u8>, RuntimeError> {
     let snapshot = match snapshot {
         Some(bytes) => Some(SnapshotRef {
             digest: fnv1a64(bytes),
             len: u16::try_from(bytes.len()).map_err(|_| RuntimeError::BadFrame)?,
+            harvest: u8::try_from(harvest).map_err(|_| RuntimeError::BadFrame)?,
         }),
         None => None,
     };
@@ -799,8 +765,9 @@ fn bind(
     seed: &RunSeed,
     journal: &mut Journal,
     snapshot: Option<&[u8]>,
+    harvest: &[Vec<u8>],
 ) -> Result<Vec<u8>, RuntimeError> {
-    let input = run_start(seed, snapshot)?;
+    let input = run_start(seed, snapshot, harvest.len())?;
     if journal.is_empty() {
         // HOST-ONLY
         journal.input.clone_from(&input);
@@ -809,6 +776,13 @@ fn bind(
             for (index, chunk) in snapshot.chunks(wire::SNAPSHOT_CHUNK).enumerate() {
                 let index = u8::try_from(index).map_err(|_| RuntimeError::BadFrame)?;
                 journal.store.insert((digest, index), chunk.to_vec());
+            }
+            for (index, item) in harvest.iter().enumerate() {
+                let index = u8::try_from(index)
+                    .ok()
+                    .and_then(|i| wire::HARVEST_ITEM_BASE.checked_add(i))
+                    .ok_or(RuntimeError::BadFrame)?;
+                journal.store.insert((digest, index), item.clone());
             }
         }
     } else if journal.input != input {
@@ -864,17 +838,16 @@ fn boot(
         unemit: &unemit,
         pos: 0,
     };
-    let mut dispatcher = HostDispatcher {
+    let mut ports = HostPorts {
         model: &mut *world.model,
         device: &mut *world.device,
         faults: &mut *world.faults,
         inputs: &mut *world.inputs,
         store: &mut store,
-        run: seed.id.get(),
-        took_input: false,
         #[cfg(test)]
         injected_outcome: hooks.injected_outcome.take(),
     };
+    let mut dispatcher = RunDispatcher::new(&mut ports, seed.id);
     let (polled, concluded, unserviceable) = {
         let mut ctx = Ctx::new(&mut records, &mut dispatcher, &mut out);
         let polled = {
@@ -892,10 +865,10 @@ fn boot(
     };
     #[cfg(test)]
     {
-        hooks.injected_outcome = dispatcher.injected_outcome.take();
+        hooks.injected_outcome = ports.injected_outcome.take();
     }
     hooks.reset = reset.get();
-    let requeue = lost.get() && dispatcher.took_input;
+    let requeue = lost.get();
     journal.store = store;
     if requeue {
         world.inputs.untake();
@@ -932,10 +905,10 @@ fn drive_with(
     if handoff.is_some() != seed.parent.is_some() {
         return Err(RuntimeError::JournalCorrupt);
     }
-    let (inherited, snapshot) = handoff.map_or((Vec::new(), None), |handoff| {
-        (handoff.mask_digests, Some(handoff.snapshot))
+    let (inherited, snapshot, harvest) = handoff.map_or((Vec::new(), None, Vec::new()), |h| {
+        (h.mask_digests, Some(h.snapshot), h.harvest)
     });
-    let input = bind(seed, journal, snapshot.as_deref())?;
+    let input = bind(seed, journal, snapshot.as_deref(), &harvest)?;
     let crash = Cell::new(crash);
     // After a reset that followed the terminal record, the next boot
     // replays the whole run and must conclude the same way.
@@ -1016,6 +989,17 @@ fn finish(
             .ok_or(RuntimeError::JournalCorrupt)?;
         bytes.extend_from_slice(chunk);
     }
+    let mut harvest = Vec::new();
+    for index in 0..snapshot.harvest {
+        let index = wire::HARVEST_ITEM_BASE
+            .checked_add(index)
+            .ok_or(RuntimeError::JournalCorrupt)?;
+        let item = journal
+            .store
+            .get(&(snapshot.digest, index))
+            .ok_or(RuntimeError::JournalCorrupt)?;
+        harvest.push(item.clone());
+    }
     Ok(SegmentOutcome::Rollover(
         trace,
         RolloverHandoff {
@@ -1023,6 +1007,7 @@ fn finish(
             lineage,
             prompt_bytes,
             mask_digests,
+            harvest,
         },
     ))
 }

@@ -32,9 +32,12 @@ Waymaker workflow, shipped on the device (target: ESP32-S3,
   fake device, fault injectors, in-memory journals, fixture runners —
   each allocation site marked `// HOST-ONLY`. Product logic never
   lives behind `host`.
-- **The run and the supervisor are both workflows.** `run::run` and
-  `agent::supervise` are `async fn`s over `Ctx` in the firmware build
-  (SPEC §21–22, ADR 0002–0003). `journal.rs` (the derived `Frame`
+- **The run and the supervisor are both workflows,** joined by a
+  product board dispatcher. `run::run` and `agent::supervise` are
+  `async fn`s over `Ctx` in the firmware build, and `agent::device::Device`
+  drives one from the other over a board's `RunStore` and `DevicePorts`
+  (SPEC §21–23, ADR 0002–0004). A board supplies those two traits —
+  never its own dispatcher. `journal.rs` (the derived `Frame`
   view), `world.rs` and `run::host` / `agent::host` are host-only
   doubles and harnesses — never product logic.
 

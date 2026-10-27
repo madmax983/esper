@@ -79,7 +79,7 @@ pub const SNAPSHOT_KEY_BYTES: usize = 8 + 1;
 /// The largest encoded [`TerminalRecord`].
 pub const MAX_TERMINAL_BYTES: usize = 1 + 1 + MAX_REASON + 2 + OUTPUT_CAP;
 /// The largest encoded [`RunStart`].
-pub const MAX_RUN_START_BYTES: usize = SEED_INPUT_LEN + (1 + 2 + BRIEF_CAP) + (1 + 8 + 2);
+pub const MAX_RUN_START_BYTES: usize = SEED_INPUT_LEN + (1 + 2 + BRIEF_CAP) + (1 + 8 + 2 + 1);
 
 /// The longest machine-readable terminal reason.
 pub const MAX_REASON: usize = 48;
@@ -95,6 +95,7 @@ const _: () = {
     assert!(2 + MAX_ASK_INPUT <= PAGE_RECORD_MAX);
     assert!(MAX_TERMINAL_BYTES <= PAGE_RECORD_MAX);
     assert!(MAX_RUN_START_BYTES <= PAGE_RECORD_MAX);
+    assert!(esper_core::checkpoint::MAX_ENTRY_RECORD_BYTES <= SNAPSHOT_CHUNK);
 };
 
 // ---------------------------------------------------------------------
@@ -999,7 +1000,14 @@ pub struct SnapshotRef {
     pub digest: u64,
     /// The encoded snapshot's length.
     pub len: u16,
+    /// Harvested memory entries the parent kept, stored as items from
+    /// [`HARVEST_ITEM_BASE`] up under the same digest.
+    pub harvest: u8,
 }
+
+/// The snapshot-store index of a carried harvest entry's first item:
+/// chunk indices below it are snapshot chunks.
+pub const HARVEST_ITEM_BASE: u8 = 0x80;
 
 impl SnapshotRef {
     /// The number of [`SNAPSHOT_CHUNK`]-sized chunks.
@@ -1042,6 +1050,7 @@ impl RunStart {
                 w.u8(1)?;
                 w.u64(snapshot.digest)?;
                 w.u16(snapshot.len)?;
+                w.u8(snapshot.harvest)?;
             }
             None => w.u8(0)?,
         }
@@ -1072,6 +1081,7 @@ impl RunStart {
             Some(SnapshotRef {
                 digest: r.u64()?,
                 len: r.u16()?,
+                harvest: r.u8()?,
             })
         } else {
             None

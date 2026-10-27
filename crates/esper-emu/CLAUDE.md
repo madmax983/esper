@@ -10,9 +10,11 @@ directly as its oracle).
 
 ## Rules
 
-- **`src/workload.rs`** holds the `run` stage's doubles (a
-  fixed-capacity journal, an 8-pin device, a scripted model) and drives
-  `esper_runtime::run::run` through one reset. `xtask` includes it next
+- **`src/workload.rs`** holds the doubles (a fixed-capacity journal, an
+  8-pin device, a scripted model, a one-run `RunStore`) behind the
+  product dispatchers: the `run` stage drives `run::run` through
+  `RunDispatcher`; the `agent` stage drives `supervise` through the
+  board `Device`. Both go through one reset. `xtask` includes it next
   to `boot.rs`; keep both target-independent.
 - **`src/boot.rs` is target-independent.** It runs on the host as the
   oracle and on each core. No `cfg(target_arch)` in it; anything

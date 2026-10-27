@@ -89,8 +89,8 @@ ever gated behind `host` again.
 - Every existing fixture, distill table, and Jev cassette is
   unchanged.
 - The supervisor is firmware-clean, and since ADR 0003 so is the run;
-  the board's `RUN` dispatcher still has to be written. The host
-  dispatcher double drives runs through `drive_segment`.
+  since ADR 0004 so is the board dispatcher behind `RUN`, which the
+  host double now uses too.
 - RAM: `AgentState` 7,384 B, the `supervise` future 2,280 B (host,
   64-bit; pinned by test). Briefed runs use a 1536-byte prompt buffer
   (+512 B). Board figures are not yet measured.

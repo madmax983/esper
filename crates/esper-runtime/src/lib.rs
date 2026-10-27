@@ -34,6 +34,9 @@ const _: () = {
     let _ = agent::AgentSeed::default_slice;
     let _ = agent::wire::PAGE_RECORD_MAX;
     let _: fn(&agent::Start, &mut [u8]) -> Result<usize, agent::AgentError> = agent::Start::encode;
+    // The board dispatcher ships on the device.
+    let _ = agent::goal_of;
+    let _ = agent::device::MAX_SEGMENTS;
     // The run workflow ships on the device too.
     let _ = run::RunState::new;
     let _ = run::wire::RunStart::decode;
