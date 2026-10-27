@@ -407,6 +407,9 @@ pub(crate) fn build_seed(fixture: &Fixture, model_bundle: u64) -> Result<RunSeed
         // context budget drives the runtime's rollover trigger.
         context_budget_bytes: fixture.seed.context_budget_bytes,
         parent: None,
+        // Golden fixtures are plain runs: no supervisor, no brief
+        // (SPEC §21.4), so their prompts stay byte-identical.
+        brief: None,
     })
 }
 

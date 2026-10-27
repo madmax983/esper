@@ -102,3 +102,31 @@ the normative behavior: two repair turns are allowed, the third invalid
 output degrades. The counting itself lives in the runtime (derived from
 committed outcomes); the state machine only exposes the
 `RepairAvailable` / `RepairExhausted` events.
+
+## Always-on primitives (§21, E4+aon)
+
+- Exactly 11 legal `(GoalStatus, GoalEvent)` pairs; the four terminal
+  statuses have no outgoing edge. (`goal_transition_table_is_exactly_
+  the_eleven_edges`, `terminal_goal_statuses_have_no_outgoing_edge`.)
+- Envelope never widens: `remaining + reserved <= granted` per unit,
+  checked by `Goal::check_envelope` after every ledger change and by
+  a seeded property test over 300 random spawn/park/resume/settle
+  lifecycles (`envelope_never_widens_under_random_lifecycles`).
+- A refund larger than its reservation fails closed
+  (`RefundExceedsReservation`).
+- `Denied`, `Incompatible`, `StorageFault` fail a goal at once; other
+  failures back off `min(base · 2^(k−1), cap)` and fail at
+  `max_consecutive_failures` (`backoff_is_monotonic_and_bounded`).
+- Operator control never drops an obligation: `Running`/`Waiting` →
+  `GoalBusy`.
+- Goal ids are monotonic and never reused, even after `reap`.
+- Memory masks the full input before truncating to `NOTE_MAX`
+  (`ingest_masks_the_full_input_before_truncating`) and strips control
+  bytes so no value can forge a prompt line.
+- Pinned (operator) entries are capped at 8 and never evicted;
+  harvested entries evict oldest-stamp-first.
+- Storage is canonical: `reap` and `forget` compact their slot arrays,
+  so a checkpoint decodes to exactly the state it encodes
+  (`checkpoint_round_trips_after_reap_and_forget`, a regression test).
+- Checkpoint decode fails closed in the §20.3 order; every truncation
+  and every single-bit flip is rejected.

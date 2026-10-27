@@ -11,6 +11,11 @@
 //!
 //! The driver entry point is [`drive_run`] (plus [`drive_run_async`]
 //! under the `host` feature).
+//!
+//! E4+aon adds the always-on layer above the run ([`agent`]): a
+//! supervisor paced by a durable heartbeat ([`drive_beat`],
+//! [`run_heartbeat`]) that serves standing goals with ordinary runs and
+//! carries masked memory between them (SPEC §21).
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "host"), no_std)]
@@ -25,6 +30,8 @@ pub mod backend;
 pub mod error;
 pub mod seed;
 
+#[cfg(feature = "host")]
+pub mod agent;
 #[cfg(feature = "host")]
 pub mod engine;
 #[cfg(feature = "host")]
@@ -46,9 +53,9 @@ pub use backend::ScriptedBackend;
 // The E3+jev System One adapter: a typed host backend. The transport
 // vocabulary it names is public so cassettes stay authorable.
 pub use backend::{
-    BackendError, BundleId, DistillEntry, InferenceSettings, ModelBackend, OUTPUT_CAP, PROMPT_CAP,
-    PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend, TokenUsage, build_prompt,
-    fingerprint_prompt, fnv1a64,
+    BRIEFED_PROMPT_CAP, BackendError, BundleId, DistillEntry, InferenceSettings, ModelBackend,
+    OUTPUT_CAP, PROMPT_CAP, PriorCtx, PromptCtx, RepairHint, TINY_PARAMS_BYTES, TinyBackend,
+    TokenUsage, build_prompt, fingerprint_prompt, fnv1a64,
 };
 #[cfg(feature = "host")]
 pub use jev::{
@@ -61,8 +68,15 @@ pub use jev::{
 // the status detail level, and the typed dispatch arguments).
 pub use esper_core::decision::{StatusDetail, ToolArgs};
 pub use esper_core::registry::Capabilities;
-pub use seed::{ESPER_WORKFLOW_KIND, RunSeed, WORKFLOW_VERSION};
+pub use seed::{ESPER_WORKFLOW_KIND, RunSeed, SEED_INPUT_LEN, WORKFLOW_VERSION};
 
+// E4+aon: the always-on supervisor (SPEC §21).
+#[cfg(feature = "host")]
+pub use agent::{
+    AgentCrash, AgentCrashPoint, AgentError, AgentFrame, AgentSeed, AgentStore, AgentWorld,
+    BeatAction, CheckpointReport, Inbox, Pulse, RunRecord, Segment, Settlement, Supervisor,
+    drive_beat, halt_beat_at, run_heartbeat,
+};
 #[cfg(feature = "host")]
 pub use engine::{RolloverHandoff, SegmentOutcome, drive_run, drive_run_async, drive_segment};
 #[cfg(feature = "host")]

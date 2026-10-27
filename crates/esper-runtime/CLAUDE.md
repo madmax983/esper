@@ -54,6 +54,16 @@ verification, per-segment journal ownership, and the
   Rollover), `RolloverHandoff` (snapshot + lineage + prompt bytes +
   digest stream); the 80% rollover trigger in `do_gather`; the
   failed-path guard in `do_authorize`; masking in `do_observe`.
+- `src/agent.rs` — E4+aon (SPEC §21): the always-on supervisor.
+  `AgentSeed` (template run seed = capability ceiling, plus
+  `SchedulePolicy`), `AgentStore` (supervisor `AgentFrame` journal +
+  owned `RunRecord`s of `Segment`s), `Inbox` (per-goal input),
+  `AgentWorld`, `Supervisor` (replay-derived ledger, memory, beat;
+  operator API `add_goal` / `pause` / `unpause` / `retire` /
+  `remember` / `forget` / `checkpoint`), `drive_beat` (one beat,
+  crash-injectable at 5 `AgentCrashPoint`s or a run `CrashPoint`),
+  `run_heartbeat` (Tokio interval, `MissedTickBehavior::Delay`),
+  `Pulse`, harvest.
 - `src/journal.rs` — `Frame` / `Journal`: the only durable state.
   Everything else is derived by replay. E4: `ToolObservation`
   carries `secret_digest`; `ModelDecision` carries `prompt_bytes`.
@@ -77,6 +87,11 @@ verification, per-segment journal ownership, and the
 - `tests/invariants.rs` — the durability contract.
 - `tests/context_lifecycle.rs` — E4: masking, 80% rollover, lineage,
   failed-path survival, reboot after rollover, corrupt snapshot.
+- `tests/always_on.rs` — E4+aon: cadence, satisfaction, least-privilege
+  denial, backoff, envelope exhaustion, parking, memory rules, brief
+  binding, checkpoint, rollover under supervision, the Tokio
+  heartbeat, and the agent crash matrix (5 agent points × every beat,
+  11 run points × the run beats, all equal to the crash-free result).
 
 ## Authority order
 
@@ -184,3 +199,30 @@ The doubles model the physical world: `FaultPlan` consumption and
   `[truncated]`) + `EMIT one decision line.` The fixed part always
   fits `PROMPT_CAP` — pinned by test, so signature growth fails
   loudly.
+
+## E4+aon: the supervisor (SPEC §21)
+
+**Write path.** Every supervisor change goes through
+`Supervisor::commit`: prove the frame applies to the derived state,
+then append it. Replay runs the same `apply`, so the live path and
+recovery cannot disagree, and a frame that would not replay is never
+committed. Operator ops prove themselves on a copy of the ledger or
+memory first.
+
+**Beat order.** `BeatStarted` → pick → `RunSpawned` (full seed +
+reservation) or `RunResumed` → drive the run's newest segment
+(rollovers append segments) → `RunParked` or `RunSettled` (refund +
+harvest) → `BeatCompleted`. `drive_beat` pins the beat it owns on the
+first boot; after any crash it finishes that beat and returns its
+pulse, never starting the next one.
+
+**Briefs.** A spawned seed carries `brief: Some(..)` and
+`InferenceSettings::briefed_settings()` (1536-byte prompt). The brief
+is bound into the 151-byte seed snapshot and inherited by rollover
+children. Plain seeds keep the 1024 cap: `RunSeed::validate` picks the
+cap by brief presence.
+
+**Harvest.** From every segment's committed trace: successful
+observations (mutating tools only with a passing verification), last
+write per key; then the goal's `Outcome`. Inputs over
+`MEMORY_INPUT_MAX` are skipped, never truncated unmasked.

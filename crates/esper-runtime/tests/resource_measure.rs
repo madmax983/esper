@@ -155,6 +155,7 @@ fn seed_for(harness: &Harness, model_bundle: u64) -> RunSeed {
         inference: InferenceSettings::default_settings(),
         context_budget_bytes: None,
         parent: None,
+        brief: None,
     }
 }
 

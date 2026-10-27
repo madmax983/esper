@@ -102,9 +102,11 @@ impl RecordKind {
     }
 }
 
-/// The single logical terminal result (§8.2): a machine-readable status,
-/// a bounded machine-readable reason, and a bounded user-facing summary.
-/// Only [`TerminalStatus::Completed`] claims the objective was met.
+/// The single logical terminal result (§8.2).
+///
+/// A machine-readable status, a bounded machine-readable reason, and a
+/// bounded user-facing summary. Only [`TerminalStatus::Completed`]
+/// claims the objective was met.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalResult {
     status: TerminalStatus,

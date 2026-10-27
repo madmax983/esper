@@ -33,6 +33,14 @@ use thiserror::Error;
 /// Maximum bytes of one inference prompt (E3).
 pub const PROMPT_CAP: usize = 1024;
 
+/// Maximum bytes of one inference prompt for a briefed run (E4+aon).
+///
+/// SPEC §21.4: [`PROMPT_CAP`] plus room for the GOAL/MEM brief and a
+/// full LAST line. Only a seed that carries a brief may raise
+/// `max_prompt_bytes` above [`PROMPT_CAP`]; the engine's prompt buffer
+/// is this size.
+pub const BRIEFED_PROMPT_CAP: usize = 1536;
+
 /// Maximum bytes of one model output line (E3).
 pub const OUTPUT_CAP: usize = 256;
 
@@ -52,6 +60,12 @@ pub const TINY_PARAMS_BYTES: usize = 2156;
 const PROMPT_CAP_U16: u16 = {
     assert!(PROMPT_CAP == 1024);
     1024
+};
+
+/// `BRIEFED_PROMPT_CAP` as `u16`, tied to the cap by assertion.
+const BRIEFED_PROMPT_CAP_U16: u16 = {
+    assert!(BRIEFED_PROMPT_CAP == 1536);
+    1536
 };
 
 /// `OUTPUT_CAP` as `u16` for the [`InferenceSettings`] fields: 256
@@ -99,6 +113,33 @@ impl InferenceSettings {
             return Err("max_output_bytes must be within 1..=256");
         }
         Ok(())
+    }
+
+    /// Validate the bounds for a briefed run (E4+aon, SPEC §21.4): the
+    /// prompt may use up to [`BRIEFED_PROMPT_CAP`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason when a bound is zero or exceeds its
+    /// cap.
+    pub const fn validate_briefed(&self) -> Result<(), &'static str> {
+        if self.max_prompt_bytes == 0 || self.max_prompt_bytes > BRIEFED_PROMPT_CAP_U16 {
+            return Err("max_prompt_bytes must be within 1..=1536 for a briefed run");
+        }
+        if self.max_output_bytes == 0 || self.max_output_bytes > OUTPUT_CAP_U16 {
+            return Err("max_output_bytes must be within 1..=256");
+        }
+        Ok(())
+    }
+
+    /// The briefed-run defaults: the full briefed prompt cap and the
+    /// full output cap.
+    #[must_use]
+    pub const fn briefed_settings() -> Self {
+        Self {
+            max_prompt_bytes: BRIEFED_PROMPT_CAP_U16,
+            max_output_bytes: OUTPUT_CAP_U16,
+        }
     }
 
     /// The canonical 4-byte encoding, little-endian: `max_prompt_bytes`
@@ -480,6 +521,10 @@ pub struct PromptCtx<'a> {
     /// The folded-history marker, when this run continues a
     /// compacted parent (E4, SPEC §20.5). `None` for root runs.
     pub prior: Option<PriorCtx>,
+    /// The goal objective and recalled memory, when an always-on
+    /// supervisor spawned this run (E4+aon, SPEC §21.4). `None` for
+    /// plain runs, whose prompts are byte-identical to E4.
+    pub brief: Option<&'a esper_core::brief::Brief>,
 }
 
 /// The folded-history marker for a continued run's prompt (E4,
@@ -540,6 +585,8 @@ const TRUNCATED_MARKER: &str = "[truncated]\n";
 /// <render_signature of each of the 6 catalog tools>
 /// STATE turns=<n> muts=<n>
 /// PRIOR [stale:folded@epoch=<e>] failed=<n> pending=<n> facts=<n>
+/// GOAL <objective>
+/// MEM <label> = <value>
 /// REPAIR <attempt>:<variant> <grammar one-liner>
 /// LAST <observation bytes>
 /// EMIT one decision line.
@@ -554,14 +601,17 @@ const TRUNCATED_MARKER: &str = "[truncated]\n";
 /// failed-path, pending-obligation, and fact counts. The parent's
 /// raw bytes never appear in a continued prompt: any reference to a
 /// compacted frame resolves to the marker, never to the original
-/// payload. The REPAIR line appears only after an invalid line burned a
+/// payload. The GOAL and MEM lines (the brief, SPEC §21.4) appear only
+/// in a run an always-on supervisor spawned: the pre-rendered
+/// [`esper_core::brief::Brief`], already masked and bounded to
+/// `BRIEF_CAP`. The REPAIR line appears only after an invalid line burned a
 /// turn, and carries the attempt, the §4.4 variant, and the grammar
 /// one-liner again. The LAST line appears only after a tool reported,
 /// and carries the observation bytes raw (already bounded machine
 /// JSON, capped at 128 bytes by the engine).
 ///
 /// Truncation rule: the TOOLS block, the STATE line, the PRIOR line,
-/// the REPAIR line, and the EMIT trailer are fixed — they are never
+/// the brief, the REPAIR line, and the EMIT trailer are fixed — they are never
 /// truncated. Only the LAST observation tail may truncate, and then
 /// it ends with `[truncated]`. The framing around the signatures is
 /// abbreviated (`turns=`/`muts=`) so the fixed prompt — signatures plus
@@ -597,6 +647,11 @@ pub fn build_prompt(ctx: &PromptCtx, out: &mut [u8]) -> usize {
             " failed={} pending={} facts={}",
             prior.failed_paths, prior.pending, prior.facts
         );
+    }
+    if let Some(brief) = ctx.brief {
+        // The brief: pre-rendered newline-ended lines, fixed, never
+        // truncated (SPEC §21.4).
+        let _ = writer.write_bytes(brief.as_bytes());
     }
     if let Some(hint) = ctx.repair {
         let _ = writeln!(
@@ -748,6 +803,7 @@ mod tests {
             last_observation: None,
             repair: None,
             prior: None,
+            brief: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -784,6 +840,7 @@ mod tests {
                 variant: "malformed",
             }),
             prior: None,
+            brief: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -803,6 +860,7 @@ mod tests {
             last_observation: Some(b"{\"pin\":4,\"level\":\"low\"}"),
             repair: None,
             prior: None,
+            brief: None,
         };
         let n = build_prompt(&ctx, &mut out);
         let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
@@ -824,6 +882,7 @@ mod tests {
             last_observation: None,
             repair: None,
             prior: None,
+            brief: None,
         };
         let n = build_prompt(&root, &mut out);
         let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
@@ -842,6 +901,7 @@ mod tests {
                 pending: 0,
                 facts: 2,
             }),
+            brief: None,
         };
         let n = build_prompt(&child, &mut out);
         let text = core::str::from_utf8(&out[..n]).expect("the prompt is ASCII");
@@ -878,6 +938,7 @@ mod tests {
             last_observation: None,
             repair: None,
             prior: None,
+            brief: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -911,6 +972,7 @@ mod tests {
                 variant: "invalid_args",
             }),
             prior: None,
+            brief: None,
         };
         let n = build_prompt(&ctx, &mut out);
         assert!(
@@ -939,6 +1001,7 @@ mod tests {
             last_observation: Some(&observation),
             repair: None,
             prior: None,
+            brief: None,
         };
         // HOST-ONLY (E3)
         let mut out = [0u8; PROMPT_CAP];
@@ -1116,5 +1179,136 @@ mod tests {
         #[cfg(feature = "host")]
         assert_send::<super::ScriptedBackend>();
         assert_backend_send::<TinyBackend<'static>>();
+    }
+
+    /// A brief holding a full objective and as many maximal MEM lines
+    /// as fit `BRIEF_CAP`.
+    fn max_brief() -> esper_core::brief::Brief {
+        use esper_core::beat::Beat;
+        use esper_core::goal::GoalId;
+        use esper_core::ids::{Digest, ToolId};
+        use esper_core::memory::{Memory, MemoryEntry, MemoryKey, Provenance, recall};
+        let goal = GoalId::MIN;
+        let mut memory = Memory::new();
+        for i in 0..4u8 {
+            let key = MemoryKey::Observation {
+                tool: ToolId::new(1),
+                args_digest: Digest::of_bytes(&[i]),
+            };
+            let entry = MemoryEntry::new(
+                key,
+                &[b'L'; 40],
+                &[b'V'; 40],
+                Provenance {
+                    goal: Some(goal),
+                    run: None,
+                    beat: Beat::new(1),
+                },
+            )
+            .expect("entry");
+            memory.write(entry).expect("write");
+        }
+        let objective = esper_core::compact::Note::from_bytes(&[b'o'; 64]).expect("note");
+        esper_core::brief::Brief::compose(&objective, &recall(&memory, goal))
+    }
+
+    /// The brief sits after STATE/PRIOR and before REPAIR/LAST, whole.
+    #[test]
+    fn brief_lines_sit_between_prior_and_repair() {
+        let brief = max_brief();
+        let observation = br#"{"pin":3,"level":"low"}"#;
+        let ctx = PromptCtx {
+            turns_left: 5,
+            mutations_left: 2,
+            last_observation: Some(observation),
+            repair: Some(RepairHint {
+                attempt: 1,
+                variant: "malformed",
+            }),
+            prior: Some(PriorCtx {
+                epoch: 3,
+                failed_paths: 0,
+                pending: 0,
+                facts: 1,
+            }),
+            brief: Some(&brief),
+        };
+        let mut out = [0u8; super::BRIEFED_PROMPT_CAP];
+        let n = build_prompt(&ctx, &mut out);
+        let text = core::str::from_utf8(&out[..n]).expect("ASCII");
+        let at = |needle: &str| text.find(needle).expect(needle);
+        assert!(at("STATE ") < at("PRIOR "));
+        assert!(at("PRIOR ") < at("GOAL "));
+        assert!(at("GOAL ") < at("MEM "));
+        assert!(at("MEM ") < at("REPAIR "));
+        assert!(at("REPAIR ") < at("LAST "));
+        let brief_text = core::str::from_utf8(brief.as_bytes()).expect("ASCII");
+        assert!(text.contains(brief_text), "the brief renders whole");
+        // A plain run's prompt carries no brief lines at all.
+        let plain = PromptCtx { brief: None, ..ctx };
+        let n = build_prompt(&plain, &mut out);
+        let text = core::str::from_utf8(&out[..n]).expect("ASCII");
+        assert!(!text.contains("GOAL ") && !text.contains("MEM "));
+    }
+
+    /// The budget pin for briefed runs (SPEC §21.4): the longest fixed
+    /// prompt (maximal counters, PRIOR, the longest REPAIR) plus a
+    /// full brief plus a full 128-byte LAST line fits
+    /// `BRIEFED_PROMPT_CAP` with nothing truncated.
+    #[test]
+    fn briefed_prompt_fits_the_briefed_cap() {
+        let brief = max_brief();
+        assert!(brief.as_bytes().len() > 200, "the brief is near its cap");
+        let observation = [b'x'; 128];
+        let ctx = PromptCtx {
+            turns_left: u16::MAX,
+            mutations_left: u16::MAX,
+            last_observation: Some(&observation),
+            repair: Some(RepairHint {
+                attempt: u8::MAX,
+                variant: "invalid_args",
+            }),
+            prior: Some(PriorCtx {
+                epoch: u32::MAX,
+                failed_paths: u8::MAX,
+                pending: u8::MAX,
+                facts: u8::MAX,
+            }),
+            brief: Some(&brief),
+        };
+        let mut out = [0u8; super::BRIEFED_PROMPT_CAP];
+        let n = build_prompt(&ctx, &mut out);
+        let text = core::str::from_utf8(&out[..n]).expect("ASCII");
+        assert!(
+            !text.contains("[truncated]"),
+            "nothing truncates: {n} bytes"
+        );
+        assert!(text.ends_with("EMIT one decision line.\n"));
+        assert!(
+            n + esper_core::brief::BRIEF_CAP - brief.as_bytes().len() <= super::BRIEFED_PROMPT_CAP
+        );
+    }
+
+    #[test]
+    fn briefed_settings_validate_against_the_briefed_cap() {
+        let briefed = InferenceSettings::briefed_settings();
+        briefed.validate_briefed().expect("briefed defaults");
+        assert!(
+            briefed.validate().is_err(),
+            "a plain run keeps the 1024 cap"
+        );
+        let over = InferenceSettings {
+            max_prompt_bytes: 1537,
+            ..briefed
+        };
+        assert!(over.validate_briefed().is_err());
+        let zero = InferenceSettings {
+            max_prompt_bytes: 0,
+            ..briefed
+        };
+        assert!(zero.validate_briefed().is_err());
+        InferenceSettings::default_settings()
+            .validate_briefed()
+            .expect("the plain defaults are a valid briefed setting too");
     }
 }
