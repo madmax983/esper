@@ -10,8 +10,8 @@ The supervisor and the run are `no_std` Waymaker workflows over `Ctx`
 `RunStore` and `DevicePorts` (ADR 0004). What the ESP32-S3 needed was
 those two traits on its SPI flash. Waymaker's flash driver
 (`waymaker-drive`) and its bridge to `Ctx` were test support; Waymaker's
-ADR 0055 (madmax983/waymaker#213) made both layers, and Esper patches
-its Waymaker crates to that revision until they are published.
+ADR 0055 (madmax983/waymaker#213) made both layers, and both are now
+published to crates.io beside the others.
 
 Three facts shaped the board:
 
@@ -55,8 +55,8 @@ Three facts shaped the board:
   run; effects repeat (every board tool tolerates it) and operator input
   the discarded history held is lost.
 - The image is built in CI but not booted: no part, no Xtensa QEMU.
-- Esper depends on a Waymaker git revision until Waymaker publishes;
-  the root `[patch.crates-io]` and the image's must move together.
+- Every Waymaker crate comes from crates.io; the root workspace and the
+  image's must move together.
 
 ## Alternatives considered
 

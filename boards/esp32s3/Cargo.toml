@@ -21,7 +21,7 @@ esper-board = { path = "../../crates/esper-board", default-features = false }
 esper-core = { path = "../../crates/esper-core" }
 esper-runtime = { path = "../../crates/esper-runtime", default-features = false }
 waymaker-core = "0.1.0"
-waymaker-drive = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
+waymaker-drive = "0.1.0"
 esp-hal = { version = "1.2.2", features = ["unstable"] }
 esp-storage = { version = "0.10.0", features = ["embedded-storage"] }
 esp-backtrace = { version = "0.20.0", features = ["panic-handler", "println"] }
@@ -58,12 +58,6 @@ codegen-units = 1
 debug = 2
 lto = "fat"
 opt-level = "s"
-
-# The root workspace's patch, repeated: every Waymaker crate from one source.
-[patch.crates-io]
-waymaker-core = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
-waymaker-flash = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
-waymaker-embassy = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
 
 # The root workspace's lints, repeated: this is a workspace of its own.
 [lints.clippy]

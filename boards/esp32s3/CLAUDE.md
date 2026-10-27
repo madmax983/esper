@@ -30,5 +30,5 @@ cargo +1.97 clippy --no-default-features --features esp32c3 --target riscv32imc-
 ```
 
 The plan starts at 4 MiB (`PLAN_BASE`) and takes 448 KiB; it assumes the
-default 8 MiB partition layout leaves that region unused. Keep the
-`[patch.crates-io]` revision equal to the root manifest's.
+default 8 MiB partition layout leaves that region unused. Keep its
+Waymaker versions equal to the root workspace's.

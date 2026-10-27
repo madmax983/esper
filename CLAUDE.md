@@ -75,8 +75,9 @@ cd boards/esp32s3
 cargo +1.97 clippy --no-default-features --features esp32c3 --target riscv32imc-unknown-none-elf -- -D warnings
 ```
 
-Waymaker comes from a git revision (`[patch.crates-io]` in the root
-manifest and in `boards/esp32s3/Cargo.toml`, plus `waymaker-drive` /
-`waymaker-bridge` in `esper-board`): bump all of them together.
+Every Waymaker crate comes from crates.io, `waymaker-drive` and
+`waymaker-bridge` included. Never mix a git source with a registry one:
+the types would not unify. Bump them together, in the root workspace and
+in `boards/esp32s3` (a workspace of its own).
 
 Do not publish any crate (Mark's call).

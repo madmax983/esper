@@ -14,11 +14,3 @@ resolver = "2"
 pedantic = "deny"
 nursery = "deny"
 
-# Waymaker at the revision that made `waymaker-drive` and `waymaker-bridge`
-# layers (madmax983/waymaker ADR 0055). The board needs both, they are not
-# published yet, and every Waymaker crate must come from one source or the
-# types do not unify. Bump this rev with the board's, together.
-[patch.crates-io]
-waymaker-core = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
-waymaker-flash = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
-waymaker-embassy = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }

@@ -1510,7 +1510,8 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 [[package]]
 name = "waymaker-bridge"
 version = "0.1.0"
-source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2248b62b34dfc393596e83d32bc353a26fa6b5f838bd3633ca6dddf95d245365"
 dependencies = [
  "waymaker-core",
  "waymaker-drive",
@@ -1520,12 +1521,14 @@ dependencies = [
 [[package]]
 name = "waymaker-core"
 version = "0.1.0"
-source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7a87f8767aca4143ed665476a743b65c03991863f5e859a790974b5fba1044e"
 
 [[package]]
 name = "waymaker-drive"
 version = "0.1.0"
-source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adf32618a5131efadb1794b11f1f9819934310df2b6e14347a06a54d1adcb169"
 dependencies = [
  "waymaker-core",
  "waymaker-flash",
@@ -1534,7 +1537,8 @@ dependencies = [
 [[package]]
 name = "waymaker-embassy"
 version = "0.1.0"
-source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c3cceb35d5ee729e6fae0b127312517641689974439efb15795295d22b6442"
 dependencies = [
  "waymaker-core",
  "waymaker-flash",
@@ -1543,7 +1547,8 @@ dependencies = [
 [[package]]
 name = "waymaker-flash"
 version = "0.1.0"
-source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2affa2a710222b7998064895c16935ae638c9187c02ea66a6dacf62c92933025"
 dependencies = [
  "waymaker-core",
 ]

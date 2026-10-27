@@ -287,8 +287,8 @@ Things this environment cannot verify, stated plainly:
 - **E4+aon on the board.** The supervisor, the run (SPEC §22) and the
   board dispatcher that drives one from the other (SPEC §23) are all
   `no_std` and run together on two emulated ARM cores. The
-  flash-backed `RunStore` is the board crate's: Waymaker's façade
-  bridge is not published to crates.io.
+  flash-backed `RunStore` is the board crate's (SPEC §24), over
+  Waymaker's published driver and bridge.
   A boot-clock heartbeat restarts its interval after a reset; only a
   persistent-clock heartbeat survives power loss. Recall is
   recency-ordered, not relevance-ranked. One run at a time.
