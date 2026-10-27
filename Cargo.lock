@@ -111,6 +111,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
+name = "embedded-storage"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c815b3ed4213d85d6cfd274b871f430c0681084e28dfd4a537877f47f844ec83"
+
+[[package]]
+name = "esper-board"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "esper-core",
+ "esper-runtime",
+ "thiserror",
+ "waymaker-bridge",
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+ "waymaker-flash",
+]
+
+[[package]]
 name = "esper-core"
 version = "0.1.0"
 dependencies = [
@@ -418,16 +439,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "waymaker-bridge"
+version = "0.1.0"
+source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+dependencies = [
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+]
+
+[[package]]
 name = "waymaker-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7a87f8767aca4143ed665476a743b65c03991863f5e859a790974b5fba1044e"
+source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+
+[[package]]
+name = "waymaker-drive"
+version = "0.1.0"
+source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
+dependencies = [
+ "waymaker-core",
+ "waymaker-flash",
+]
 
 [[package]]
 name = "waymaker-embassy"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c3cceb35d5ee729e6fae0b127312517641689974439efb15795295d22b6442"
+source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
 dependencies = [
  "waymaker-core",
  "waymaker-flash",
@@ -436,8 +474,7 @@ dependencies = [
 [[package]]
 name = "waymaker-flash"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2affa2a710222b7998064895c16935ae638c9187c02ea66a6dacf62c92933025"
+source = "git+https://github.com/madmax983/waymaker?rev=73507df23f1b5f4f9320284cf0b2a4121a980cf1#73507df23f1b5f4f9320284cf0b2a4121a980cf1"
 dependencies = [
  "waymaker-core",
 ]

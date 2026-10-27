@@ -35,7 +35,7 @@ use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Answer, Ctx, Halted, Handoff, Journal, NoAlarm};
 
-use super::device::{Device, DevicePorts, RunStore, StoreFault};
+use super::device::{Device, DevicePorts, RunBody, RunStore, StoreFault};
 use super::wire::{Command, PAGE_RECORD_MAX, Sense, WireError};
 use super::{AgentError, AgentSeed, AgentState, Pulse, PulseSink, supervise};
 use crate::backend::ModelBackend;
@@ -489,8 +489,6 @@ impl HostRuns<'_> {
 }
 
 impl RunStore for HostRuns<'_> {
-    type Journal = Self;
-
     fn select(&mut self, run: EsperRunId, start: Option<&[u8]>) -> Result<(), StoreFault> {
         if !self.runs.contains_key(&run.get()) {
             let start = start.ok_or(StoreFault::Unknown)?;
@@ -523,9 +521,13 @@ impl RunStore for HostRuns<'_> {
         Ok(input.len())
     }
 
-    fn boot(&mut self) -> &mut Self {
+    fn boot(&mut self, body: &mut dyn RunBody) -> Result<(), StoreFault> {
         self.pos = 0;
-        self
+        let mut out = [0u8; PAGE_RECORD_MAX];
+        // This store records terminal records itself, through `conclude`:
+        // what the body returns is the dispatcher's to settle.
+        let _end = body.drive(self, &mut out);
+        Ok(())
     }
 
     fn terminal(&self, out: &mut [u8]) -> Option<(bool, usize)> {

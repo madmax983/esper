@@ -1,0 +1,14 @@
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3"
+# The Xtensa toolchain links with GCC, which must not add its start files.
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+# The compile check's chip (see the `esp32c3` feature): never flashed.
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3"
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core"]

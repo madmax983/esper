@@ -6,9 +6,11 @@
 //! supplies two things:
 //!
 //! * a [`RunStore`]: one Waymaker journal per run. On the board each is
-//!   flash-backed, behind Waymaker's façade bridge
-//!   (`waymaker-facade-demo::Bridge` over a `waymaker-drive` boundary);
-//!   the dispatcher sees only the [`Journal`] trait.
+//!   flash-backed: `waymaker_drive::Driver` owns the boot, and lends the
+//!   run's journal as `waymaker_bridge::Bridge` over its boundary. The
+//!   dispatcher sees only the [`Journal`] trait, through [`RunBody`] —
+//!   the store calls the run, not the other way round, because a flash
+//!   driver owns its boot loop.
 //! * [`DevicePorts`]: the run's ports ([`RunPorts`]: model, pins, clock,
 //!   operator input, snapshot store) plus the supervisor's (sensing and
 //!   the checkpoint item store).
@@ -43,6 +45,7 @@ use esper_core::beat::Beat;
 use esper_core::goal::GoalId;
 use esper_core::harvest::HarvestSet;
 use esper_core::ids::RunId;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 use waymaker_embassy::ctx::Conclusion;
 use waymaker_embassy::dispatch::Produced;
@@ -77,15 +80,76 @@ pub enum StoreFault {
     Halted,
 }
 
+/// How one boot of the nested run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyEnd {
+    /// The run ended: completed (else failed), its terminal record the
+    /// first `len` bytes of the store's `out`.
+    Ended {
+        /// Whether the run completed.
+        completed: bool,
+        /// The terminal record's length.
+        len: usize,
+    },
+    /// The run faulted, and a replay would fault again: it is over, with
+    /// no terminal record of its own. A store whose driver records
+    /// endings records it failed, with no payload.
+    Faulted,
+    /// The run stopped at a boundary: a wait, an answer still owed, or a
+    /// halted journal. The next boot carries on.
+    Stopped,
+}
+
+/// The nested run's half of one boot of its journal.
+///
+/// [`RunStore::boot`] calls it with the run's journal lent for exactly
+/// that boot. Object-safe, so a store needs no type parameter for the
+/// run it drives.
+pub trait RunBody {
+    /// Drive the run once over `journal`; an ending's terminal record is
+    /// written to `out`. The store records what [`BodyEnd`] says (a flash
+    /// driver writes it as the run's terminal record).
+    fn drive(&mut self, journal: &mut dyn Journal, out: &mut [u8]) -> BodyEnd;
+}
+
+/// A lent `&mut dyn Journal`, as a sized [`Journal`] a [`Ctx`] can hold.
+pub struct Lent<'j>(pub &'j mut dyn Journal);
+
+impl Journal for Lent<'_> {
+    fn schedule(
+        &mut self,
+        kind: ActivityKind,
+        input: &[u8],
+    ) -> Result<waymaker_embassy::Handoff<'_>, waymaker_embassy::Halted> {
+        self.0.schedule(kind, input)
+    }
+
+    fn resolve(
+        &mut self,
+        answer: waymaker_embassy::Answer<'_>,
+    ) -> Result<Outcome<'_>, waymaker_embassy::Halted> {
+        self.0.resolve(answer)
+    }
+
+    fn wait(&mut self, spec: TimerSpec) -> Result<(), waymaker_embassy::Halted> {
+        self.0.wait(spec)
+    }
+
+    fn continue_as_new(&mut self, input: &[u8]) -> waymaker_embassy::Halted {
+        self.0.continue_as_new(input)
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        self.0.deadline_remaining()
+    }
+}
+
 /// Where the device keeps its runs' Waymaker journals.
 ///
 /// On the board each run's journal is flash-backed; Waymaker's
 /// `continue_as_new` retires a segment and installs the next one's input
 /// in the same journal.
 pub trait RunStore {
-    /// One run's journal.
-    type Journal: Journal;
-
     /// Select `run`. The first select of a run creates its journal over
     /// `start` (its encoded [`RunStart`]); a later select finds it,
     /// whatever `start` says.
@@ -104,8 +168,17 @@ pub trait RunStore {
     /// [`StoreFault::Unknown`] when nothing is selected or `out` is short.
     fn input(&self, out: &mut [u8]) -> Result<usize, StoreFault>;
 
-    /// Rewind the selected run's journal for a fresh replay and lend it.
-    fn boot(&mut self) -> &mut Self::Journal;
+    /// Boot the selected run's journal once — a fresh replay from its
+    /// first record — and lend it to `body` for that boot. A store whose
+    /// driver records terminal records itself records the one `body`
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreFault::Halted`] when the media stopped this boot (the
+    /// answer stays outstanding); [`StoreFault::Unknown`] when nothing is
+    /// selected or the journal refused the run.
+    fn boot(&mut self, body: &mut dyn RunBody) -> Result<(), StoreFault>;
 
     /// The selected run's terminal record, if one was written:
     /// completed (else failed) and its length in `out`.
@@ -154,6 +227,65 @@ enum Driven {
     Parked,
     /// Concluded; the terminal record is in [`Device::terminal`].
     Concluded,
+}
+
+/// One boot of one segment of the nested run: what [`Device::drive`]
+/// lends the store, and what the boot left behind.
+struct Segment<'s, 't> {
+    ports: &'s mut dyn RunPorts,
+    state: &'s mut RunState,
+    terminal: &'s mut [u8; PAGE_RECORD_MAX],
+    input: &'s [u8],
+    run: RunId,
+    task: &'s mut Context<'t>,
+    /// The run ended this boot: completed (else failed), and its
+    /// terminal record's length in `terminal`.
+    ended: Option<(bool, usize)>,
+    /// The run faulted.
+    error: Option<RuntimeError>,
+    /// The run is waiting on an answer the world cannot give yet.
+    unserviceable: bool,
+}
+
+impl RunBody for Segment<'_, '_> {
+    fn drive(&mut self, journal: &mut dyn Journal, out: &mut [u8]) -> BodyEnd {
+        let mut journal = Lent(journal);
+        let mut page = [0u8; PAGE_RECORD_MAX];
+        let mut dispatcher = RunDispatcher::new(&mut *self.ports, self.run);
+        let mut ctx = Ctx::new(&mut journal, &mut dispatcher, &mut page);
+        let polled = {
+            let mut workflow = pin!(run(&mut ctx, self.input, &mut *self.state));
+            workflow.as_mut().poll(self.task)
+        };
+        self.unserviceable = ctx.unserviceable();
+        if let Poll::Ready(Err(error)) = polled {
+            self.error = Some(error);
+            return BodyEnd::Faulted;
+        }
+        let (completed, bytes) = match ctx.conclusion() {
+            None => return BodyEnd::Stopped,
+            Some(Conclusion::Ended(Outcome::Completed(bytes))) => (true, bytes),
+            Some(Conclusion::Ended(Outcome::Failed(bytes))) => (false, bytes),
+            Some(Conclusion::Refused) => {
+                self.error = Some(RuntimeError::BadTerminal);
+                return BodyEnd::Faulted;
+            }
+        };
+        let (Some(kept), Some(lent)) = (
+            self.terminal.get_mut(..bytes.len()),
+            out.get_mut(..bytes.len()),
+        ) else {
+            self.error = Some(RuntimeError::BadTerminal);
+            return BodyEnd::Faulted;
+        };
+        kept.copy_from_slice(bytes);
+        lent.copy_from_slice(bytes);
+        self.ended = Some((completed, bytes.len()));
+        BodyEnd::Ended {
+            completed,
+            len: bytes.len(),
+        }
+    }
 }
 
 /// The board dispatcher: the supervisor's activities over a board's
@@ -214,42 +346,34 @@ impl<'a, S: RunStore, P: DevicePorts> Device<'a, S, P> {
                 Ok(start) => start,
                 Err(error) => return Poll::Ready(Err(error.into())),
             };
-            let mut page = [0u8; PAGE_RECORD_MAX];
-            let mut dispatcher = RunDispatcher::new(&mut *self.ports, start.seed.id);
-            let journal = self.runs.boot();
-            let (polled, concluded, unserviceable) = {
-                let mut ctx = Ctx::new(journal, &mut dispatcher, &mut page);
-                let polled = {
-                    let mut workflow = pin!(run(&mut ctx, input, &mut *self.state));
-                    workflow.as_mut().poll(task)
-                };
-                let concluded = match ctx.conclusion() {
-                    Some(Conclusion::Ended(outcome)) => {
-                        let (completed, bytes) = match outcome {
-                            Outcome::Completed(bytes) => (true, bytes),
-                            Outcome::Failed(bytes) => (false, bytes),
-                        };
-                        self.terminal_len = bytes.len();
-                        Some(self.terminal.get_mut(..bytes.len()).map_or(
-                            Err(RuntimeError::BadTerminal),
-                            |dst| {
-                                dst.copy_from_slice(bytes);
-                                Ok(completed)
-                            },
-                        ))
-                    }
-                    Some(Conclusion::Refused) => Some(Err(RuntimeError::BadTerminal)),
-                    None => None,
-                };
-                (polled, concluded, ctx.unserviceable())
+            let mut segment = Segment {
+                ports: &mut *self.ports,
+                state: &mut *self.state,
+                terminal: &mut self.terminal,
+                input,
+                run: start.seed.id,
+                task: &mut *task,
+                ended: None,
+                error: None,
+                unserviceable: false,
             };
-            if let Poll::Ready(Err(error)) = polled {
+            match self.runs.boot(&mut segment) {
+                Ok(()) => {}
+                Err(StoreFault::Halted) => return Poll::Pending,
+                Err(_) => return Poll::Ready(Err(RuntimeError::JournalCorrupt)),
+            }
+            let Segment {
+                ended,
+                error,
+                unserviceable,
+                ..
+            } = segment;
+            if let Some(error) = error {
                 return Poll::Ready(Err(error));
             }
-            match concluded {
-                Some(Ok(completed)) => return self.settle(completed),
-                Some(Err(error)) => return Poll::Ready(Err(error)),
-                None => {}
+            if let Some((completed, len)) = ended {
+                self.terminal_len = len;
+                return self.settle(completed);
             }
             if unserviceable {
                 return Poll::Ready(Ok(Driven::Parked));

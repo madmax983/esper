@@ -82,14 +82,17 @@ jobs:
       - name: Check the firmware build on the host
         run: cargo check --locked -p esper-runtime --no-default-features
 
+      - name: Check the board crate without its test doubles
+        run: cargo check --locked -p esper-board --no-default-features
+
       - name: Build for Cortex-M0 (thumbv6m-none-eabi)
-        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv6m-none-eabi
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime -p esper-board --no-default-features --lib --target thumbv6m-none-eabi
 
       - name: Build for Cortex-M3 (thumbv7m-none-eabi)
-        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv7m-none-eabi
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime -p esper-board --no-default-features --lib --target thumbv7m-none-eabi
 
       - name: Build for Cortex-M4 (thumbv7em-none-eabi)
-        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv7em-none-eabi
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime -p esper-board --no-default-features --lib --target thumbv7em-none-eabi
 
       # The emulated image's binary is behind `required-features`, so the
       # host clippy stage never compiles it, and the emulation job builds
@@ -127,3 +130,43 @@ jobs:
 
       - name: Boot the image on both cores
         run: cargo --locked xtask emulate
+
+  board:
+    # The ESP32-S3 image itself: `boards/esp32s3`, built for
+    # `xtensa-esp32s3-none-elf`. That target exists only in Espressif's
+    # fork of the toolchain, so this job installs it with `espup` — the
+    # one job that does — and builds with the `esp` channel the image's own
+    # `rust-toolchain.toml` names. Building is not booting: nothing here
+    # runs the image on a part or under Espressif's QEMU fork.
+    #
+    # The lint runs on the pinned stable toolchain against the ESP32-C3's
+    # RISC-V core (the image's `esp32c3` feature): the same glue and the
+    # same esp-hal API, on a toolchain whose clippy matches the rest of CI.
+    name: ESP32-S3 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: boards/esp32s3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          target: riscv32imc-unknown-none-elf
+
+      - name: Lint the image's glue (RISC-V compile check, pinned toolchain)
+        run: cargo +1.97 clippy --locked --no-default-features --features esp32c3 --target riscv32imc-unknown-none-elf -- -D warnings
+
+      - name: Install the Espressif toolchain
+        run: |
+          curl -sSfL https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu -o "$RUNNER_TEMP/espup"
+          chmod +x "$RUNNER_TEMP/espup"
+          "$RUNNER_TEMP/espup" install --targets esp32s3 --export-file "$RUNNER_TEMP/export-esp.sh"
+
+      - name: Build the ESP32-S3 image
+        run: |
+          . "$RUNNER_TEMP/export-esp.sh"
+          cargo +esp build --locked --release

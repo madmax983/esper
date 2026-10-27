@@ -1,0 +1,4 @@
+# The Espressif fork: the only toolchain that ships `xtensa-esp32s3-none-elf`.
+# `espup install` puts it in place; CI's `board` job does that.
+[toolchain]
+channel = "esp"

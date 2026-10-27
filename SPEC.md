@@ -2815,11 +2815,16 @@ over two board traits (ADR 0004):
 - **`RunStore`** — one Waymaker `Journal` per run. `select(run, start)`
   creates a run's journal from its `RunStart` the first time and finds
   it after; `input()` is the current segment's input (it changes when
-  the run continues as new); `boot()` rewinds and lends the journal;
-  `terminal()` / `conclude()` read and write the terminal record. On the
-  board the journals are flash-backed behind Waymaker's façade bridge
-  (`waymaker-drive` + `waymaker-facade-demo::Bridge`, not yet published
-  to crates.io, so the binding lives in the board crate).
+  the run continues as new); `boot(body)` boots the journal once from
+  its first record and lends it to the run (`RunBody`), which answers
+  how the boot ended (`BodyEnd`: ended with a terminal record, faulted,
+  or stopped at a boundary); `terminal()` / `conclude()` read and
+  write the terminal record. The store calls the run rather than
+  handing out a journal because a flash driver owns its boot loop: on
+  the board (§24) each journal is a Waymaker bank pair driven by
+  `waymaker_drive::Driver::at_bank` and lent through
+  `waymaker_bridge::Bridge`, and the driver writes the terminal record
+  the run returns.
 - **`DevicePorts: RunPorts`** — the run's ports (§23.2) plus `sense`,
   `select_goal` (route operator input to the goal's inbox), and the
   checkpoint item store.
@@ -2881,9 +2886,129 @@ The result equals one harvester fed every segment's events (pinned in
 
 ### 23.5 What this does not claim
 
-- **Not the board's flash.** The board crate supplies the flash-backed
-  `RunStore`; this repository proves the dispatcher over RAM journals.
 - **One run journal per run, kept until the board reclaims it.**
   Reclaiming a settled run's journal (after its harvest is read) is the
-  board store's policy.
+  board store's policy (§24.2).
 
+
+## 24. The ESP32-S3 board
+
+`esper-board` is the board's product half (ADR 0005): `no_std`,
+allocation-free, chip-independent — written against
+`embedded-storage`'s `NorFlash` and a small `Hardware` trait — and
+tested on the host over a RAM chip. `boards/esp32s3` (`esper-s3`) is
+the image: it hands `esper-board` the chip's SPI flash (`esp-storage`),
+eight GPIOs, the boot clock and UART0, and runs the boot loop. It is a
+workspace of its own on Espressif's `esp` toolchain.
+
+### 24.1 Waymaker is the store
+
+Every journal is a Waymaker **bank pair** (a *slot*) driven by
+`waymaker_drive::Driver::at_bank` and lent to a `Ctx` workflow through
+`waymaker_bridge::Bridge` — the two crates Waymaker made layers for this
+(its ADR 0055). The supervisor has one slot; each live run has one;
+`continue_as_new` swaps banks within a slot.
+
+| Window (`plan::Plan`) | Holds |
+|---|---|
+| supervisor slot | `supervise`'s journal: two banks |
+| run slots × 4 | one run each, every segment of it |
+| checkpoint item log | `STORE`/`LOAD` items (§21.4) |
+| snapshot item log | `SNAP_STORE`/`SNAP_LOAD` chunks (§20.4) |
+
+A slot's first run is installed by `slot::commission` — erase, header,
+barrier, seal, barrier: the install Waymaker's own rig performs on a
+fresh part, since a swap needs an authoritative bank to retire.
+
+### 24.2 Which slot holds which run
+
+A run slot is commissioned with the supervisor's run id as its Waymaker
+`RunId`. `agent::run_id` leaves the low 16 bits zero and the driver
+numbers each segment as its predecessor's successor, so a slot is found
+by the top 48 bits after any number of rollovers — no directory of the
+board's own. A new run takes its goal's previous slot (a goal spawns
+again only after its run settled), else an empty slot, else any slot
+whose run has a terminal record; else `StoreFault::Full`.
+
+### 24.3 A journal Waymaker refuses
+
+A reset between a frame and its seal (for every record kind but an
+outcome) or inside a frame leaves a tail with no append point, and
+Waymaker refuses the bank rather than guess (its ADR 0018; its failure
+matrix asserts such refusals happen). Recycling the bank is
+`continue_as_new`'s job, so the board does exactly that:
+`slot::reinstall` installs the segment's own input — durable in the
+authoritative header — into the other bank at the next generation and
+under the successor run id. Until that seal lands the refused bank
+stays authoritative, so a reset mid-reinstall reinstalls again; after
+it, the segment replays from its start. Effects the discarded history
+performed may be performed again (Waymaker's at-least-once); every
+board tool is safe to repeat. Operator input a discarded `SENSE` or
+`ASK` answer carried is gone; the operator types it again.
+
+A run that faults (`BodyEnd::Faulted`) is recorded `RunFailed` with no
+payload, as Waymaker's own examples record a workflow that returned an
+error, so its slot is concluded and reusable.
+
+### 24.4 The item logs
+
+`STORE`/`LOAD` and `SNAP_STORE`/`SNAP_LOAD` hand items to the world to
+keep across a `continue_as_new` (the old journal cannot hold them). An
+`ItemLog` is two areas, each holding the items of one digest:
+`[magic, generation, digest, check][item]…`, items appended (body,
+barrier, header, barrier) and never rewritten, the last whole copy of
+an index winning. The first item of a new digest erases the area with
+the older generation, so the newest complete checkpoint is always on
+media while the next is written. A torn item fails its check and is
+skipped; its redelivery lands whole.
+
+### 24.5 Ports, operator, model
+
+- **Tools.** The six tools over `Hardware`, answering the host world's
+  canonical JSON byte for byte. Every one is safe to repeat (a pin
+  write drives the level it drove; the rest observe or wait), so the
+  board keeps no effect ledger.
+- **Operator** (UART0, one line each): `goal <0-9> <objective>`,
+  `say <goal> <text>`, `pause|unpause|retire <goal>`,
+  `remember <name> <value>`, `forget <name>`. Commands wait in RAM for
+  the next `SENSE`, typed input for the goal's `ASK`. Masking stays
+  where the runtime does it.
+- **Model.** `TinyBackend` over `demo::DISTILL`, the prompts the demo
+  goal (`goal 1 drive pin 3 high`) renders from pin 3 low and from pin
+  3 already high (what a reinstalled segment finds). Any other prompt
+  is `UnknownPrompt`. A distillation stand-in, not a trained model
+  (ADR 0001).
+- **Clock.** The boot clock only (`ClockCapability::BootOnly`): a
+  devkit's RTC is not backed, and declaring a persistent clock the
+  board lacks is what Waymaker's clock contract forbids. Beats are
+  `AfterBoot` deadlines.
+
+### 24.6 Evidence
+
+- `esper-board/tests/board.rs`, on a RAM NOR with a power-cut injector,
+  runs the product stack — `Supervisor`, `FlashRuns`, `BoardPorts`,
+  the item logs, the operator channel, the runtime's `Device` and
+  `run` — and requires, for a cut **before** every one of a clean
+  life's storage mutations and for a cut that **tears** every one, that
+  the goal's run settles `Completed`, pin 3 ends high, and the pin
+  changed exactly once. A test fails if `demo::DISTILL` drifts from the
+  prompts the board renders.
+- Unit tests pin the item log (round trip, last copy wins, two digests
+  kept, the third retiring the oldest, area room, torn items in both
+  cut modes), the tools' JSON, the partition checks, and the size of
+  every piece of board state.
+- `boards/esp32s3` is built for `xtensa-esp32s3-none-elf` in CI (the
+  `board` job installs the toolchain with `espup`) and linted on the
+  pinned toolchain against the ESP32-C3's RISC-V core.
+
+### 24.7 What this does not claim
+
+- **Not run on a part.** The image is built, not booted: no CI job
+  flashes an ESP32-S3 or starts Espressif's QEMU fork. The barrier
+  rests on `esp-storage` returning only after the ROM routine finished
+  the write; that is the driver's behaviour, not something a test here
+  observes on silicon.
+- **One goal's prompts.** The tiny backend answers the demo goal and
+  nothing else.
+- **A reinstall loses the discarded history's operator input.** It is
+  re-typed, not recovered.

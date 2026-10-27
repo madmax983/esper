@@ -1,0 +1,34 @@
+[package]
+name = "esper-board"
+version = "0.1.0"
+edition = "2024"
+description = "Esper's board half: the supervisor and its runs on a NOR flash chip through Waymaker's driver and bridge, the item logs, the UART operator channel, and the device ports. Chip-independent; the ESP32-S3 image links it."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+esper-core = { path = "../esper-core" }
+esper-runtime = { path = "../esper-runtime", default-features = false }
+# The journal: banks, recovery, the driver and the bridge (ADR 0005). The
+# workspace patches the published crates to the revision that made the
+# driver and the bridge layers.
+waymaker-core = "0.1.0"
+waymaker-flash = "0.1.0"
+waymaker-embassy = "0.1.0"
+waymaker-drive = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
+waymaker-bridge = { git = "https://github.com/madmax983/waymaker", rev = "73507df23f1b5f4f9320284cf0b2a4121a980cf1" }
+# The flash chip's traits; the S3 image hands in `esp-storage`'s driver.
+embedded-storage = "0.3.1"
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+esper-runtime = { path = "../esper-runtime" }
+waymaker-core = "0.1.0"
+
+[features]
+default = ["host"]
+# The RAM chip and its power-cut injector, for tests. Never in firmware.
+host = []
+
+[lints]
+workspace = true
