@@ -903,31 +903,51 @@ impl GoalLedger {
     /// # Errors
     ///
     /// [`Error::SnapshotCorrupt`] for duplicate ids, an id at or past
-    /// the allocator, a goal in flight, or a widened envelope.
+    /// the allocator, a goal in flight, a widened envelope, or more
+    /// goals than [`MAX_GOALS`].
     pub fn from_parts(goals: &[Goal], next_id: u16) -> Result<Self, Error> {
-        if goals.len() > MAX_GOALS {
-            return Err(Error::SnapshotCorrupt);
-        }
-        let mut ledger = Self {
-            slots: [None; MAX_GOALS],
-            next_id,
-        };
-        for (slot, goal) in ledger.slots.iter_mut().zip(goals.iter()) {
-            let past_allocator = next_id != 0 && goal.id.get() >= next_id;
-            if past_allocator
-                || goal.status == GoalStatus::Running
-                || goal.check_envelope().is_err()
-            {
-                return Err(Error::SnapshotCorrupt);
-            }
-            *slot = Some(*goal);
-        }
-        for (i, goal) in goals.iter().enumerate() {
-            if goals.iter().skip(i + 1).any(|other| other.id == goal.id) {
-                return Err(Error::SnapshotCorrupt);
-            }
+        let mut ledger = Self::restoring(next_id);
+        for goal in goals {
+            ledger.restore_goal(*goal)?;
         }
         Ok(ledger)
+    }
+
+    /// An empty ledger whose allocator stands at `next_id`: the start
+    /// of an item-by-item checkpoint restore ([`Self::restore_goal`]).
+    #[must_use]
+    pub const fn restoring(next_id: u16) -> Self {
+        Self {
+            slots: [None; MAX_GOALS],
+            next_id,
+        }
+    }
+
+    /// Append one restored goal, validating it against the allocator
+    /// and the goals already restored. Order is preserved, so storage
+    /// stays canonical.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotCorrupt`] for a duplicate id, an id at or past
+    /// the allocator, a goal in flight, a widened envelope, or a full
+    /// ledger.
+    pub fn restore_goal(&mut self, goal: Goal) -> Result<(), Error> {
+        let past_allocator = self.next_id != 0 && goal.id.get() >= self.next_id;
+        if past_allocator
+            || goal.status == GoalStatus::Running
+            || goal.check_envelope().is_err()
+            || self.get(goal.id).is_some()
+        {
+            return Err(Error::SnapshotCorrupt);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::SnapshotCorrupt)?;
+        *slot = Some(goal);
+        Ok(())
     }
 }
 

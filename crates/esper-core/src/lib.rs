@@ -45,8 +45,10 @@
 //! - [`memory`]: bounded, masked, provenance-tagged cross-run memory
 //!   and recall.
 //! - [`brief`]: the bounded GOAL/MEM prompt block bound into a seed.
+//! - [`harvest`]: the streaming, verification-gated harvest of a settled
+//!   run into memory entries.
 //! - [`checkpoint`]: versioned, integrity-checked supervisor
-//!   checkpoints.
+//!   checkpoints in page-sized items.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -60,6 +62,7 @@ pub mod compact;
 pub mod decision;
 pub mod error;
 pub mod goal;
+pub mod harvest;
 pub mod ids;
 // E2: the strict JSON parser moved to `esper-protocol` so the contract
 // validator and the decoder share one implementation without a
@@ -79,7 +82,10 @@ pub mod state;
 pub use beat::{Beat, BeatSpan, SchedulePolicy};
 pub use brief::{BRIEF_CAP, Brief};
 pub use budget::ResourceBudget;
-pub use checkpoint::{AgentCheckpoint, CHECKPOINT_VERSION, MAX_CHECKPOINT_BYTES};
+pub use checkpoint::{
+    AgentCheckpoint, CHECKPOINT_VERSION, HEADER_BYTES, Header, MAX_CHECKPOINT_BYTES,
+    MAX_ITEM_BYTES, Restore,
+};
 pub use compact::{
     CompactState, CompactionPolicy, CompactionReport, DEFAULT_POLICY, Fact, FailedPath,
     FrameSummary, Note, PendingItem, PendingKind, VersionSet, compact, should_compact,
@@ -89,6 +95,7 @@ pub use error::{Error, ErrorCode};
 pub use goal::{
     Cadence, Envelope, Goal, GoalEvent, GoalId, GoalLedger, GoalSpec, GoalStatus, Grant, Pick,
 };
+pub use harvest::{HarvestSet, Harvester, MAX_HARVEST};
 pub use ids::{Digest, EffectId, EffectSeq, Pin, RunId, ToolId};
 pub use lineage::{ContinuedRun, Lineage, continue_as_new};
 pub use mask::{MaskClass, MaskReport, fnv1a64, mask_bound, mask_bytes, mask_report};

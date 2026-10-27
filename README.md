@@ -14,14 +14,17 @@ inference boundary. The full contract lives in
 ## Always on: heartbeats, goals, memory (E4+aon)
 
 A run is durable but finite. The always-on layer is a **supervisor**
-above the run (SPEC §21, [ADR 0002](docs/adr/0002-always-on-supervisor-above-the-run.md)):
+above the run — itself a Waymaker workflow, `no_std` and
+allocation-free, compiled into the firmware build (SPEC §21,
+[ADR 0002](docs/adr/0002-always-on-supervisor-above-the-run.md)):
 
-- **Heartbeats** — a durable beat counter (`Beat`), committed before
-  each beat's work; it never skips and never repeats, and a reset
-  mid-beat finishes the same beat. One beat does at most one unit of
-  work (spawn or resume one run). No wall clock: the host's tick
-  source (`run_heartbeat`, a Tokio interval) decides *when*, the beat
-  decides *what*. Each beat returns a `Pulse`.
+- **Heartbeats** — each beat awaits a durable Waymaker deadline
+  (`ctx.timer`): `Heartbeat::Boot { ticks }` (no RTC needed; a reset
+  restarts the interval) or `Heartbeat::Persistent { period }` (an RTC
+  deadline that survives power loss). Beats are counted by replay, so
+  they never skip or repeat; a late wake yields one beat, never a
+  burst. One beat does at most one unit of work. Each beat emits a
+  `Pulse` to a `PulseSink`.
 - **Goals** — standing objectives (`Once` or `Every(n beats)`) with a
   priority, a least-privilege capability set, and a cumulative budget
   envelope: reserve on spawn, refund on settlement, never widened.
@@ -30,35 +33,37 @@ above the run (SPEC §21, [ADR 0002](docs/adr/0002-always-on-supervisor-above-th
   goal at once. A goal parked on `Ask` never blocks other goals and is
   never abandoned (overdue is a signal, not a timeout).
 - **Memory** — 32 masked, provenance-tagged entries that outlive runs.
-  The harness harvests them from committed evidence (successful
-  observations; mutations only with a passing verification; each
-  run's outcome); the operator adds pinned notes. **The model cannot
-  write memory.** Secrets are masked over the full input before
-  truncation, so none reaches the journal or a prompt.
+  A streaming `Harvester` takes them from committed evidence
+  (successful observations; mutations only with a passing
+  verification; each run's outcome); the operator adds pinned notes.
+  **The model cannot write memory.** Operator text is masked before it
+  becomes a durable record.
 - **The brief** — each spawned run's prompt gains `GOAL <objective>`
   and up to four `MEM <label> = <value>` lines (≤ 256 bytes), bound
-  into the seed snapshot (now 151 bytes) so a reboot cannot swap it.
-  Unbriefed runs are byte-identical to E4.
-- **Checkpoint** — between beats the supervisor folds its journal into
-  a verified, versioned checkpoint and drops settled run journals, so
-  an agent that runs forever stores a bounded amount.
+  into the seed snapshot (now 151 bytes). Unbriefed runs are
+  byte-identical to E4.
+- **Bounded history** — every `checkpoint_every` beats the state is
+  stored item by item and the workflow continues as new with a 46-byte
+  header; the next run restores the items and checks their digest.
+
+Every record the supervisor writes fits one 512-byte scratch page
+(`SENSE` ≤ 443 B, `RUN` ≤ 337 B, items ≤ 164 B), and its state is
+caller-owned so it can live in a `static`:
 
 ```rust
-let mut store = AgentStore::new();
-let mut sup = Supervisor::boot(&seed, &mut store)?;
-// GoalSpec { objective, priority, cadence, envelope, capabilities }
-let goal = sup.add_goal(&mut store, &keep_pin_3_low)?;
-sup.remember(&mut store, b"site", b"greenhouse north")?;
-let pulses = run_heartbeat(&seed, &mut store, &mut world, Duration::from_secs(60), 1_000).await?;
+// On the device: an Embassy task over the flash journal and the
+// device dispatcher. `AGENT` is a `static`; the future never
+// completes, it beats forever.
+let mut ctx = Ctx::new(&mut journal, &mut dispatcher, &mut page);
+supervise(&mut ctx, &SEED, run_input, &mut rtc_alarm, &mut AGENT, &mut telemetry).await
 ```
 
-The agent crash matrices (`tests/always_on.rs`) inject a reset at
-each of the 5 agent crash points on every beat of a mixed workload —
-once recovered within the call, once as power loss recovered on the
-next call — and each of the 11 run crash points inside supervised
-runs, and demand the crash-free journal, pulses, prompts, and device
-history byte for byte. A torn spawn (journal committed, run record
-lost) recovers from the committed seed.
+The crash matrix (`tests/always_on.rs`) resets at every Waymaker
+boundary kind — intent committed, effect done with its outcome lost,
+outcome committed, deadline armed — on every occurrence of a mixed
+workload, with and without `continue_as_new` (174 cases), plus every
+run-level crash point inside a supervised run, and demands the
+crash-free state, pulses, prompts, and device history.
 
 ## What it is
 
@@ -99,8 +104,8 @@ lost) recovers from the committed seed.
 | Crate | Role | Runtime shape |
 |---|---|---|
 | `esper-protocol` | The single contract source: the six-tool `CATALOG`, the allocation-free argument validator, the compact signature renderer, the JSON Schema renderer | `#![no_std]`, allocation-free, `core` + `thiserror` only |
-| `esper-core` | Pure types: `Decision` decoder (now validating through the protocol contracts into typed `ToolArgs`), resource budget, `ProgressDelta`, runtime monitor, terminal statuses, state machine, v2 `Capabilities`, `authorize()`; E4 context lifecycle; E4+aon `beat`, `goal`, `memory`, `brief`, `checkpoint` | `#![no_std]`, allocation-free |
-| `esper-runtime` | The ReAct workflow over Waymaker: intent-before-dispatch commit boundaries, the E3 model backends (`backend.rs`: `ModelBackend`, `ScriptedBackend`, `TinyBackend`, prompt construction, bundle identity), fake device (GPIO + sensors + virtual clock), independent verifier, crash hooks; E4+aon always-on supervisor (`agent.rs`) | `#![no_std]` engine core without the `host` feature |
+| `esper-core` | Pure types: `Decision` decoder (now validating through the protocol contracts into typed `ToolArgs`), resource budget, `ProgressDelta`, runtime monitor, terminal statuses, state machine, v2 `Capabilities`, `authorize()`; E4 context lifecycle; E4+aon `beat`, `goal`, `memory`, `brief`, `harvest`, `checkpoint` | `#![no_std]`, allocation-free |
+| `esper-runtime` | The ReAct workflow over Waymaker: intent-before-dispatch commit boundaries, the E3 model backends (`backend.rs`: `ModelBackend`, `ScriptedBackend`, `TinyBackend`, prompt construction, bundle identity), fake device (GPIO + sensors + virtual clock), independent verifier, crash hooks; E4+aon always-on supervisor (`agent/`: the `supervise` workflow and its page-bounded payloads, in the firmware build; `agent/host.rs` doubles behind `host`) | `#![no_std]` engine core and supervisor without the `host` feature |
 | `esper-eval` | Host-only fixture runner, trace comparison, trajectory scoring; E3 runs every fixture under both backends (record → distill → replay) | **Host only** — must never be linked into firmware |
 
 Layering is strict and checked: `esper-eval → esper-runtime →
@@ -124,15 +129,16 @@ cargo test -p esper-runtime --test crash_matrix          # 6. crash matrix
 cargo test -p esper-eval                                # 7. fixture runner
 ```
 
-Test counts (E4+aon): 436 hand-written test functions — 187 in
-`esper-core` (37 of them E4+aon: the exhaustive 8×10 goal
+Test counts (E4+aon): 443 hand-written test functions — 195 in
+`esper-core` (45 of them E4+aon: the exhaustive 8×10 goal
 transition table, every terminal status × cadence, a seeded
 property test of the never-widening envelope, memory masking and
-eviction, the brief bound, checkpoint truncation and bit-flip
-sweeps), 164 in `esper-runtime` (22 of them E4+aon, including the
-18-test supervisor suite and its two crash matrices), 63 in
-`esper-eval`, 22 in `esper-protocol` — plus one generated test per
-golden fixture; `cargo test --workspace` runs 455. Zero warnings from clippy
+eviction, the harvester, the brief bound and round trip, checkpoint
+truncation, bit-flip, and item-wise restore sweeps), 163 in
+`esper-runtime` (21 of them E4+aon, including the 17-test supervisor
+suite and its crash matrix), 63 in `esper-eval`, 22 in
+`esper-protocol` — plus one generated test per golden fixture;
+`cargo test --workspace` runs 462. Zero warnings from clippy
 (pedantic + nursery, denied workspace-wide). All crates target Rust
 edition 2024.
 
@@ -242,10 +248,11 @@ host-only.
   published.
 - **E4 (this tree):** context compaction / `Compact` state /
   `continue_as_new`; masking; rollover. SPEC §20.
-- **E4+aon (this tree):** always-on primitives — durable heartbeats,
-  standing goals with never-widening envelopes, masked cross-run
-  memory, the GOAL/MEM brief, the supervisor journal and checkpoint.
-  SPEC §21. Shipped locally; not published.
+- **E4+aon (this tree):** always-on primitives — a firmware Waymaker
+  workflow with durable heartbeat deadlines, standing goals with
+  never-widening envelopes, masked cross-run memory, the GOAL/MEM
+  brief, and item-wise checkpoints across `continue_as_new`. SPEC §21.
+  Not yet published.
 - **E5:** network tools; remote model backend and the MCP gateway;
   the radio-byte budget becomes real.
 - **E6:** bounded parallel calls (the one-call-per-turn rule is
@@ -255,13 +262,17 @@ host-only.
 
 Things this environment cannot verify, stated plainly:
 
-- **E4+aon has no wall clock.** "Every 10 beats" is not "every 10
-  minutes"; the host maps beats to time and owns that claim. Recall is
+- **E4+aon on the board.** The supervisor is in the firmware build,
+  but its `RUN` activity needs the run engine, which is still
+  host-only (`engine.rs`); on the board it waits for the engine port.
+  A boot-clock heartbeat restarts its interval after a reset; only a
+  persistent-clock heartbeat survives power loss. Recall is
   recency-ordered, not relevance-ranked. One run at a time.
-- **E4+aon prompt buffer.** Briefed runs use a 1536-byte prompt buffer
-  (`BRIEFED_PROMPT_CAP`, +512 B of stack on the board); plain runs keep
-  1024. `memory::ingest` uses a ~2.4 KiB masking scratch on the stack.
-  Neither is measured on the target board yet.
+- **E4+aon RAM is measured on the host only.** `AgentState` is
+  7,384 B and the `supervise` future 2,280 B on `x86_64` (pinned by
+  test). Briefed runs use a 1536-byte prompt buffer (+512 B);
+  `memory::ingest` uses a ~2.4 KiB masking scratch on the stack. None
+  of these is measured on the target board yet.
 
 - **No hardware.** Everything physical is the fake device: pin
   tables, sensor channels, the virtual clock, fault plans, read-back.
@@ -284,7 +295,7 @@ Things this environment cannot verify, stated plainly:
 - **Coverage tooling unavailable.** `cargo-llvm-cov` and
   `cargo-tarpaulin` are not installed (on 2026-10-27 the install was
   not permitted in the sandbox). The SPEC's ≥85% gate is therefore
-  unmeasured here. The suite runs 455 tests and the contract surface
+  unmeasured here. The suite runs 462 tests and the contract surface
   is exercised by the golden trajectories and the agent crash matrix,
   but line coverage is an open number.
 - **No mechanized proofs.** The user's SPEC-PROOF step names Verus; no

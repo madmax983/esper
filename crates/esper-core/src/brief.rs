@@ -18,6 +18,7 @@
 //! history.
 
 use crate::compact::Note;
+use crate::error::Error;
 use crate::ids::Digest;
 use crate::memory::Recall;
 
@@ -62,6 +63,53 @@ impl Brief {
             }
         }
         brief
+    }
+
+    /// Rebuild a brief from its rendered bytes — the receiving side of a
+    /// spawn request, which must not trust what it was handed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BriefInvalid`] unless `bytes` is at most [`BRIEF_CAP`],
+    /// opens with `GOAL `, every line after it opens with `MEM `, every
+    /// line ends with a newline, and no other control byte appears.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > BRIEF_CAP || !bytes.starts_with(GOAL_PREFIX) || !bytes.ends_with(b"\n") {
+            return Err(Error::BriefInvalid);
+        }
+        let mut lines: u8 = 0;
+        for (index, line) in bytes
+            .split(|b| *b == b'\n')
+            .take_while(|line| !line.is_empty())
+            .enumerate()
+        {
+            let prefix = if index == 0 { GOAL_PREFIX } else { MEM_PREFIX };
+            if !line.starts_with(prefix) || line.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+                return Err(Error::BriefInvalid);
+            }
+            lines = lines.saturating_add(1);
+        }
+        // Every byte must belong to a counted line: no empty line in
+        // the middle (`take_while` stops at one).
+        let counted: usize = bytes
+            .split(|b| *b == b'\n')
+            .take(usize::from(lines))
+            .map(|line| line.len() + 1)
+            .sum();
+        if counted != bytes.len() {
+            return Err(Error::BriefInvalid);
+        }
+        let mut brief = Self {
+            bytes: [0; BRIEF_CAP],
+            len: u16::try_from(bytes.len()).map_err(|_| Error::BriefInvalid)?,
+            lines,
+        };
+        brief
+            .bytes
+            .get_mut(..bytes.len())
+            .ok_or(Error::BriefInvalid)?
+            .copy_from_slice(bytes);
+        Ok(brief)
     }
 
     /// Append one line made of `parts` plus a newline, or nothing when

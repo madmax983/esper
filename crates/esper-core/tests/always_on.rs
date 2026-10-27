@@ -9,7 +9,8 @@
 use esper_core::beat::{Beat, BeatSpan, SchedulePolicy};
 use esper_core::brief::{BRIEF_CAP, Brief};
 use esper_core::checkpoint::{
-    AgentCheckpoint, CHECKPOINT_VERSION, MAX_CHECKPOINT_BYTES, decode, encode, encoded_len,
+    AgentCheckpoint, CHECKPOINT_VERSION, HEADER_BYTES, Header, MAX_CHECKPOINT_BYTES,
+    MAX_ITEM_BYTES, Restore, decode, encode, encoded_len,
 };
 use esper_core::compact::{NOTE_MAX, Note};
 use esper_core::error::Error;
@@ -17,6 +18,7 @@ use esper_core::goal::{
     Cadence, Envelope, Goal, GoalEvent, GoalId, GoalLedger, GoalSpec, GoalStatus, Grant, MAX_GOALS,
     Pick, TRANSITIONS, transition,
 };
+use esper_core::harvest::{Harvester, MAX_HARVEST};
 use esper_core::ids::{Digest, RunId, ToolId};
 use esper_core::mask::fnv1a64;
 use esper_core::memory::{
@@ -970,6 +972,7 @@ fn rich_checkpoint() -> AgentCheckpoint {
     AgentCheckpoint {
         last_beat: Beat::new(6),
         spawn_seq: 2,
+        next_deadline: 1_234,
         ledger,
         memory,
     }
@@ -989,12 +992,7 @@ fn checkpoint_round_trips_exactly() {
     let bytes = encoded(&state);
     assert_eq!(bytes[0], CHECKPOINT_VERSION);
     assert_eq!(decode(&bytes), Ok(state));
-    let empty = AgentCheckpoint {
-        last_beat: Beat::ZERO,
-        spawn_seq: 0,
-        ledger: GoalLedger::new(),
-        memory: Memory::new(),
-    };
+    let empty = AgentCheckpoint::new();
     assert_eq!(decode(&encoded(&empty)), Ok(empty));
 }
 
@@ -1017,6 +1015,7 @@ fn checkpoint_fits_its_bound_when_everything_is_full() {
     let state = AgentCheckpoint {
         last_beat: Beat::new(u64::MAX),
         spawn_seq: u32::MAX,
+        next_deadline: u64::MAX,
         ledger,
         memory,
     };
@@ -1081,23 +1080,30 @@ fn resign(mut bytes: Vec<u8>) -> Vec<u8> {
 #[test]
 fn a_checksummed_but_invalid_payload_is_corrupt() {
     let bytes = encoded(&rich_checkpoint());
-    // Header: version 1, last_beat 8, spawn_seq 4, next_goal_id 2,
-    // next_stamp 4, goal count 1 → the first goal's id starts at 20.
+    // Header: version 1, last_beat 8, spawn_seq 4, next_deadline 8,
+    // next_goal_id 2, next_stamp 4, goals 1, entries 1, digest 8 = 37;
+    // the first item's tag is at 37, its goal id at 38.
+    assert_eq!(HEADER_BYTES, 37);
     let mut zero_id = bytes.clone();
-    zero_id[20] = 0;
-    zero_id[21] = 0;
+    zero_id[38] = 0;
+    zero_id[39] = 0;
     assert_eq!(decode(&resign(zero_id)), Err(Error::SnapshotCorrupt));
 
     // A goal count beyond the ledger's capacity.
     let mut too_many = bytes.clone();
-    too_many[19] = u8::try_from(MAX_GOALS + 1).expect("small");
+    too_many[27] = u8::try_from(MAX_GOALS + 1).expect("small");
     assert_eq!(decode(&resign(too_many)), Err(Error::SnapshotCorrupt));
 
     // The id allocator behind an existing goal id.
     let mut stale_alloc = bytes.clone();
-    stale_alloc[13] = 1;
-    stale_alloc[14] = 0;
+    stale_alloc[21] = 1;
+    stale_alloc[22] = 0;
     assert_eq!(decode(&resign(stale_alloc)), Err(Error::SnapshotCorrupt));
+
+    // A header digest that lies about its items.
+    let mut lying = bytes.clone();
+    lying[29] ^= 1;
+    assert_eq!(decode(&resign(lying)), Err(Error::SnapshotCorrupt));
 
     // Trailing payload bytes.
     let mut trailing = bytes;
@@ -1176,4 +1182,281 @@ fn checkpoint_round_trips_after_reap_and_forget() {
     live.write(next).expect("write");
     restored.write(next).expect("write");
     assert_eq!(live, restored);
+}
+
+// ---------------------------------------------------------------------
+// Item-wise checkpoint (the device path, SPEC §21.6)
+
+/// The largest record the device may stage: one 512-byte Waymaker
+/// scratch page, minus frame overhead and seal headroom.
+const PAGE_RECORD_MAX: usize = 512 - 32;
+
+// Every checkpoint record fits one page, at compile time.
+const _: () = assert!(HEADER_BYTES <= PAGE_RECORD_MAX);
+const _: () = assert!(MAX_ITEM_BYTES <= PAGE_RECORD_MAX);
+
+#[test]
+fn every_checkpoint_record_fits_a_scratch_page() {
+    // And the bound is real: the largest goal and entry hit it.
+    let state = checkpoint_full();
+    let mut item = [0u8; MAX_ITEM_BYTES];
+    let longest = (0..state.item_count())
+        .map(|i| state.encode_item(i, &mut item).expect("item"))
+        .max()
+        .expect("items");
+    assert!(longest <= MAX_ITEM_BYTES);
+    assert!(
+        longest > MAX_ITEM_BYTES - 8,
+        "the bound is tight: {longest}"
+    );
+}
+
+fn checkpoint_full() -> AgentCheckpoint {
+    let mut ledger = GoalLedger::new();
+    for _ in 0..MAX_GOALS {
+        let id = add(&mut ledger, &spec(&[b'o'; NOTE_MAX], 1, every(3)), 0);
+        spawn(&mut ledger, id, u64::MAX);
+        ledger.park(id, Beat::new(u64::MAX)).expect("park");
+    }
+    let mut memory = Memory::new();
+    for i in 0..MAX_MEMORY {
+        let args = [b'{', u8::try_from(i).expect("small"), b'}'];
+        let goal = GoalId::new(u16::MAX);
+        memory
+            .write(entry(obs_key(255, &args), &[b'L'; 64], &[b'V'; 64], goal))
+            .expect("w");
+    }
+    AgentCheckpoint {
+        last_beat: Beat::new(u64::MAX),
+        spawn_seq: u32::MAX,
+        next_deadline: u64::MAX,
+        ledger,
+        memory,
+    }
+}
+
+/// Store item by item, restore item by item into a caller-owned
+/// target: the result is the state, exactly.
+#[test]
+fn item_wise_restore_rebuilds_the_state_exactly() {
+    let makers: [fn() -> AgentCheckpoint; 3] =
+        [rich_checkpoint, checkpoint_full, AgentCheckpoint::new];
+    for make in makers {
+        let state = make();
+        let header = state.header();
+        let mut header_bytes = [0u8; HEADER_BYTES];
+        assert_eq!(header.encode(&mut header_bytes), Ok(HEADER_BYTES));
+        let header = Header::decode(&header_bytes).expect("header");
+        assert_eq!(header.items(), state.item_count());
+
+        let mut target = AgentCheckpoint::new();
+        let mut restore = Restore::begin(header, &mut target);
+        let mut item = [0u8; MAX_ITEM_BYTES];
+        for index in 0..state.item_count() {
+            let len = state.encode_item(index, &mut item).expect("item");
+            restore.push(&mut target, &item[..len]).expect("push");
+        }
+        restore.finish().expect("finish");
+        assert_eq!(target, state);
+    }
+}
+
+#[test]
+fn item_wise_restore_fails_closed() {
+    let state = rich_checkpoint();
+    let header = state.header();
+    let mut item = [0u8; MAX_ITEM_BYTES];
+    let items: Vec<Vec<u8>> = (0..state.item_count())
+        .map(|i| {
+            let n = state.encode_item(i, &mut item).expect("item");
+            item[..n].to_vec()
+        })
+        .collect();
+    let mut target = AgentCheckpoint::new();
+
+    // Missing the last item.
+    let mut restore = Restore::begin(header, &mut target);
+    for bytes in &items[..items.len() - 1] {
+        restore.push(&mut target, bytes).expect("push");
+    }
+    assert_eq!(restore.finish(), Err(Error::SnapshotTruncated));
+
+    // An item out of order (an entry where a goal belongs).
+    let mut restore = Restore::begin(header, &mut target);
+    let last = items.last().expect("an entry");
+    assert_eq!(restore.push(&mut target, last), Err(Error::SnapshotCorrupt));
+
+    // One item too many.
+    let mut restore = Restore::begin(header, &mut target);
+    for bytes in &items {
+        restore.push(&mut target, bytes).expect("push");
+    }
+    assert_eq!(
+        restore.push(&mut target, &items[0]),
+        Err(Error::SnapshotCorrupt)
+    );
+
+    // A flipped byte in any item: either the item no longer decodes, or
+    // the digest catches it at the end.
+    for (which, bytes) in items.iter().enumerate() {
+        for index in 0..bytes.len() {
+            let mut restore = Restore::begin(header, &mut target);
+            let mut ok = true;
+            for (i, original) in items.iter().enumerate() {
+                let mut item = original.clone();
+                if i == which {
+                    item[index] ^= 0x20;
+                }
+                if restore.push(&mut target, &item).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            assert!(
+                !ok || restore.finish().is_err(),
+                "a flip in item {which} byte {index} restored silently"
+            );
+        }
+    }
+
+    // A foreign header version is a version problem.
+    let mut header_bytes = [0u8; HEADER_BYTES];
+    header.encode(&mut header_bytes).expect("header");
+    header_bytes[0] = 7;
+    assert_eq!(
+        Header::decode(&header_bytes),
+        Err(Error::SnapshotVersionMismatch { found: 7 })
+    );
+}
+
+// ---------------------------------------------------------------------
+// Harvest (SPEC §21.3)
+
+const READ: ToolId = ToolId::new(1);
+const WRITE: ToolId = ToolId::new(2);
+
+const fn harvester(goal: GoalId) -> Harvester {
+    Harvester::new(Provenance {
+        goal: Some(goal),
+        run: Some(run_id(7)),
+        beat: Beat::new(3),
+    })
+}
+
+#[test]
+fn harvest_keeps_reads_and_verified_writes_then_the_outcome() {
+    let g = GoalId::MIN;
+    let mut h = harvester(g);
+    h.request(1, READ, br#"{"pin": 3}"#);
+    h.observation(1, false, b"");
+    h.observation(1, true, br#"{"pin":3,"level":"low"}"#);
+    h.request(2, WRITE, br#"{"pin": 4, "level": "high"}"#);
+    h.observation(2, true, br#"{"pin":4,"level":"high"}"#);
+    h.verification(2, true);
+    h.request(3, WRITE, br#"{"pin": 5, "level": "high"}"#);
+    h.observation(3, true, br#"{"pin":5,"level":"high"}"#);
+    h.verification(3, false);
+    let set = h
+        .finish(g, TerminalStatus::Completed, b"done")
+        .expect("finish");
+    let labels: Vec<&[u8]> = set.entries().map(|e| e.label.as_bytes()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            br#"gpio_pin_read {"pin": 3}"#.as_slice(),
+            br#"gpio_pin_write {"pin": 4, "level": "high"}"#.as_slice(),
+            b"goal#1".as_slice(),
+        ],
+        "the unverified pin-5 write is not remembered"
+    );
+    assert_eq!(
+        set.get(2).map(|e| e.value.as_bytes()),
+        Some(b"completed done".as_slice())
+    );
+    assert!(set.entries().all(|e| e.stamp == 0 && !e.pinned()));
+}
+
+#[test]
+fn harvest_is_bounded_newest_kept_and_supersedes_by_key() {
+    let g = GoalId::new(12_345).expect("id");
+    let mut h = harvester(g);
+    for i in 0..10u32 {
+        let args = format!("{{\"pin\": {}}}", i % 8);
+        h.request(i, READ, args.as_bytes());
+        h.observation(i, true, format!("v{i}").as_bytes());
+    }
+    let set = h.finish(g, TerminalStatus::Stuck, b"").expect("finish");
+    assert_eq!(set.len(), MAX_HARVEST);
+    let values: Vec<&[u8]> = set.entries().map(|e| e.value.as_bytes()).collect();
+    // Pins 0 and 1 were re-read as 8 and 9: superseded, newest last.
+    assert_eq!(
+        values,
+        vec![b"v5".as_slice(), b"v6", b"v7", b"v8", b"v9", b"stuck"]
+    );
+    assert_eq!(
+        set.get(5).map(|e| e.label.as_bytes()),
+        Some(b"goal#12345".as_slice())
+    );
+}
+
+#[test]
+fn harvest_masks_and_skips_what_it_cannot_mask_whole() {
+    let g = GoalId::MIN;
+    let mut h = harvester(g);
+    let secret = ["sk", "live", "ABCDEFGHIJKLMNOPQRSTUVWX"].join("_");
+    h.request(1, READ, br#"{"pin": 3}"#);
+    h.observation(1, true, format!("token {secret}").as_bytes());
+    h.request(2, READ, br#"{"pin": 4}"#);
+    h.observation(2, true, &[b'x'; MEMORY_INPUT_MAX + 1]);
+    let set = h
+        .finish(g, TerminalStatus::Completed, &[b's'; MEMORY_INPUT_MAX])
+        .expect("finish");
+    assert_eq!(set.len(), 2, "the overlong observation is skipped");
+    let first = set.get(0).expect("entry").value.as_bytes();
+    assert!(!contains(first, b"ABCDEFGHIJKLMNOP"));
+    assert!(contains(first, b"[redacted:secret#1]"));
+    // An overlong summary falls back to the status name.
+    assert_eq!(
+        set.get(1).map(|e| e.value.as_bytes()),
+        Some(b"completed".as_slice())
+    );
+}
+
+#[test]
+fn an_unknown_tool_needs_a_verification() {
+    let g = GoalId::MIN;
+    let mut h = harvester(g);
+    h.request(1, ToolId::new(99), b"{}");
+    h.observation(1, true, b"ok");
+    let set = h.finish(g, TerminalStatus::Completed, b"").expect("finish");
+    assert_eq!(set.len(), 1, "only the outcome");
+}
+
+// ---------------------------------------------------------------------
+// Brief round trip (the spawn request's receiving side)
+
+#[test]
+fn a_brief_round_trips_and_malformed_bytes_fail_closed() {
+    let g = GoalId::MIN;
+    let mut memory = Memory::new();
+    memory
+        .write(entry(obs_key(1, b"{a}"), b"read a", b"low", Some(g)))
+        .expect("w");
+    let objective = Note::from_bytes(b"keep pin 3 low").expect("note");
+    let brief = Brief::compose(&objective, &recall(&memory, g));
+    assert_eq!(Brief::from_bytes(brief.as_bytes()), Ok(brief));
+    for bad in [
+        b"".as_slice(),
+        b"MEM x = y\n",
+        b"GOAL x",
+        b"GOAL x\n\nMEM y = z\n",
+        b"GOAL x\nNOTE y\n",
+        b"GOAL x\x07\n",
+    ] {
+        assert_eq!(Brief::from_bytes(bad), Err(Error::BriefInvalid), "{bad:?}");
+    }
+    assert_eq!(
+        Brief::from_bytes(&[b'G'; BRIEF_CAP + 1]),
+        Err(Error::BriefInvalid)
+    );
 }

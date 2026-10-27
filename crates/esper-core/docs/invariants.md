@@ -129,4 +129,15 @@ committed outcomes); the state machine only exposes the
   so a checkpoint decodes to exactly the state it encodes
   (`checkpoint_round_trips_after_reap_and_forget`, a regression test).
 - Checkpoint decode fails closed in the §20.3 order; every truncation
-  and every single-bit flip is rejected.
+  and every single-bit flip of the blob is rejected.
+- Every checkpoint record fits a scratch page: `HEADER_BYTES` (37) and
+  `MAX_ITEM_BYTES` (164) are `const`-asserted `≤ 480`, and the item
+  bound is shown tight.
+- Item-wise restore fails closed: a missing item, an item out of
+  order, one item too many, or a flipped byte in any item never
+  restores silently (`item_wise_restore_fails_closed`).
+- Harvest remembers a mutation only with a passing verification; a tool
+  the catalog does not know needs one too; overlong inputs are skipped,
+  never truncated unmasked; at most `MAX_HARVEST` (6) entries.
+- `Brief::from_bytes` accepts only a well-formed brief: `GOAL` first,
+  `MEM` after, every line newline-ended, no control bytes, ≤ 256 B.

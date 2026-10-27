@@ -1,40 +1,51 @@
 //! Versioned, integrity-checked checkpoints of the always-on
-//! supervisor's derived state (SPEC §21.6).
+//! supervisor's derived state, in page-sized items (SPEC §21.6).
 //!
 //! An always-on journal grows without bound; a checkpoint folds it.
-//! Byte layout, little-endian, the §20.3 discipline:
+//! On the device every Waymaker record must fit one scratch page, so a
+//! checkpoint is never one blob: it is a fixed [`Header`] plus one
+//! **item** per goal and per memory entry, each at most
+//! [`MAX_ITEM_BYTES`]. The supervisor stores the items through
+//! activities, retires its run with `continue_as_new` carrying only
+//! the header, and the next run loads the items back into a
+//! caller-owned [`AgentCheckpoint`] through [`Restore`] — no buffer
+//! the size of the whole state ever exists.
 //!
 //! ```text
-//! [version: 1][payload][integrity: u64 LE]
+//! header (HEADER_BYTES = 37), little-endian:
+//!   version u8, last_beat u64, spawn_seq u32, next_deadline u64,
+//!   next_goal_id u16, next_stamp u32, goals u8, entries u8,
+//!   digest u64   — FNV-1a-64 over every item's bytes, in order
 //!
-//! payload:
-//!   last_beat u64, spawn_seq u32, next_goal_id u16, next_stamp u32
-//!   goals:  count u8, then per goal:
-//!     id u16, objective (len u8 + bytes), priority u8,
-//!     cadence (tag u8: 0 once / 1 every, span u32),
-//!     envelope (per_run_turns u16, per_run_mutations u16,
-//!               turns u32, mutations u32, runs u16),
-//!     remaining (turns u32, mutations u32, runs u16),
-//!     reserved (turns u16, mutations u16),
-//!     capabilities (read_pins [8], read_count u8, write_pins [8],
-//!                   write_count u8, sensors [4], sensor_count u8,
-//!                   allow_timer u8, allow_status u8),
-//!     status u8, next_due u64, failures u8, runs_started u32,
-//!     last_status u8 (0xff = none), waiting_since u64,
-//!     run (tag u8, id u64)
-//!   memory: count u8, then per entry:
-//!     key (tag u8, then: observation tool u8 + digest u64 |
-//!          outcome goal u16 | note digest u64),
-//!     label (len u8 + bytes), value (len u8 + bytes),
-//!     provenance (goal u16, 0 = none; run tag u8 + id u64; beat u64),
-//!     stamp u32
+//! item: tag u8 (0 goal / 1 entry), then
+//!   goal:  id u16, objective (len u8 + bytes), priority u8,
+//!          cadence (tag u8: 0 once / 1 every, span u32),
+//!          envelope (per_run_turns u16, per_run_mutations u16,
+//!                    turns u32, mutations u32, runs u16),
+//!          remaining (turns u32, mutations u32, runs u16),
+//!          reserved (turns u16, mutations u16),
+//!          capabilities (read_pins [8], read_count u8, write_pins [8],
+//!                        write_count u8, sensors [4], sensor_count u8,
+//!                        allow_timer u8, allow_status u8),
+//!          status u8, next_due u64, failures u8, runs_started u32,
+//!          last_status u8 (0xff = none), waiting_since u64,
+//!          run (tag u8, id u64)
+//!   entry: key (tag u8, then: observation tool u8 + digest u64 |
+//!               outcome goal u16 | note digest u64),
+//!          label (len u8 + bytes), value (len u8 + bytes),
+//!          provenance (goal u16, 0 = none; run tag u8 + id u64;
+//!                      beat u64),
+//!          stamp u32
 //! ```
 //!
-//! [`decode`] fails closed in the §20.3 order — truncated, then
-//! version, then checksum, then corrupt — reusing the `Snapshot*`
-//! error variants. Structural invariants (unique ids and keys, the
-//! envelope never widened, no goal mid-run) are re-proven on decode by
-//! [`GoalLedger::from_parts`] and [`Memory::from_parts`].
+//! Goals come first, then entries, each in storage order. [`encode`] /
+//! [`decode`] are the same layout as one blob with a trailing
+//! FNV-1a-64 integrity field, for host tooling and tests. Decoding
+//! fails closed in the §20.3 order — truncated, then version, then
+//! checksum, then corrupt — reusing the `Snapshot*` error variants.
+//! Structural invariants (unique ids, keys and stamps, the envelope
+//! never widened, no goal mid-run) are re-proven per item by
+//! [`GoalLedger::restore_goal`] and [`Memory::restore_entry`].
 
 use crate::beat::{Beat, BeatSpan};
 use crate::compact::{NOTE_MAX, Note};
@@ -52,24 +63,53 @@ use crate::state::TerminalStatus;
 /// unknown versions fail closed.
 pub const CHECKPOINT_VERSION: u8 = 1;
 
-/// Length of the trailing integrity field.
+/// Length of the trailing integrity field of the blob form.
 const CHECKSUM_LEN: usize = 8;
 
-/// Largest encoded goal.
+/// Exact bytes of an encoded [`Header`].
+pub const HEADER_BYTES: usize = 1 + 8 + 4 + 8 + 2 + 4 + 1 + 1 + 8;
+
+/// Largest encoded goal (without its item tag).
 const MAX_GOAL_BYTES: usize =
     2 + (1 + NOTE_MAX) + 1 + 5 + 14 + 10 + 4 + 25 + 1 + 8 + 1 + 4 + 1 + 8 + 9;
-/// Largest encoded memory entry.
+/// Largest encoded memory entry (without its item tag).
 const MAX_ENTRY_BYTES: usize = 10 + (1 + NOTE_MAX) * 2 + 2 + 9 + 8 + 4;
 
-/// The largest checkpoint [`encode`] can produce: a buffer of this
-/// size always suffices.
-pub const MAX_CHECKPOINT_BYTES: usize = 1
-    + (8 + 4 + 2 + 4)
-    + 1
-    + MAX_GOALS * MAX_GOAL_BYTES
-    + 1
-    + MAX_MEMORY * MAX_ENTRY_BYTES
+/// The largest item [`AgentCheckpoint::encode_item`] produces: one tag
+/// byte plus the larger of a goal and an entry. Well under one
+/// 512-byte Waymaker scratch page.
+pub const MAX_ITEM_BYTES: usize = 1 + if MAX_GOAL_BYTES > MAX_ENTRY_BYTES {
+    MAX_GOAL_BYTES
+} else {
+    MAX_ENTRY_BYTES
+};
+
+/// The largest blob [`encode`] can produce: a buffer of this size
+/// always suffices. Host tooling only — the device stores items.
+pub const MAX_CHECKPOINT_BYTES: usize = HEADER_BYTES
+    + MAX_GOALS * (1 + MAX_GOAL_BYTES)
+    + MAX_MEMORY * (1 + MAX_ENTRY_BYTES)
     + CHECKSUM_LEN;
+
+/// Item tag: a goal.
+const TAG_GOAL: u8 = 0;
+/// Item tag: a memory entry.
+const TAG_ENTRY: u8 = 1;
+
+/// FNV-1a-64 offset basis: the digest of no bytes.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a-64 prime.
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+/// Fold `bytes` into a running FNV-1a-64 state. Streaming, so the
+/// digest over every item never needs the items in one buffer.
+fn fnv_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
 
 /// The supervisor's derived state at a beat boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +118,323 @@ pub struct AgentCheckpoint {
     pub last_beat: Beat,
     /// The agent-wide spawn counter.
     pub spawn_seq: u32,
+    /// The next heartbeat deadline on the persistent clock (`0` for a
+    /// boot-clock heartbeat, or before the first beat).
+    pub next_deadline: u64,
     /// The goal ledger (its id allocator included).
     pub ledger: GoalLedger,
     /// The memory store (its stamp allocator included).
     pub memory: Memory,
+}
+
+impl AgentCheckpoint {
+    /// A fresh agent: no beat, no goals, no memory.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_beat: Beat::ZERO,
+            spawn_seq: 0,
+            next_deadline: 0,
+            ledger: GoalLedger::new(),
+            memory: Memory::new(),
+        }
+    }
+
+    /// Items in this checkpoint: one per goal, then one per entry.
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.ledger.len() + self.memory.len()
+    }
+
+    /// Encode item `index` into `out`, returning the bytes written
+    /// (at most [`MAX_ITEM_BYTES`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotCorrupt`] for an index past [`Self::item_count`];
+    /// [`Error::SnapshotBufferTooSmall`] when `out` is short.
+    pub fn encode_item(&self, index: usize, out: &mut [u8]) -> Result<usize, Error> {
+        let mut sink = Sink::writing(out);
+        self.put_item(&mut sink, index)?;
+        Ok(sink.pos)
+    }
+
+    fn put_item(&self, sink: &mut Sink<'_>, index: usize) -> Result<(), Error> {
+        let goals = self.ledger.len();
+        if let Some(goal) = self.ledger.goals().nth(index) {
+            sink.put_u8(TAG_GOAL)?;
+            return put_goal(sink, goal);
+        }
+        let entry = self
+            .memory
+            .entries()
+            .nth(index - goals)
+            .ok_or(Error::SnapshotCorrupt)?;
+        sink.put_u8(TAG_ENTRY)?;
+        put_entry(sink, entry)
+    }
+
+    /// The header for this checkpoint: counters, allocators, item
+    /// counts, and the digest over every item's bytes.
+    #[must_use]
+    pub fn header(&self) -> Header {
+        let mut digest = FNV_OFFSET;
+        let mut item = [0u8; MAX_ITEM_BYTES];
+        for index in 0..self.item_count() {
+            // Every in-range item fits MAX_ITEM_BYTES by construction.
+            if let Ok(len) = self.encode_item(index, &mut item) {
+                digest = fnv_update(digest, item.get(..len).unwrap_or(&[]));
+            }
+        }
+        Header {
+            last_beat: self.last_beat,
+            spawn_seq: self.spawn_seq,
+            next_deadline: self.next_deadline,
+            next_goal_id: self.ledger.next_id(),
+            next_stamp: self.memory.next_stamp(),
+            goals: u8::try_from(self.ledger.len()).unwrap_or(u8::MAX),
+            entries: u8::try_from(self.memory.len()).unwrap_or(u8::MAX),
+            digest,
+        }
+    }
+}
+
+impl Default for AgentCheckpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A checkpoint's fixed header: everything but the items, plus the
+/// digest that binds them. The `continue_as_new` input on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// The last completed beat.
+    pub last_beat: Beat,
+    /// The agent-wide spawn counter.
+    pub spawn_seq: u32,
+    /// The next persistent-clock heartbeat deadline.
+    pub next_deadline: u64,
+    /// The goal id allocator.
+    pub next_goal_id: u16,
+    /// The memory stamp allocator.
+    pub next_stamp: u32,
+    /// Goal items that follow.
+    pub goals: u8,
+    /// Entry items that follow the goals.
+    pub entries: u8,
+    /// FNV-1a-64 over every item's bytes, in order.
+    pub digest: u64,
+}
+
+impl Header {
+    /// Items the header promises.
+    #[must_use]
+    pub const fn items(&self) -> usize {
+        self.goals as usize + self.entries as usize
+    }
+
+    /// Encode into `out` (exactly [`HEADER_BYTES`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotBufferTooSmall`] when `out` is short.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
+        let mut sink = Sink::writing(out);
+        self.put(&mut sink)?;
+        Ok(sink.pos)
+    }
+
+    fn put(&self, s: &mut Sink<'_>) -> Result<(), Error> {
+        s.put_u8(CHECKPOINT_VERSION)?;
+        s.put_u64(self.last_beat.get())?;
+        s.put_u32(self.spawn_seq)?;
+        s.put_u64(self.next_deadline)?;
+        s.put_u16(self.next_goal_id)?;
+        s.put_u32(self.next_stamp)?;
+        s.put_u8(self.goals)?;
+        s.put_u8(self.entries)?;
+        s.put_u64(self.digest)
+    }
+
+    /// Decode exactly [`HEADER_BYTES`]. The version is checked before
+    /// anything else, so a version bump reads as a version problem.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotVersionMismatch`] for a foreign version byte;
+    /// [`Error::SnapshotTruncated`] for a short header;
+    /// [`Error::SnapshotCorrupt`] for trailing bytes or item counts past
+    /// the ledger's or the store's capacity.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let version = *bytes.first().ok_or(Error::SnapshotTruncated)?;
+        if version != CHECKPOINT_VERSION {
+            return Err(Error::SnapshotVersionMismatch { found: version });
+        }
+        let mut r = Reader {
+            bytes,
+            pos: 1,
+            end: bytes.len(),
+        };
+        let header = Self::take(&mut r)?;
+        if r.pos != r.end {
+            return Err(Error::SnapshotCorrupt);
+        }
+        Ok(header)
+    }
+
+    fn take(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let header = Self {
+            last_beat: Beat::new(r.u64()?),
+            spawn_seq: r.u32()?,
+            next_deadline: r.u64()?,
+            next_goal_id: r.u16()?,
+            next_stamp: r.u32()?,
+            goals: r.u8()?,
+            entries: r.u8()?,
+            digest: r.u64()?,
+        };
+        if usize::from(header.goals) > MAX_GOALS || usize::from(header.entries) > MAX_MEMORY {
+            return Err(Error::SnapshotCorrupt);
+        }
+        Ok(header)
+    }
+}
+
+/// An item-by-item restore into a caller-owned [`AgentCheckpoint`].
+///
+/// Holds only the header, a running digest, and a count — the state
+/// itself lives in the target the caller owns, so restoring needs no
+/// second copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restore {
+    header: Header,
+    digest: u64,
+    received: usize,
+}
+
+impl Restore {
+    /// Begin restoring `header` into `target`, which is reset to the
+    /// header's counters and empty, allocator-positioned stores.
+    pub const fn begin(header: Header, target: &mut AgentCheckpoint) -> Self {
+        *target = AgentCheckpoint {
+            last_beat: header.last_beat,
+            spawn_seq: header.spawn_seq,
+            next_deadline: header.next_deadline,
+            ledger: GoalLedger::restoring(header.next_goal_id),
+            memory: Memory::restoring(header.next_stamp),
+        };
+        Self {
+            header,
+            digest: FNV_OFFSET,
+            received: 0,
+        }
+    }
+
+    /// Items received so far.
+    #[must_use]
+    pub const fn received(&self) -> usize {
+        self.received
+    }
+
+    /// Items still owed.
+    #[must_use]
+    pub const fn remaining(&self) -> usize {
+        self.header.items().saturating_sub(self.received)
+    }
+
+    /// Apply the next item. Goals must come before entries, exactly as
+    /// many of each as the header promised.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotCorrupt`] for an item past the promised count,
+    /// the wrong kind in this position, trailing bytes, or any
+    /// structural violation; [`Error::SnapshotTruncated`] for a short
+    /// item.
+    pub fn push(&mut self, target: &mut AgentCheckpoint, item: &[u8]) -> Result<(), Error> {
+        let mut r = Reader {
+            bytes: item,
+            pos: 0,
+            end: item.len(),
+        };
+        self.take_into(target, &mut r)?;
+        if r.pos != r.end {
+            return Err(Error::SnapshotCorrupt);
+        }
+        Ok(())
+    }
+
+    /// Read one item from `r` into `target`, folding its bytes into the
+    /// running digest.
+    fn take_into(&mut self, target: &mut AgentCheckpoint, r: &mut Reader<'_>) -> Result<(), Error> {
+        if self.remaining() == 0 {
+            return Err(Error::SnapshotCorrupt);
+        }
+        let start = r.pos;
+        let want_goal = self.received < usize::from(self.header.goals);
+        match (r.u8()?, want_goal) {
+            (TAG_GOAL, true) => target.ledger.restore_goal(take_goal(r)?)?,
+            (TAG_ENTRY, false) => target.memory.restore_entry(take_entry(r)?)?,
+            _ => return Err(Error::SnapshotCorrupt),
+        }
+        let bytes = r.bytes.get(start..r.pos).ok_or(Error::SnapshotTruncated)?;
+        self.digest = fnv_update(self.digest, bytes);
+        self.received += 1;
+        Ok(())
+    }
+
+    /// Finish: every promised item arrived and the digest matches.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTruncated`] when items are still owed;
+    /// [`Error::SnapshotChecksumMismatch`] when the items do not match
+    /// the header's digest.
+    pub const fn finish(&self) -> Result<(), Error> {
+        if self.remaining() != 0 {
+            return Err(Error::SnapshotTruncated);
+        }
+        if self.digest != self.header.digest {
+            return Err(Error::SnapshotChecksumMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The largest encoded memory entry ([`encode_entry`]): the harvest
+/// activity's answer on the device.
+pub const MAX_ENTRY_RECORD_BYTES: usize = MAX_ENTRY_BYTES;
+
+/// Encode one memory entry (the item layout without its tag),
+/// returning the bytes written.
+///
+/// # Errors
+///
+/// [`Error::SnapshotBufferTooSmall`] when `out` is short.
+pub fn encode_entry(entry: &MemoryEntry, out: &mut [u8]) -> Result<usize, Error> {
+    let mut sink = Sink::writing(out);
+    put_entry(&mut sink, entry)?;
+    Ok(sink.pos)
+}
+
+/// Decode exactly one memory entry written by [`encode_entry`].
+///
+/// # Errors
+///
+/// [`Error::SnapshotTruncated`] for short input; [`Error::SnapshotCorrupt`]
+/// for trailing bytes or an invalid field.
+pub fn decode_entry(bytes: &[u8]) -> Result<MemoryEntry, Error> {
+    let mut r = Reader {
+        bytes,
+        pos: 0,
+        end: bytes.len(),
+    };
+    let entry = take_entry(&mut r)?;
+    if r.pos != r.end {
+        return Err(Error::SnapshotCorrupt);
+    }
+    Ok(entry)
 }
 
 /// Exact bytes [`encode`] writes for `state`.
@@ -89,11 +442,12 @@ pub struct AgentCheckpoint {
 pub fn encoded_len(state: &AgentCheckpoint) -> usize {
     let mut sink = Sink::counting();
     // Counting never fails: every write only advances the cursor.
-    let _ = put_state(&mut sink, state);
+    let _ = put_blob(&mut sink, state);
     sink.pos + CHECKSUM_LEN
 }
 
-/// Encode `state` into `out`, returning the bytes written.
+/// Encode `state` as one blob (header, items, integrity), returning the
+/// bytes written. Host tooling; the device stores items.
 ///
 /// # Errors
 ///
@@ -101,14 +455,22 @@ pub fn encoded_len(state: &AgentCheckpoint) -> usize {
 /// [`encoded_len`].
 pub fn encode(state: &AgentCheckpoint, out: &mut [u8]) -> Result<usize, Error> {
     let mut sink = Sink::writing(out);
-    put_state(&mut sink, state)?;
+    put_blob(&mut sink, state)?;
     let end = sink.pos;
     let integrity = fnv1a64(sink.out.get(..end).ok_or(Error::SnapshotBufferTooSmall)?);
     sink.put_u64(integrity)?;
     Ok(sink.pos)
 }
 
-/// Decode and re-validate a checkpoint.
+fn put_blob(s: &mut Sink<'_>, state: &AgentCheckpoint) -> Result<(), Error> {
+    state.header().put(s)?;
+    for index in 0..state.item_count() {
+        state.put_item(s, index)?;
+    }
+    Ok(())
+}
+
+/// Decode and re-validate a blob.
 ///
 /// # Errors
 ///
@@ -124,37 +486,22 @@ pub fn decode(bytes: &[u8]) -> Result<AgentCheckpoint, Error> {
         pos: 1,
         end: bytes.len() - CHECKSUM_LEN,
     };
-    let last_beat = Beat::new(r.u64()?);
-    let spawn_seq = r.u32()?;
-    let next_goal_id = r.u16()?;
-    let next_stamp = r.u32()?;
-
-    let mut goals = [placeholder_goal(); MAX_GOALS];
-    let count = r.count(MAX_GOALS)?;
-    for slot in goals.iter_mut().take(count) {
-        *slot = take_goal(&mut r)?;
+    let header = Header::take(&mut r)?;
+    let mut state = AgentCheckpoint::new();
+    let mut restore = Restore::begin(header, &mut state);
+    while restore.remaining() > 0 {
+        restore.take_into(&mut state, &mut r)?;
     }
-    let ledger = GoalLedger::from_parts(goals.get(..count).unwrap_or(&[]), next_goal_id)?;
-
-    let mut entries = [placeholder_entry(); MAX_MEMORY];
-    let count = r.count(MAX_MEMORY)?;
-    for slot in entries.iter_mut().take(count) {
-        *slot = take_entry(&mut r)?;
-    }
-    let memory = Memory::from_parts(entries.get(..count).unwrap_or(&[]), next_stamp)?;
-
     if r.pos != r.end {
         return Err(Error::SnapshotCorrupt);
     }
-    Ok(AgentCheckpoint {
-        last_beat,
-        spawn_seq,
-        ledger,
-        memory,
-    })
+    // The blob integrity already passed, so a digest mismatch here is a
+    // payload that checksums but lies about its items: corrupt.
+    restore.finish().map_err(|_| Error::SnapshotCorrupt)?;
+    Ok(state)
 }
 
-/// Check length, version, and integrity without decoding the payload.
+/// Check a blob's length, version, and integrity without decoding it.
 ///
 /// # Errors
 ///
@@ -244,27 +591,6 @@ impl<'a> Sink<'a> {
         self.put_u8(u8::from(run.is_some()))?;
         self.put_u64(run.map_or(0, RunId::get))
     }
-
-    fn put_count(&mut self, n: usize) -> Result<(), Error> {
-        self.put_u8(u8::try_from(n).map_err(|_| Error::SnapshotCorrupt)?)
-    }
-}
-
-fn put_state(s: &mut Sink<'_>, state: &AgentCheckpoint) -> Result<(), Error> {
-    s.put_u8(CHECKPOINT_VERSION)?;
-    s.put_u64(state.last_beat.get())?;
-    s.put_u32(state.spawn_seq)?;
-    s.put_u16(state.ledger.next_id())?;
-    s.put_u32(state.memory.next_stamp())?;
-    s.put_count(state.ledger.len())?;
-    for goal in state.ledger.goals() {
-        put_goal(s, goal)?;
-    }
-    s.put_count(state.memory.len())?;
-    for entry in state.memory.entries() {
-        put_entry(s, entry)?;
-    }
-    Ok(())
 }
 
 fn put_goal(s: &mut Sink<'_>, g: &Goal) -> Result<(), Error> {
@@ -377,14 +703,6 @@ impl<'a> Reader<'a> {
             1 => Ok(true),
             _ => Err(Error::SnapshotCorrupt),
         }
-    }
-
-    fn count(&mut self, capacity: usize) -> Result<usize, Error> {
-        let n = usize::from(self.u8()?);
-        if n > capacity {
-            return Err(Error::SnapshotCorrupt);
-        }
-        Ok(n)
     }
 
     fn note(&mut self) -> Result<Note, Error> {
@@ -524,52 +842,4 @@ fn take_entry(r: &mut Reader<'_>) -> Result<MemoryEntry, Error> {
         provenance: Provenance { goal, run, beat },
         stamp,
     })
-}
-
-/// Filler for the fixed decode arrays; never escapes [`decode`].
-const fn placeholder_goal() -> Goal {
-    Goal {
-        id: GoalId::MIN,
-        objective: Note::EMPTY,
-        priority: 0,
-        cadence: Cadence::Once,
-        envelope: Envelope {
-            per_run_turns: 0,
-            per_run_mutations: 0,
-            turns: 0,
-            mutations: 0,
-            runs: 0,
-        },
-        remaining: Remaining {
-            turns: 0,
-            mutations: 0,
-            runs: 0,
-        },
-        reserved: Grant::ZERO,
-        capabilities: Capabilities::empty(),
-        status: GoalStatus::Active,
-        next_due: Beat::ZERO,
-        failures: 0,
-        runs_started: 0,
-        last_status: None,
-        waiting_since: Beat::ZERO,
-        run: None,
-    }
-}
-
-/// Filler for the fixed decode arrays; never escapes [`decode`].
-const fn placeholder_entry() -> MemoryEntry {
-    MemoryEntry {
-        key: MemoryKey::Note {
-            name_digest: Digest::new(0),
-        },
-        label: Note::EMPTY,
-        value: Note::EMPTY,
-        provenance: Provenance {
-            goal: None,
-            run: None,
-            beat: Beat::ZERO,
-        },
-        stamp: 0,
-    }
 }

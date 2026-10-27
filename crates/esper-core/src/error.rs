@@ -401,6 +401,11 @@ pub enum Error {
     /// The memory write stamp space is exhausted.
     #[error("memory stamps exhausted")]
     MemoryStampsExhausted,
+    /// Brief bytes are not a well-formed brief: over `BRIEF_CAP`, not
+    /// opening with a `GOAL` line, a line without its newline, or a
+    /// control byte inside a line.
+    #[error("brief bytes are malformed")]
+    BriefInvalid,
 }
 
 impl Error {

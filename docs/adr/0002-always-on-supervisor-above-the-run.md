@@ -1,4 +1,4 @@
-# ADR 0002: Always-on lives in a supervisor above the run, paced by a durable beat counter
+# ADR 0002: Always-on is a firmware Waymaker workflow above the run
 
 - Status: proposed, pending Mark's review
 - Date: 2026-10-27
@@ -19,64 +19,83 @@ always-on agent needs three things a run cannot give it:
 
 The forces:
 
+- **Esper ships on the device.** It is a firmware harness (ESP32-S3);
+  anything that exists only behind the `host` feature does not exist.
+- **Waymaker is the durability layer.** It already provides durable
+  activities, durable deadlines (`ctx.timer`, boot or persistent
+  clock), and `continue_as_new`, as `no_std` futures an Embassy
+  executor polls.
+- **Every record fits a scratch page.** Waymaker states device RAM
+  with a 512-byte scratch page.
 - The run's guarantees (§11.3) are the product. Nothing here may
   weaken them or change a golden fixture.
-- There is no persistent clock across power loss (§7.3, Waymaker
-  durable-time rule). "Every 10 minutes" cannot be a durable claim.
 - Budgets are run identity and never widen (ADR 10). An agent that
-  spawns runs forever needs the same property one level up, or it is
-  an unbounded spender.
+  spawns runs forever needs the same property one level up.
 - Model output is untrusted prose (§8.1). A model that writes its own
   memory can launder hallucinations into "facts" the next run trusts.
 
+## The rejected first design
+
+The first cut of this rung built the supervisor as a **host-only**
+layer: a heap-backed `AgentStore` journal, a hand-rolled replay, a
+Tokio interval as the heartbeat, a 6.5 KB checkpoint blob, and
+1 KB run reports. Every test passed and the firmware build compiled —
+because the supervisor was excluded from it. It was rejected in
+review: it duplicated what Waymaker already does, could not run on the
+board, and its records could never stage through a 512-byte page. The
+lesson is recorded in the root `CLAUDE.md` (firmware-first), and the
+firmware build now carries a guard that fails if the supervisor is
+ever gated behind `host` again.
+
 ## Decision
 
-1. **A supervisor above the run, not a bigger run.** The supervisor
-   has its own journal (`AgentJournal`) and drives ordinary runs
-   through `drive_segment`. The run state machine is untouched. A
-   long-lived run with an "idle" state was rejected: it would put an
-   unbounded loop inside the bounded one and break §11.3 item 6 (one
-   logical terminal).
-2. **Heartbeats are a durable counter, not a clock.** `Beat(u64)` is
-   committed before each beat's work, never skips, never repeats.
-   Cadences and backoffs are in beats. The host maps beats to wall
-   time and owns that claim.
-3. **One unit of work per beat.** At most one run spawns or resumes
-   per beat — the heartbeat twin of one call per turn (ADR 2). This
-   bounds per-beat cost and keeps the scheduler deterministic.
-4. **Goals carry a cumulative envelope, reserve-on-intent,
-   refund-on-outcome.** The spawn reserves the run's grant before the
-   run exists; settlement refunds the unspent part. A crash between
-   the two holds the reservation, so the envelope can never widen.
-5. **Memory is written by the harness from committed evidence, and by
-   the operator — never by the model.** Harvest reads the settled
-   run's committed trace: successful observations (mutations only
-   with a passing verification) and the terminal outcome. Values are
-   masked before they become durable. A `memory_write` tool was
-   rejected for now: it changes the §17 catalog and gives the model a
-   write path into its own future prompts.
-6. **The brief is identity.** The goal objective and recalled memory
-   reach the prompt as a pre-rendered, bounded `Brief` whose digest is
-   bound into the seed snapshot (151 bytes), so a reboot cannot swap
-   it. Unbriefed runs keep byte-identical prompts and seeds.
-7. **A checkpoint bounds storage.** Between beats the supervisor
-   folds its journal into a versioned, integrity-checked checkpoint
-   and drops settled run journals.
+1. **The supervisor is a Waymaker workflow.** `agent::supervise` is an
+   `async fn` over `waymaker_embassy::Ctx`: `no_std`, no allocation,
+   no async runtime, compiled into the firmware build. Waymaker's
+   journal is its only store; its state is derived by replay into a
+   caller-owned `AgentState` (a `static` on the device).
+2. **Heartbeats are durable deadlines, counted.** Each beat awaits
+   `ctx.timer`; the clock (`AfterBoot` or `AtPersistentTime`) is a
+   declared part of the agent's identity, never guessed. The beat
+   counter is derived by replay, so it never skips or repeats. The
+   workflow never reads a clock: the persistent reading arrives inside
+   a recorded activity answer.
+3. **Everything the world says is an activity.** Operator commands and
+   input readiness arrive in a recorded `SENSE` answer; goal runs are
+   `RUN` activities whose committed input is the full spawn seed and
+   brief; harvested memory arrives one `HARVEST` record at a time.
+   Replay sees exactly what the live boot saw.
+4. **Every record fits one page.** Each payload has a compile-time
+   maximum asserted `≤ 480` bytes. Large state is split into items:
+   the checkpoint is a 37-byte header plus one item per goal and per
+   memory entry, stored with `STORE`, carried across `continue_as_new`
+   by the header alone, and restored item by item into the caller's
+   state with a digest check.
+5. **One unit of work per beat**, as one call per turn (ADR 2).
+6. **Goals carry a cumulative envelope, reserve-on-intent,
+   refund-on-outcome**, so the envelope can never widen.
+7. **Memory is written by the harness from committed evidence, and by
+   the operator — never by the model.** A streaming, allocation-free
+   `Harvester` pairs requests, observations and verifications (one
+   open effect at a time) and remembers mutations only with a passing
+   verification. Operator text is masked by the dispatcher before the
+   `SENSE` answer becomes a durable record.
+8. **The brief is identity**, bound into the seed snapshot (151 bytes)
+   and carried in the committed `RUN` intent; unbriefed runs stay
+   byte-identical.
 
 ## Consequences
 
 - Every existing fixture, distill table, and Jev cassette is
-  unchanged (unbriefed seeds and prompts are byte-identical).
-- The prompt buffer grows to `BRIEFED_PROMPT_CAP` = 1536 bytes for
-  briefed runs (+512 B of stack on the board). `PROMPT_CAP` and the
-  default `InferenceSettings` stay 1024.
-- Recall is recency-ordered, not relevance-ranked. That is honest
-  for a 32-entry store and a 256-byte brief; semantic recall is a
-  later rung's question.
-- A goal whose run waits on human input is "overdue" after a policy
-  number of beats — a signal, never a timeout. The supervisor never
-  abandons a parked run.
-- Proof posture: like E0–E4, invariants are enforced by exhaustive
-  and property-style tests (all 8×10 goal transition pairs, the
-  envelope never-widen sequence, the agent crash matrix), not by a
-  mechanized prover — no Verus toolchain exists in this workspace.
+  unchanged.
+- The supervisor is firmware-clean today, but `RUN` on the board needs
+  the run engine port (`esper-device`); until then the host dispatcher
+  double drives runs through `drive_segment`.
+- RAM: `AgentState` 7,384 B, the `supervise` future 2,280 B (host,
+  64-bit; pinned by test). Briefed runs use a 1536-byte prompt buffer
+  (+512 B). Board figures are not yet measured.
+- Recall is recency-ordered, not relevance-ranked.
+- Proof posture: exhaustive and seeded property tests (all 8×10 goal
+  transitions, the never-widening envelope, every byte flip of a
+  restored checkpoint, 174 injected resets at Waymaker boundaries);
+  no mechanized prover — no Verus toolchain exists in this workspace.

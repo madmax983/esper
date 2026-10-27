@@ -307,32 +307,50 @@ impl Memory {
     /// or stamps, a stamp at or past `next_stamp`, or too many pinned
     /// entries.
     pub fn from_parts(entries: &[MemoryEntry], next_stamp: u32) -> Result<Self, Error> {
-        if entries.len() > MAX_MEMORY {
-            return Err(Error::SnapshotCorrupt);
-        }
-        let mut memory = Self {
-            slots: [None; MAX_MEMORY],
-            next_stamp,
-        };
-        for (i, entry) in entries.iter().enumerate() {
-            if entry.stamp == 0 || entry.stamp >= next_stamp {
-                return Err(Error::SnapshotCorrupt);
-            }
-            if entries
-                .iter()
-                .skip(i + 1)
-                .any(|other| other.key == entry.key || other.stamp == entry.stamp)
-            {
-                return Err(Error::SnapshotCorrupt);
-            }
-        }
-        for (slot, entry) in memory.slots.iter_mut().zip(entries.iter()) {
-            *slot = Some(*entry);
-        }
-        if memory.pinned_count() > MAX_PINNED {
-            return Err(Error::SnapshotCorrupt);
+        let mut memory = Self::restoring(next_stamp);
+        for entry in entries {
+            memory.restore_entry(*entry)?;
         }
         Ok(memory)
+    }
+
+    /// An empty store whose stamp allocator stands at `next_stamp`: the
+    /// start of an item-by-item checkpoint restore
+    /// ([`Self::restore_entry`]).
+    #[must_use]
+    pub const fn restoring(next_stamp: u32) -> Self {
+        Self {
+            slots: [None; MAX_MEMORY],
+            next_stamp,
+        }
+    }
+
+    /// Append one restored entry, validating it against the stamp
+    /// allocator and the entries already restored. Order is preserved,
+    /// so storage stays canonical.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotCorrupt`] for an unstamped entry, a stamp at or
+    /// past the allocator, a duplicate key or stamp, one pinned entry
+    /// too many, or a full store.
+    pub fn restore_entry(&mut self, entry: MemoryEntry) -> Result<(), Error> {
+        if entry.stamp == 0
+            || entry.stamp >= self.next_stamp
+            || self
+                .entries()
+                .any(|other| other.key == entry.key || other.stamp == entry.stamp)
+            || (entry.pinned() && self.pinned_count() >= MAX_PINNED)
+        {
+            return Err(Error::SnapshotCorrupt);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::SnapshotCorrupt)?;
+        *slot = Some(entry);
+        Ok(())
     }
 }
 
