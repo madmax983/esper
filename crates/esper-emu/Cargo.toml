@@ -3,7 +3,7 @@ name = "esper-emu"
 version = "0.1.0"
 edition = "2024"
 description = "Esper firmware linked, started and run under QEMU so the harness executes on the instruction sets it is written for. An execution fixture: never published, never shipped, never a substitute for a board."
-license = "MIT"
+license = "MIT OR Apache-2.0"
 publish = false
 
 # Behind `required-features`: without it `cargo build --workspace` and
@@ -21,6 +21,8 @@ esper-runtime = { path = "../esper-runtime", default-features = false, optional 
 # The façade's `Decode`, for reading a `SENSE` answer the way the
 # supervisor does.
 waymaker-embassy = { version = "0.1.0", optional = true }
+# The journal protocol's identities, for the image's journal double.
+waymaker-core = { version = "0.1.0", optional = true }
 
 # The reset vector, the vector table, and the semihosting channel the
 # harness reads. Target-gated so no host build ever sees them.
@@ -31,7 +33,7 @@ cortex-m-semihosting = "0.5"
 [features]
 default = []
 # Builds the binary at all. `cargo xtask emulate` always passes it.
-emu = ["dep:esper-core", "dep:esper-runtime", "dep:waymaker-embassy"]
+emu = ["dep:esper-core", "dep:esper-runtime", "dep:waymaker-embassy", "dep:waymaker-core"]
 
 [lints]
 workspace = true

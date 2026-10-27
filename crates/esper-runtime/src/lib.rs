@@ -1,16 +1,17 @@
-//! `esper-runtime`: the durable `ReAct` runtime for the Esper E0/E1 slice.
+//! `esper-runtime`: the durable `ReAct` runtime, for firmware.
 //!
-//! The engine runs one scripted `ReAct` trajectory at a time: the model
-//! emits one line per turn, the engine decodes it with the E2 contract
-//! validator, authorizes tool calls against the seed's capabilities,
-//! dispatches them to the world doubles, verifies mutating tools with
-//! an independent read-back, and accounts every committed step with the
-//! deterministic monitor. Every boundary crossing appends a journal
-//! frame first; a simulated crash at any [`CrashPoint`] drops all
-//! in-memory state and replays the journal, so recovery is just replay.
+//! The run ([`fn@run`]) is a Waymaker workflow: an `async fn` over
+//! `waymaker_embassy::Ctx`, `no_std` and allocation-free. The model
+//! emits one line per turn as a recorded inference activity; the
+//! workflow decodes it with the E2 contract validator, authorizes tool
+//! calls against the seed's capabilities, dispatches each attempt as a
+//! recorded activity, verifies mutating tools with an independent
+//! read-back, and accounts every step with the deterministic monitor.
+//! Waymaker's journal is the only store: a reset replays the recorded
+//! answers and the workflow resumes from the committed prefix.
 //!
-//! The driver entry point is [`drive_run`] (plus [`drive_run_async`]
-//! under the `host` feature).
+//! Under the `host` feature, [`drive_run`] drives the workflow over the
+//! test doubles, injecting a reset at any [`CrashPoint`].
 //!
 //! E4+aon adds the always-on layer above the run ([`agent`]): the
 //! [`supervise`] workflow, `no_std` over `waymaker_embassy::Ctx`, paced
@@ -19,12 +20,6 @@
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "host"), no_std)]
-
-// Declared per SPEC §2 and intentionally linked: the E0/E1 engine
-// drives `waymaker-core` directly, and the E2 async model backend
-// integrates through the Embassy facade.
-#[allow(unused_extern_crates)]
-extern crate waymaker_embassy as _;
 
 pub mod agent;
 pub mod backend;
@@ -39,12 +34,15 @@ const _: () = {
     let _ = agent::AgentSeed::default_slice;
     let _ = agent::wire::PAGE_RECORD_MAX;
     let _: fn(&agent::Start, &mut [u8]) -> Result<usize, agent::AgentError> = agent::Start::encode;
+    // The run workflow ships on the device too.
+    let _ = run::RunState::new;
+    let _ = run::wire::RunStart::decode;
+    let _ = run::device::observe;
 };
 pub mod error;
+pub mod run;
 pub mod seed;
 
-#[cfg(feature = "host")]
-pub mod engine;
 #[cfg(feature = "host")]
 pub mod jev;
 #[cfg(feature = "host")]
@@ -87,10 +85,15 @@ pub use agent::{
     AgentError, AgentSeed, AgentState, BeatAction, Heartbeat, NoPulse, Pulse, PulseSink,
     Settlement, Start, supervise,
 };
+// The run workflow (SPEC §22): `no_std`, compiled into the firmware.
 #[cfg(feature = "host")]
-pub use engine::{RolloverHandoff, SegmentOutcome, drive_run, drive_run_async, drive_segment};
+pub use journal::{Frame, Journal, Record};
 #[cfg(feature = "host")]
-pub use journal::{Frame, Journal};
+pub use run::host::{
+    Reset, RolloverHandoff, SegmentOutcome, drive_run, drive_run_async, drive_run_with_reset,
+    drive_segment,
+};
+pub use run::{RunState, run};
 #[cfg(feature = "host")]
 pub use trace::{RunTrace, TraceEvent};
 #[cfg(feature = "host")]

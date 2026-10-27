@@ -284,7 +284,157 @@ const fn lineage_bytes(lineage: &Lineage) -> [u8; 65] {
     out
 }
 
+/// Read `N` little-endian bytes at `at`.
+fn le<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+    <[u8; N]>::try_from(bytes.get(at..at.checked_add(N)?)?).ok()
+}
+
+/// Decode [`lineage_bytes`]' 65-byte layout.
+fn lineage_from_bytes(bytes: &[u8]) -> Option<Lineage> {
+    Some(Lineage {
+        parent_run: esper_core::RunId::new(u64::from_le_bytes(le(bytes, 0)?)),
+        continued_at_frame: u32::from_le_bytes(le(bytes, 8)?),
+        budgets_remaining: esper_core::ResourceBudget {
+            model_turns: u16::from_le_bytes(le(bytes, 12)?),
+            input_tokens: u32::from_le_bytes(le(bytes, 14)?),
+            output_tokens: u32::from_le_bytes(le(bytes, 18)?),
+            elapsed_ms: u64::from_le_bytes(le(bytes, 22)?),
+            radio_bytes: u32::from_le_bytes(le(bytes, 30)?),
+            mutations: u16::from_le_bytes(le(bytes, 34)?),
+            consecutive_errors: *bytes.get(36)?,
+        },
+        versions: esper_core::VersionSet {
+            workflow: u32::from_le_bytes(le(bytes, 37)?),
+            model: esper_core::Digest::new(u64::from_le_bytes(le(bytes, 41)?)),
+            catalog: esper_core::Digest::new(u64::from_le_bytes(le(bytes, 49)?)),
+            policy: esper_core::Digest::new(u64::from_le_bytes(le(bytes, 57)?)),
+        },
+    })
+}
+
+/// A tagged optional `u64` at `at`: tag `0` with eight zero bytes is
+/// `None`, tag `1` carries the value; anything else is malformed.
+fn tagged_u64(bytes: &[u8], at: usize) -> Result<Option<u64>, ()> {
+    let value = u64::from_le_bytes(le(bytes, at + 1).ok_or(())?);
+    match (bytes.get(at).copied().ok_or(())?, value) {
+        (0, 0) => Ok(None),
+        (1, value) => Ok(Some(value)),
+        _ => Err(()),
+    }
+}
+
+/// A `0`/`1` flag byte.
+const fn flag(byte: u8) -> Option<bool> {
+    match byte {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+impl SeedSnapshot {
+    /// Decode [`SeedSnapshot::input_bytes`]: the inverse, failing
+    /// closed (`None`) on any tag or flag outside its closed set, or a
+    /// `None` lineage whose 65 bytes are not zero.
+    #[must_use]
+    pub fn from_input_bytes(bytes: &[u8; SEED_INPUT_LEN]) -> Option<Self> {
+        let parent = match bytes[67] {
+            0 if bytes[68..133].iter().all(|b| *b == 0) => None,
+            1 => Some(lineage_from_bytes(&bytes[68..133])?),
+            _ => return None,
+        };
+        let snapshot = Self {
+            id: u64::from_le_bytes(le(bytes, 0)?),
+            elapsed_ms: u64::from_le_bytes(le(bytes, 8)?),
+            input_tokens: u32::from_le_bytes(le(bytes, 16)?),
+            output_tokens: u32::from_le_bytes(le(bytes, 20)?),
+            model_turns: u16::from_le_bytes(le(bytes, 24)?),
+            mutations: u16::from_le_bytes(le(bytes, 26)?),
+            workflow_version: u16::from_le_bytes(le(bytes, 28)?),
+            read_pins: le(bytes, 30)?,
+            read_count: bytes[38],
+            write_pins: le(bytes, 39)?,
+            write_count: bytes[47],
+            sensors: le(bytes, 48)?,
+            sensor_count: bytes[52],
+            allow_timer: flag(bytes[53])?,
+            allow_status: flag(bytes[54])?,
+            model_bundle: u64::from_le_bytes(le(bytes, 55)?),
+            inference: InferenceSettings {
+                max_prompt_bytes: u16::from_le_bytes(le(bytes, 63)?),
+                max_output_bytes: u16::from_le_bytes(le(bytes, 65)?),
+            },
+            parent,
+            context_budget_bytes: tagged_u64(bytes, 133).ok()?,
+            brief_digest: tagged_u64(bytes, 142).ok()?,
+        };
+        // Canonical only: re-encoding must reproduce the bytes.
+        (snapshot.input_bytes() == *bytes).then_some(snapshot)
+    }
+}
+
 impl RunSeed {
+    /// Rebuild a seed from its binding and its brief. The caller checks
+    /// that the brief hashes to `snapshot.brief_digest`.
+    #[must_use]
+    pub const fn from_snapshot(snapshot: &SeedSnapshot, brief: Option<Brief>) -> Self {
+        Self {
+            id: esper_core::RunId::new(snapshot.id),
+            model_turns: snapshot.model_turns,
+            mutations: snapshot.mutations,
+            input_tokens: snapshot.input_tokens,
+            output_tokens: snapshot.output_tokens,
+            elapsed_ms: snapshot.elapsed_ms,
+            capabilities: Capabilities {
+                read_pins: snapshot.read_pins,
+                read_count: snapshot.read_count,
+                write_pins: snapshot.write_pins,
+                write_count: snapshot.write_count,
+                sensors: snapshot.sensors,
+                sensor_count: snapshot.sensor_count,
+                allow_timer: snapshot.allow_timer,
+                allow_status: snapshot.allow_status,
+            },
+            workflow_version: snapshot.workflow_version,
+            model_bundle: snapshot.model_bundle,
+            inference: snapshot.inference,
+            context_budget_bytes: snapshot.context_budget_bytes,
+            parent: snapshot.parent,
+            brief,
+        }
+    }
+
+    /// The seed of the run that continues this one at `lineage` (E4,
+    /// SPEC §20.6).
+    ///
+    /// The child inherits the capabilities, workflow version, model
+    /// bundle, inference settings, context budget and brief; it starts
+    /// with the lineage's remaining budgets, which
+    /// [`esper_core::lineage::continue_as_new`] already proved do not
+    /// widen. The context budget is per-segment capacity, not a
+    /// consumable: inheriting the remainder would shrink every
+    /// generation's window toward zero. The child's id derives from the
+    /// parent id and the cut frame.
+    #[must_use]
+    pub const fn child(&self, lineage: Lineage) -> Self {
+        let remaining = lineage.budgets_remaining;
+        Self {
+            id: esper_core::RunId::new(
+                self.id
+                    .get()
+                    .wrapping_add(lineage.continued_at_frame as u64)
+                    .wrapping_add(1),
+            ),
+            model_turns: remaining.model_turns,
+            mutations: remaining.mutations,
+            input_tokens: remaining.input_tokens,
+            output_tokens: remaining.output_tokens,
+            elapsed_ms: remaining.elapsed_ms,
+            parent: Some(lineage),
+            ..*self
+        }
+    }
+
     /// Validate the seed before the first boot (SPEC §3.2 `Recover`).
     ///
     /// A seed names the exact workflow version this build runs; any
@@ -695,5 +845,61 @@ mod tests {
             ..plain
         };
         assert!(plain_wide.validate().is_err(), "a plain run keeps 1024");
+    }
+
+    /// The run's Waymaker input carries the seed as its 151-byte
+    /// binding: decoding it must reproduce the seed exactly, for a root,
+    /// a continued child with a context budget, and a briefed seed.
+    #[test]
+    fn the_binding_decodes_back_to_the_seed() {
+        let root = RunSeed {
+            id: RunId::new(42),
+            ..RunSeed::default_slice()
+        };
+        let child = RunSeed {
+            context_budget_bytes: Some(512),
+            ..root.child(test_lineage(9))
+        };
+        for seed in [root, child] {
+            let bytes = seed.snapshot().input_bytes();
+            let snapshot = SeedSnapshot::from_input_bytes(&bytes).expect("canonical bytes decode");
+            assert_eq!(snapshot, seed.snapshot());
+            assert_eq!(RunSeed::from_snapshot(&snapshot, None), seed);
+        }
+    }
+
+    /// Non-canonical bytes fail closed: an unknown flag, an unknown
+    /// tag, or a `None` lineage with stray bytes behind it.
+    #[test]
+    fn non_canonical_bindings_do_not_decode() {
+        let bytes = RunSeed::default_slice().snapshot().input_bytes();
+        for (at, value) in [(53usize, 2u8), (67, 2), (70, 1), (133, 2), (142, 7)] {
+            let mut bad = bytes;
+            bad[at] = value;
+            assert!(
+                SeedSnapshot::from_input_bytes(&bad).is_none(),
+                "byte {at} = {value} decoded"
+            );
+        }
+    }
+
+    /// A child continues its parent: remaining budgets, the lineage,
+    /// and every identity field inherited; its id derives from the cut.
+    #[test]
+    fn a_child_continues_its_parent() {
+        let parent = RunSeed {
+            id: RunId::new(100),
+            context_budget_bytes: Some(1000),
+            ..RunSeed::default_slice()
+        };
+        let lineage = test_lineage(12);
+        let child = parent.child(lineage);
+        assert_eq!(child.id, RunId::new(113));
+        assert_eq!(child.parent, Some(lineage));
+        assert_eq!(child.model_turns, lineage.budgets_remaining.model_turns);
+        assert_eq!(child.mutations, lineage.budgets_remaining.mutations);
+        assert_eq!(child.capabilities, parent.capabilities);
+        assert_eq!(child.context_budget_bytes, parent.context_budget_bytes);
+        assert_eq!(child.model_bundle, parent.model_bundle);
     }
 }

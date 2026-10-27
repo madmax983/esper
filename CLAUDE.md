@@ -32,9 +32,11 @@ Waymaker workflow, shipped on the device (target: ESP32-S3,
   fake device, fault injectors, in-memory journals, fixture runners —
   each allocation site marked `// HOST-ONLY`. Product logic never
   lives behind `host`.
-- **Existing host-only code is migration debt, not precedent.** The run
-  engine loop (`engine.rs`), its `Journal`, and `world.rs` are host-only
-  today; the firmware port retires that. Do not copy the pattern.
+- **The run and the supervisor are both workflows.** `run::run` and
+  `agent::supervise` are `async fn`s over `Ctx` in the firmware build
+  (SPEC §21–22, ADR 0002–0003). `journal.rs` (the derived `Frame`
+  view), `world.rs` and `run::host` / `agent::host` are host-only
+  doubles and harnesses — never product logic.
 
 ## Engineering law
 

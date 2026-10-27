@@ -10,6 +10,8 @@
 #[path = "../../crates/esper-emu/src/boot.rs"]
 mod boot;
 mod emulate;
+#[path = "../../crates/esper-emu/src/workload.rs"]
+mod workload;
 
 use std::process::ExitCode;
 

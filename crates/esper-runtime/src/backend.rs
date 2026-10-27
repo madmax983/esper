@@ -493,7 +493,7 @@ impl ModelBackend for TinyBackend<'_> {
 /// This is the engine's hint — which repair turn just burned and why —
 /// not the decoder's field-level hint (`esper_core::error::RepairHint`
 /// names the broken field; this one names the repair attempt).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairHint {
     /// The one-based repair index already committed.
     pub attempt: u8,

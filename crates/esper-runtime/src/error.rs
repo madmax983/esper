@@ -149,6 +149,9 @@ pub enum RuntimeError {
     /// The boot/reboot budget was exceeded; the run is livelocked.
     #[error("too many boots without the run completing")]
     TooManyBoots,
+    /// A recorded payload does not decode.
+    #[error("recorded payload does not decode: {0}")]
+    Wire(#[from] crate::agent::wire::WireError),
     /// A terminal payload named an unknown status code.
     #[error("terminal record has an unknown status code")]
     BadTerminal,

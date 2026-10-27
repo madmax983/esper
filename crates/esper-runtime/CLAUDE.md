@@ -12,8 +12,9 @@ object-safe `backend::ModelBackend` trait (`infer` / `bundle_id` /
 table keyed by `fingerprint_prompt`, no trained weights — see
 `docs/adr/0001-e3-tiny-backend-distillation-standin.md`). The fake
 device (GPIO + sensors + virtual clock), fault injector, and
-human-input queue are host-only doubles; the engine, journal, and
-durability protocol are the real slice. E2: six typed tools from the
+human-input queue are host-only doubles; the run workflow (SPEC §22,
+`run::run`) and its durability protocol are the real slice, in the
+firmware build. E2: six typed tools from the
 static protocol registry; authorization before dispatch; independent
 read-back verification for every mutation; effect-ID dedup on all
 dispatches. E4: context lifecycle — masking at the observation
@@ -45,15 +46,23 @@ verification, per-segment journal ownership, and the
   `synthesize_response`. SPEC §19 (live-verified 2026-09-22:
   `api.typesafe.ai`, top-level `{state, model, questions}`,
   `jev-1.13.0`, ~880–950 ms/turn).
-- `src/engine.rs` — the boundary loop: turn → authorize → dispatch →
-  verify → account, with crash recovery as journal replay. E3: the
-  `Infer` step drives a `&mut dyn ModelBackend`; the engine builds
-  the prompt with `build_prompt` from journal-restored inputs so
-  record and replay see byte-identical prompts. E4: `drive_segment`
-  (one driver lifetime), `SegmentOutcome` (Completed / Suspended /
-  Rollover), `RolloverHandoff` (snapshot + lineage + prompt bytes +
-  digest stream); the 80% rollover trigger in `do_gather`; the
-  failed-path guard in `do_authorize`; masking in `do_observe`.
+- `src/run/mod.rs` — SPEC §22: **the run, in the firmware build.**
+  `run` is an `async fn` over `waymaker_embassy::Ctx` walking the
+  normative machine; every world touch is an activity; state is the
+  caller-owned `RunState` (pinned ≤ 11 KiB). The 80% rollover folds
+  frame by frame, stores the snapshot in chunks and
+  `continue_as_new`s; the failed-path guard is in `authorize_call`.
+- `src/run/wire.rs` — the run's activity kinds (`INFER`, `PROBE`,
+  `TOOL`, `VERIFY`, `ASK`, `SNAP_STORE`, `SNAP_LOAD`), `RunStart`,
+  `TerminalRecord`, `Fault`; every maximum `const`-asserted ≤ 480.
+- `src/run/device.rs` — the dispatcher's product half: `infer`
+  (prompt rendering + backend), `bind` (re-validation), `observe`
+  (mask before answering), `validate_ask_input`,
+  `parse_delay_outcome`.
+- `src/run/host.rs` — HOST-ONLY: the journal double with the crash
+  point → boundary table, the dispatcher over the world doubles,
+  `drive_segment` / `drive_run` / `drive_run_with_reset`, the derived
+  frame view.
 - `src/agent/mod.rs` — E4+aon (SPEC §21): the always-on supervisor,
   **in the firmware build**. `supervise` is an `async fn` over
   `waymaker_embassy::Ctx` (`no_std`, no alloc): each beat awaits a
@@ -69,9 +78,9 @@ verification, per-segment journal ownership, and the
 - `src/agent/host.rs` — HOST-ONLY doubles: `MemJournal` (replay,
   redelivery, both clocks, `continue_as_new`, `CrashAt` injection),
   `HostAgent` (dispatcher over `drive_segment`), `PulseLog`, `drive`.
-- `src/journal.rs` — `Frame` / `Journal`: the only durable state.
-  Everything else is derived by replay. E4: `ToolObservation`
-  carries `secret_digest`; `ModelDecision` carries `prompt_bytes`.
+- `src/journal.rs` — HOST-ONLY: `Journal` holds a segment's Waymaker
+  records; `Frame` is the golden-trace view **derived** from them.
+  Waymaker's journal is the durable state.
 - `src/seed.rs` — `RunSeed`: explicit budgets, capabilities, version.
   E3: `model_bundle: u64` and `inference: InferenceSettings`; the
   journal-binding snapshot is a 67-byte canonical encoding

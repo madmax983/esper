@@ -126,6 +126,7 @@ dependencies = [
  "cortex-m-semihosting",
  "esper-core",
  "esper-runtime",
+ "waymaker-core",
  "waymaker-embassy",
 ]
 
@@ -529,6 +530,7 @@ version = "0.1.0"
 dependencies = [
  "esper-core",
  "esper-runtime",
+ "waymaker-core",
  "waymaker-embassy",
 ]
 

@@ -37,9 +37,9 @@ use waymaker_embassy::{ActivityDispatcher, Answer, Ctx, Halted, Handoff, Journal
 use super::wire::{self, Command, HarvestEntry, PAGE_RECORD_MAX, RunReport, RunRequest, Sense};
 use super::{AgentError, AgentSeed, AgentState, Pulse, PulseSink, supervise};
 use crate::backend::ModelBackend;
-use crate::engine::{RolloverHandoff, SegmentOutcome, drive_segment};
 use crate::error::CrashPoint;
 use crate::journal::Journal as RunJournal;
+use crate::run::host::{RolloverHandoff, SegmentOutcome, drive_segment};
 use crate::seed::RunSeed;
 use crate::trace::{RunTrace, TraceEvent};
 use crate::world::{FakeDevice, FaultPlan, InputPlan};
