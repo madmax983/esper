@@ -6,7 +6,7 @@ description = "Esper E0/E1 harness core: state machine, decision decoder, budget
 license = "MIT"
 
 [dependencies]
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 esper-protocol = { path = "../esper-protocol", version = "0.1.0" }
 
 [lints]

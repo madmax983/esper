@@ -1,0 +1,7 @@
+[alias]
+# CI and a local checkout run the same command. Cargo flags precede the
+# alias: `cargo --locked xtask emulate`.
+#
+# No `[build] target` here: it would make `cargo xtask` cross-compile its
+# own host-only dependencies. Firmware targets belong on the command line.
+xtask = "run --quiet --package xtask --"

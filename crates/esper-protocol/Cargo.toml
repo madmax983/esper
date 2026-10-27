@@ -6,7 +6,7 @@ description = "Esper E2: the single contract source for the typed native tool ca
 license = "MIT"
 
 [dependencies]
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 
 [lints]
 workspace = true

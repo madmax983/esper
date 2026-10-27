@@ -1,0 +1,129 @@
+# Esper's pipeline, modeled on Waymaker's.
+#
+# The toolchain and every firmware target come from rust-toolchain.toml,
+# which a local checkout reads too, so CI is confirmation rather than
+# discovery. The `check` job runs the gates in the root CLAUDE.md, in the
+# same order.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A superseded pull-request run is wasted work, but cancelling a push to
+# main can leave the default branch with no completed run at all.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately not RUSTFLAGS: that reaches every registry dependency,
+  # so a new rustc warning inside a dependency would fail a build with
+  # nothing in this repository to fix. The denial belongs on the tools
+  # that lint our own code.
+  RUSTDOCFLAGS: -D warnings -D missing-docs
+
+jobs:
+  check:
+    name: fmt, clippy, test, docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustflags: ""` because this action's default puts `-D warnings`
+      # into RUSTFLAGS, which is the decision the env block above explains
+      # not making.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace
+
+      # Firmware ships release, where overflow checks and debug assertions
+      # are off: this catches a wrapping `+` the dev test above cannot see.
+      - name: Test (release)
+        run: cargo test --locked --workspace --release
+
+      - name: Docs
+        run: cargo doc --locked --workspace --no-deps
+
+  firmware:
+    # A change that only builds on the host is not a change that works.
+    # `cargo check --no-default-features` on the host proves no `std` in
+    # our code but runs on a target that has `std`; these build the
+    # firmware crates for targets that have none, so a dependency that
+    # pulls `std` in fails here.
+    name: firmware builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # The root CLAUDE.md's firmware gate, verbatim.
+      - name: Check the firmware build on the host
+        run: cargo check --locked -p esper-runtime --no-default-features
+
+      - name: Build for Cortex-M0 (thumbv6m-none-eabi)
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv6m-none-eabi
+
+      - name: Build for Cortex-M3 (thumbv7m-none-eabi)
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv7m-none-eabi
+
+      - name: Build for Cortex-M4 (thumbv7em-none-eabi)
+        run: cargo build --locked -p esper-core -p esper-protocol -p esper-runtime --no-default-features --lib --target thumbv7em-none-eabi
+
+      # The emulated image's binary is behind `required-features`, so the
+      # host clippy stage never compiles it, and the emulation job builds
+      # it rather than linting it. One target: clippy does not link.
+      - name: Lint the emulated image on the firmware target
+        run: cargo clippy --locked -p esper-emu --target thumbv7em-none-eabi --features emu --bins -- -D warnings
+
+  emulation:
+    # A crate that compiles for the part is not a crate that runs on one:
+    # `cargo build --lib` produces an rlib and never links. This links
+    # `esper-emu` — a reset vector, a memory map, and Esper's firmware
+    # code paths — boots it on a Cortex-M3 and a Cortex-M4 under QEMU, and
+    # requires both cores to print every stage and the same digest the
+    # same workload computes on the host.
+    #
+    # What it is NOT is an ESP32-S3: the Xtensa target needs the Espressif
+    # toolchain and QEMU fork, which a clean runner does not have. See
+    # xtask/src/emulate.rs.
+    name: emulated boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Installed before the stage so that a missing emulator is an
+      # install failure rather than a boot that quietly did not happen.
+      # `cargo xtask emulate` fails closed if QEMU is absent anyway.
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y qemu-system-arm
+
+      - name: Boot the image on both cores
+        run: cargo --locked xtask emulate
