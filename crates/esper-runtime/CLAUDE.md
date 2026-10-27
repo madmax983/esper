@@ -54,6 +54,21 @@ verification, per-segment journal ownership, and the
   Rollover), `RolloverHandoff` (snapshot + lineage + prompt bytes +
   digest stream); the 80% rollover trigger in `do_gather`; the
   failed-path guard in `do_authorize`; masking in `do_observe`.
+- `src/agent/mod.rs` — E4+aon (SPEC §21): the always-on supervisor,
+  **in the firmware build**. `supervise` is an `async fn` over
+  `waymaker_embassy::Ctx` (`no_std`, no alloc): each beat awaits a
+  durable `ctx.timer` (`Heartbeat::Boot` / `Persistent`), senses the
+  world, runs at most one goal, settles, harvests, emits a `Pulse` to a
+  `PulseSink`, and every `checkpoint_every` beats stores the state item
+  by item and `continue_as_new`s. `AgentSeed` (identity, bound by
+  digest in `Start`), caller-owned `AgentState`, `AgentError`.
+- `src/agent/wire.rs` — the supervisor's activity kinds (`SENSE`,
+  `RUN`, `HARVEST`, `STORE`, `LOAD`) and page-bounded codecs
+  (`Sense`/`Command`, `RunRequest`/`RunReport`, `HarvestEntry`, item
+  keys). Every maximum is `const`-asserted `≤ PAGE_RECORD_MAX` (480).
+- `src/agent/host.rs` — HOST-ONLY doubles: `MemJournal` (replay,
+  redelivery, both clocks, `continue_as_new`, `CrashAt` injection),
+  `HostAgent` (dispatcher over `drive_segment`), `PulseLog`, `drive`.
 - `src/journal.rs` — `Frame` / `Journal`: the only durable state.
   Everything else is derived by replay. E4: `ToolObservation`
   carries `secret_digest`; `ModelDecision` carries `prompt_bytes`.
@@ -77,6 +92,13 @@ verification, per-segment journal ownership, and the
 - `tests/invariants.rs` — the durability contract.
 - `tests/context_lifecycle.rs` — E4: masking, 80% rollover, lineage,
   failed-path survival, reboot after rollover, corrupt snapshot.
+- `tests/always_on.rs` — E4+aon: cadence, satisfaction, least-privilege
+  denial, backoff, envelope exhaustion, parking, operator control,
+  memory rules, masking at the device boundary, brief transport and
+  binding, the persistent heartbeat, `continue_as_new` equivalence,
+  rollover under supervision, the RAM pin, and the crash matrix (every
+  Waymaker boundary kind × every occurrence, with and without
+  checkpoints, plus every run crash point inside a supervised run).
 
 ## Authority order
 
@@ -184,3 +206,34 @@ The doubles model the physical world: `FaultPlan` consumption and
   `[truncated]`) + `EMIT one decision line.` The fixed part always
   fits `PROMPT_CAP` — pinned by test, so signature growth fails
   loudly.
+
+## E4+aon: the supervisor (SPEC §21)
+
+**Firmware-first.** `agent` is not behind `host`. A `cfg(not(host))`
+guard in `lib.rs` names the supervisor's surface, so gating it out
+breaks `cargo check --no-default-features`. Only `agent::host` (the
+doubles) is host-only.
+
+**Waymaker is the store.** No second journal: ledger, memory, and the
+beat counter are derived by replaying the workflow into the
+caller-owned `AgentState`. Everything the world says arrives as a
+recorded activity answer — the workflow never reads a clock, an inbox,
+or an operator queue directly.
+
+**One page per record.** Every activity input and answer, and the
+`continue_as_new` input, fits `PAGE_RECORD_MAX`. New payloads get a
+`const` assertion next to their encoder.
+
+**Masking at the boundary.** Operator text is masked by the dispatcher
+(`Command::add_goal`, `Command::remember`) before the `SENSE` answer is
+recorded. Harvested entries are masked by the `Harvester`.
+
+**At least once.** A redelivered `RUN` names a run the dispatcher
+already holds: it re-drives that run from its own journal (the engine
+replays the terminal) — never a fresh one.
+
+**Briefs.** A spawned seed carries `brief: Some(..)` and
+`InferenceSettings::briefed_settings()` (1536-byte prompt). The brief
+is bound into the 151-byte seed snapshot, travels in the committed
+`RUN` intent, is re-validated by `Brief::from_bytes`, and is inherited
+by rollover children. Plain seeds keep the 1024 cap.

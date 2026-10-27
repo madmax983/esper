@@ -2335,3 +2335,377 @@ ingestion (fixture `y` proves this boundary). Multi-rollover chains
 are tested: fixture `v` runs a 13-decision task across multiple
 generations, and fixture `x` proves the cumulative fold carries
 failed paths across two rollovers plus a reboot.
+
+## 21. Rung E4+aon: always-on primitives (heartbeats, goals, memory)
+
+Rungs E0–E4 make one *run* durable: it starts from a seed, survives
+power loss, and ends with exactly one terminal result. An always-on
+agent outlives its runs. This rung adds the layer above the run — a
+**supervisor** — and three primitives it is built from:
+
+- **Heartbeat**: a durable beat, paced by Waymaker deadlines. One beat
+  does at most one unit of work.
+- **Goals**: standing objectives with a cadence, a priority, a
+  cumulative budget envelope, and a status machine. The supervisor
+  spawns runs to serve them.
+- **Memory**: bounded, masked, provenance-tagged knowledge that
+  survives across runs and reaches each new run's prompt.
+
+**Firmware-first.** The supervisor is a Waymaker workflow — an
+`async fn` over `waymaker_embassy::Ctx`, `no_std`, allocation-free —
+compiled into the firmware build (`--no-default-features`) and guarded
+so that it cannot be gated out of it. Every record it writes fits one
+512-byte Waymaker scratch page. The pure types (`beat`, `goal`,
+`memory`, `brief`, `harvest`, `checkpoint`) live in `esper-core`; the
+workflow and its page-bounded payloads live in `esper-runtime::agent`.
+Only test doubles live behind the `host` feature
+(`esper-runtime::agent::host`).
+
+Nothing in this rung changes the run state machine (§3), the run
+journal (§10), or any golden fixture: a run with no brief builds
+byte-identical prompts and seeds.
+
+### 21.1 Heartbeat: durable deadlines, counted beats
+
+`beat::Beat(u64)` counts completed beats. Beat `0` means "no beat yet";
+the first beat is `1`. `beat::BeatSpan(u32)` is a nonzero distance in
+beats (cadences, backoffs, liveness); arithmetic fails closed with
+`Error::BeatOverflow`.
+
+Each beat opens with a Waymaker deadline, `ctx.timer(spec)`, whose
+clock is part of the agent's identity (`AgentSeed::heartbeat`):
+
+| `Heartbeat` | `TimerSpec` | Across a reset |
+|---|---|---|
+| `Boot { ticks }` | `AfterBoot { ticks }` | the interval restarts: a liveness cadence, not a schedule; needs no RTC |
+| `Persistent { period }` | `AtPersistentTime { instant }` | the deadline survives power loss; Waymaker refuses it on a firmware without a persistent clock rather than downgrading |
+
+Rules (normative):
+
+1. **The workflow never reads a clock.** Deadlines are measured by the
+   journal (§11 of the Waymaker design); the persistent clock's
+   reading reaches the workflow only inside the recorded `SENSE`
+   answer (§21.5), so replay sees what the live boot saw.
+2. **Never skip, never repeat.** The beat number is derived by replay.
+   A reset inside beat `n` replays `n`'s recorded boundaries and
+   finishes beat `n`.
+3. **One unit of work per beat.** A beat spawns or resumes at most one
+   run — the heartbeat twin of one call per turn (ADR 2).
+4. **Missed beats are not owed.** For a persistent heartbeat the next
+   deadline is `max(previous deadline, sensed clock) + period`: a late
+   wake yields one beat, never a burst.
+
+Each beat emits a `Pulse` to a caller-supplied `PulseSink`
+(telemetry, a log, an LED): the beat, the action (`Idle`, `Spawned`,
+`Resumed`), the settlement, operator commands refused, and the goal
+counts (`active`, `waiting`, `overdue`, `paused`, `done`). Delivery is
+at least once — a replayed beat emits its pulse again — so a sink keys
+by beat. A goal is **overdue** when it has waited for human input for
+at least `SchedulePolicy::overdue_after` beats: a liveness signal,
+never a timeout (`AwaitInput` has no terminal transition, §3.2).
+
+### 21.2 Goals: the ledger and its status machine
+
+A goal is a standing objective. The operator adds a `GoalSpec`; the
+ledger assigns the `GoalId` (monotonic, nonzero `u16`, never reused —
+`Error::GoalIdsExhausted` past `u16::MAX`).
+
+| Field | Meaning |
+|---|---|
+| `objective` | operator text, masked at ingestion (§20.1), then truncated to `NOTE_MAX` (64) bytes; control bytes become spaces |
+| `priority` | `u8`; higher runs first |
+| `cadence` | `Once` (one completed run satisfies it) or `Every(span)` (a standing goal: each completed run reschedules it `span` beats later) |
+| `envelope` | the cumulative budget envelope (below) |
+| `capabilities` | the goal's capability set; must not widen the agent template's (`Capabilities::widens`), else `Error::GoalSpecInvalid` |
+
+**Status machine (data, like §3.2).** `GoalStatus` has eight states;
+`goal::transition(status, GoalEvent)` is total and accepts exactly
+these 11 edges, rejecting every other pair with
+`Error::GoalIllegalTransition`:
+
+| From | Event | To | Meaning |
+|---|---|---|---|
+| `Active` | `Spawn` | `Running` | a run was spawned for the goal |
+| `Running` | `Park` | `Waiting` | the run suspended on `Ask` |
+| `Waiting` | `Resume` | `Running` | input arrived; the parked run resumes |
+| `Running` | `Recur` | `Active` | the run settled; the goal is rescheduled |
+| `Running` | `Satisfy` | `Satisfied` | a `Once` goal's run completed |
+| `Running` | `Fail` | `Failed` | non-retryable status, or too many consecutive failures |
+| `Running` | `Exhaust` | `Exhausted` | the envelope cannot fund another run |
+| `Active` | `Pause` | `Paused` | operator pause |
+| `Paused` | `Unpause` | `Active` | operator resume |
+| `Active` | `Retire` | `Retired` | operator retire |
+| `Paused` | `Retire` | `Retired` | operator retire |
+
+`Satisfied`, `Failed`, `Exhausted`, and `Retired` are terminal: no
+outgoing edge. Operator control of a `Running` or `Waiting` goal fails
+closed with `Error::GoalBusy` — an open obligation is never dropped
+(§20.2 invariant (b), lifted to goals). A refused operator command
+changes nothing and is counted in the beat's pulse.
+
+**Settlement (`goal::settle`).** When a run ends, the goal's next state
+is a pure function of the terminal status, the cadence, the failure
+streak, and the envelope:
+
+| Terminal status | Next |
+|---|---|
+| `Completed`, cadence `Once` | `Satisfy` |
+| `Completed`, cadence `Every(n)` | `Recur` at `beat + n`, failure streak reset — or `Exhaust` if unfundable |
+| `Denied`, `Incompatible`, `StorageFault` | `Fail` (non-retryable: retrying re-proves the refusal) |
+| any other status | streak `+1`; `Fail` at `max_consecutive_failures`; else `Recur` at `beat + backoff(streak)` — or `Exhaust` if unfundable |
+
+`backoff(k) = min(backoff_base · 2^(k−1), backoff_cap)`, saturating.
+
+**Budget envelope (ADR 10 lifted to goals).** `Envelope` carries the
+per-run grant (`per_run_turns ≥ 1`, `per_run_mutations`) and the
+remaining cumulative units (`turns`, `mutations`, `runs`). Accounting
+is reserve-on-intent, refund-on-outcome:
+
+- `Spawn` **reserves** `min(per_run, remaining)` of each unit and one
+  run; the spawned seed's grants equal the reservation, so a run can
+  never spend what the envelope does not hold.
+- Settlement **refunds** the run's unspent units (the final segment's
+  remaining turns and mutations). A refund larger than the reservation
+  fails closed with `Error::RefundExceedsReservation`.
+- A goal is *fundable* when `turns ≥ 1`, `mutations ≥ 1`, and
+  `runs ≥ 1`. The run's exhaustion guard treats any zeroed unit as
+  exhausted (§7.2), so a run granted zero mutations would degrade
+  before its first turn; `per_run_turns` and `per_run_mutations` are
+  therefore both `≥ 1` (`Error::GoalSpecInvalid` otherwise), and a
+  read-only goal's unspent mutation is refunded at settlement.
+
+Invariant: `remaining + reserved ≤ granted` in every unit, at every
+committed point — the envelope never widens across beats, reboots,
+or checkpoints.
+
+**Scheduling (`goal::pick`).** Deterministic over the ledger and the
+input readiness the beat's recorded `SENSE` answer reports:
+
+1. A `Waiting` goal whose input has arrived → `Resume` (obligations
+   first). Highest priority, then lowest id.
+2. Else an `Active` goal with `next_due ≤ beat` → `Spawn`. Highest
+   priority, then earliest `next_due`, then lowest id.
+3. Else `Idle`.
+
+A goal never has two runs at once. A `Waiting` goal does not block
+other goals — that is the point of the supervisor.
+
+### 21.3 Memory: masked, provenance-tagged, bounded
+
+`memory::Memory` holds at most `MAX_MEMORY` (32) entries. Each entry
+has a `MemoryKey` (exact identity), a display `label` and `value`
+(each a `Note`, ≤ 64 bytes), a `Provenance` (`goal`, `run`, `beat`),
+a `pinned` flag, and a monotonic write `stamp`.
+
+| Key | Written by | Pinned |
+|---|---|---|
+| `Observation { tool, args_digest }` | harvest of a settled run | no |
+| `Outcome { goal }` | harvest of a settled run | no |
+| `Note { name_digest }` | the operator (`remember`) | yes |
+
+Rules (normative):
+
+1. **Mask before durability (§20.1, ADR 8).** Every label and value is
+   masked over the *full* input with `mask_report`, then truncated to
+   `NOTE_MAX`, then control bytes become spaces. Truncating before
+   masking could split a secret below the shape threshold, so the
+   order is fixed. Inputs over `MEMORY_INPUT_MAX` (512) bytes fail
+   closed with `Error::MemoryInputTooLong`.
+2. **The model cannot write memory.** Memory comes from committed
+   evidence (§8.1: never from model prose) or from the operator.
+3. **Never remember an unverified mutation (§9.3).** Harvest records
+   a mutating tool's observation only when a passing
+   `VerificationResult` committed for the same effect.
+4. **Same key supersedes.** A write to an existing key replaces the
+   entry in place and refreshes its stamp.
+5. **Pinned entries are never evicted.** At most `MAX_PINNED` (8)
+   pinned entries; one more fails closed with `Error::MemoryFull`.
+   Harvested entries evict oldest-stamp-first when the store is full —
+   they can be re-observed; operator notes cannot be re-invented (the
+   §20.2 discipline).
+6. **Forget is explicit.** `forget(name)` removes an operator note;
+   harvested entries leave only by supersession or eviction.
+
+**Harvest (`harvest::Harvester`).** The device's run dispatcher feeds
+a settled run's committed events — tool requests, observations,
+verifications, across every segment, in journal order — into a
+streaming, allocation-free `Harvester`. One call per turn means at
+most one effect is open, so pairing needs one slot. Each successful
+observation (gated by rule 3; a tool the catalog does not know needs a
+verification too) becomes an `Observation` entry labelled
+`<tool_name> <args>`, last write per key, newest `MAX_HARVEST − 1`
+kept; then one `Outcome { goal }` entry records `<status> <summary>`
+(the status alone when the summary is overlong). At most `MAX_HARVEST`
+(6) entries. The supervisor reads them one `HARVEST` record each and
+states their provenance itself — it alone knows the beat.
+
+**Recall (`memory::recall`).** Up to `RECALL_K` (4) entries for a
+goal, in this order: the goal's own `Outcome`; pinned notes, newest
+first; observations from this goal's runs, newest first; other
+observations, newest first. Recall is recency, not relevance — an
+honest bound, not a semantic claim.
+
+### 21.4 The brief: goals and memory in the prompt
+
+`brief::Brief` is the pre-rendered, bounded block a spawned run sees:
+
+```text
+GOAL <objective>
+MEM <label> = <value>
+```
+
+One `GOAL` line, then one `MEM` line per recalled entry while the
+block fits `BRIEF_CAP` (256) bytes; the first line that does not fit
+and every later one are dropped (deterministic). The `GOAL` line
+always fits (≤ 70 bytes).
+
+- **Placement.** After `STATE` (and `PRIOR`), before `REPAIR`. Fixed:
+  never truncated. Only `LAST` may truncate (§18.4 unchanged).
+- **Binding.** `RunSeed::brief: Option<Brief>` is identity. The seed
+  snapshot grows from 142 to 151 bytes: a tag byte and the brief's
+  FNV-1a-64 digest. A reboot cannot swap the brief under a committed
+  history; a rolled-over child inherits its parent's brief.
+- **Transport.** The brief's bytes travel inside the committed `RUN`
+  intent (§21.5); the receiving dispatcher rebuilds it with
+  `Brief::from_bytes`, which re-validates the line structure and
+  refuses control bytes (`Error::BriefInvalid`).
+- **Buffer.** `PROMPT_CAP` (1024) and the default
+  `InferenceSettings` are unchanged, so unbriefed runs are
+  byte-identical to E4. A briefed seed may set `max_prompt_bytes` up
+  to `BRIEFED_PROMPT_CAP` (1536); the engine's prompt buffer is
+  `BRIEFED_PROMPT_CAP`. A pinned test proves the longest fixed prompt
+  plus a full brief plus a full `LAST` line fits.
+
+### 21.5 The supervisor workflow and its records
+
+`agent::supervise(ctx, seed, input, alarm, state, sink)` is the
+always-on agent. `state: &mut AgentState` is caller-owned (a `static`
+on the device) and is reset and rebuilt by replay on every boot;
+Waymaker's journal is the only durable store. `input` is the run's
+`Start`: the agent seed's digest (a mismatch fails closed with
+`AgentError::SeedMismatch`, so a reboot can never swap the template,
+policy, heartbeat, or checkpoint interval) and, for a continued run, a
+checkpoint header.
+
+Everything the world says reaches the workflow as an activity, so
+replay sees exactly what the live boot saw:
+
+| Kind | Input | Answer | Max |
+|---|---|---|---|
+| `SENSE` (`0x0100`) | the beat | `Sense`: persistent-clock reading, goals whose input waits, ≤ 3 operator `Command`s | 443 B |
+| `RUN` (`0x0101`) | `RunRequest`: `Spawn { goal, seed }` (the full seed, brief included) or `Resume { goal, run }` | `RunReport`: `Parked`, or `Settled { status, refunds, harvest count }` | 337 B / 7 B |
+| `HARVEST` (`0x0102`) | run id + index | one memory entry | 163 B |
+| `STORE` (`0x0103`) | checkpoint digest + index + item | empty | 174 B |
+| `LOAD` (`0x0104`) | checkpoint digest + index | one item | 164 B |
+
+Every maximum is a compile-time constant asserted `≤ PAGE_RECORD_MAX`
+(480 B: the 512-byte scratch page less frame overhead and seal
+headroom). Operator text crosses the device boundary in a `SENSE`
+answer, which is a durable record, so the dispatcher masks it before
+answering (`Command::add_goal`, `Command::remember` call `ingest`) —
+mask before durability, at the boundary.
+
+One beat, in boundary order:
+
+```text
+ctx.timer(heartbeat deadline)
+--> SENSE(beat): clock, ready goals, operator commands; apply commands
+--> pick: spawn — reserve, recall, compose brief, derive the run id
+                  (goal << 48 | spawn_seq << 16) and seed; RUN(Spawn)
+          resume — RUN(Resume)
+          idle  — nothing
+--> RunReport: Parked → park the goal
+               Settled → settle, then HARVEST(run, i) for each entry
+--> pulse
+--> every checkpoint_every beats: STORE each item; continue_as_new
+```
+
+`RUN` is at least once: a redelivered spawn names a run the dispatcher
+already holds, so it re-drives that run from its own journal and the
+engine replays the recorded terminal (§11.3 item 6) — no effect
+re-executes. A `RUN` that fails outright settles the goal
+`StorageFault` (non-retryable) with nothing refunded; a failed `SENSE`
+reads as an empty sense; a failed `HARVEST` skips its entry. A payload
+that does not decode is a workflow fault (`AgentError::Wire`): replay
+would hit it again, so the workflow ends rather than guess.
+
+**What recovery guarantees** (the §11.3 oracle, lifted), at every
+Waymaker boundary — intent committed, effect done with its outcome
+lost, outcome committed, deadline armed — on every occurrence:
+
+1. The beat counter never skips or repeats.
+2. A run is driven under its *committed* seed, never re-composed.
+3. A run settles exactly once; no effect re-executes.
+4. Envelopes never widen (§21.2).
+5. Memory never holds raw secrets or unverified mutations (§21.3).
+6. Parked runs survive reboot and `continue_as_new`.
+7. The final state, pulses, prompts, and device write ledger equal the
+   crash-free run's — with or without `continue_as_new` in between
+   (174 injected resets in `tests/always_on.rs`, plus every run-level
+   crash point inside a supervised run).
+
+### 21.6 Checkpoint: page-sized items and `continue_as_new`
+
+An always-on journal grows without bound. Every
+`AgentSeed::checkpoint_every` beats the supervisor folds it:
+
+1. `AgentCheckpoint::header()` computes the fixed 37-byte `Header` —
+   last beat, spawn counter, next deadline, both allocators, the goal
+   and entry counts, and an FNV-1a-64 digest over every item's bytes.
+2. Each goal and each memory entry is one **item** (`encode_item`, at
+   most `MAX_ITEM_BYTES` = 164 B), written with `STORE` keyed by
+   `(digest, index)`. A failed store abandons this checkpoint (it is
+   tried again at the next interval).
+3. `ctx.continue_as_new(Start { seed digest, header })` — 46 bytes —
+   retires the run.
+4. The next run `LOAD`s the items back into the caller-owned state
+   through `Restore`, which validates each item as it arrives
+   (`GoalLedger::restore_goal`, `Memory::restore_entry`), keeps only a
+   running digest and a count, and refuses to finish unless every
+   promised item arrived and the digest matches. A missing item fails
+   closed (`AgentError::CheckpointMissing`).
+
+No buffer the size of the whole state ever exists on the device. The
+blob form (`checkpoint::encode` / `decode`: header, items, trailing
+integrity) is the same layout for host tooling; it decodes in the
+§20.3 order — truncated, version (`CHECKPOINT_VERSION` = 1), checksum,
+corrupt.
+
+**Canonical storage.** The ledger and the memory store are fixed slot
+arrays. Removal (`reap`, `forget`) compacts the survivors to the front
+in order, so storage never has holes: a checkpoint restores exactly
+the state it encodes, and later inserts land in the same slots whether
+or not the agent checkpointed. (Found by the checkpoint read-back;
+pinned by a regression test.)
+
+### 21.7 Drivers
+
+**Device.** An Embassy task owns a `Ctx` over the flash-backed
+Waymaker journal and the device dispatcher (whose `RUN` drives the run
+engine) and awaits `supervise`. The executor polls it; the
+`TimerFuture` arms the board's `Alarm` so the core sleeps between
+beats. No async runtime, no heap.
+
+**Host (doubles only, `agent::host`).** `MemJournal` (an in-memory
+`Journal`: replay, redelivery under the original `EffectId`, both
+clocks, `continue_as_new`, crash injection at the four boundary kinds),
+`HostAgent` (the dispatcher: scheduled operator commands and input
+deliveries, runs through `drive_segment`, the `Harvester`, a checkpoint
+item store), and `drive` (polls with a no-op waker, advancing the
+clocks whenever the deadline has not passed).
+
+### 21.8 What this rung does not claim
+
+- **The run engine is still host-only.** `RUN` on the board needs the
+  engine port (`esper-device`); the supervisor itself is
+  firmware-clean today and compiled into the firmware build.
+- **No wall-clock semantics beyond the declared clock.** A boot-clock
+  heartbeat restarts its interval after a reset.
+- **Recall is recency, not relevance.**
+- **The model cannot write memory or goals** (§8.1). A model-facing
+  `memory_write` tool would change the catalog (§17).
+- **One run at a time; one supervisor** (ADR 1). Concurrent runs are
+  E6's question.
+- **RAM is measured on the host only.** `AgentState` is 7,384 B and
+  the `supervise` future 2,280 B on `x86_64` (pinned by test); the
+  Xtensa figures await the board measurement.

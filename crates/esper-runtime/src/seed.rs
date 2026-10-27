@@ -6,6 +6,7 @@
 //! allowed. This module is allocation-free and compiles without the
 //! `host` feature.
 
+use esper_core::brief::Brief;
 use esper_core::lineage::Lineage;
 use esper_core::registry::Capabilities;
 
@@ -22,6 +23,10 @@ pub const WORKFLOW_VERSION: u16 = 1;
 /// Carried in the `RunStarted` record so the replay cursor can tell an
 /// Esper history from any other workflow's.
 pub const ESPER_WORKFLOW_KIND: u16 = 1;
+
+/// Length of the canonical seed binding (`SeedSnapshot::input_bytes`):
+/// 142 bytes through E4, plus the E4+aon brief tag and digest.
+pub const SEED_INPUT_LEN: usize = 151;
 
 /// Everything a run needs before its first boot.
 ///
@@ -70,6 +75,12 @@ pub struct RunSeed {
     /// run continues a compacted parent. Bound into the seed
     /// snapshot, so a reboot can never drop or swap the lineage.
     pub parent: Option<Lineage>,
+    /// The goal objective and recalled memory (E4+aon, SPEC §21.4):
+    /// `Some` when an always-on supervisor spawned this run. Its
+    /// digest is bound into the seed snapshot, so a reboot can never
+    /// swap the brief under a committed history. A rolled-over child
+    /// inherits it.
+    pub brief: Option<Brief>,
 }
 
 /// A run seed that failed validation, or a journal bound to a
@@ -118,10 +129,13 @@ pub struct SeedSnapshot {
     /// The continuation binding the journal is bound to (E4,
     /// SPEC §20.6); `None` for root runs.
     pub parent: Option<Lineage>,
+    /// The brief digest the journal is bound to (E4+aon, SPEC §21.4);
+    /// `None` for plain runs.
+    pub brief_digest: Option<u64>,
 }
 
 impl SeedSnapshot {
-    /// The canonical 142-byte encoding carried as the Waymaker
+    /// The canonical 151-byte encoding carried as the Waymaker
     /// `RunStarted` record's input. Fixed layout, little-endian; the
     /// replay cursor compares it byte for byte.
     ///
@@ -132,7 +146,8 @@ impl SeedSnapshot {
     /// `sensor_count` (1), `allow_timer` (1), `allow_status` (1),
     /// `model_bundle` (8), `inference` (4: `max_prompt_bytes`,
     /// `max_output_bytes`), parent tag (1), parent lineage (65),
-    /// context-budget tag (1), context-budget value (8).
+    /// context-budget tag (1), context-budget value (8), brief tag (1),
+    /// brief digest (8).
     /// Every identity-bearing field of the seed is bound, including
     /// the rollover trigger and the continuation binding: a child
     /// seed's snapshot differs from its parent's, two children
@@ -147,10 +162,12 @@ impl SeedSnapshot {
     /// `model` (8), `catalog` (8), `policy` (8)). A `None` parent
     /// encodes the tag `0` with 65 zero bytes. The context budget
     /// encodes the tag `0` with 8 zero bytes for `None`, else tag `1`
-    /// and the little-endian value.
+    /// and the little-endian value. The brief (E4+aon) encodes the same
+    /// way: tag `0` with 8 zero bytes for a plain run, else tag `1` and
+    /// the brief's FNV-1a-64 digest.
     #[must_use]
-    pub const fn input_bytes(&self) -> [u8; 142] {
-        let mut out = [0u8; 142];
+    pub const fn input_bytes(&self) -> [u8; SEED_INPUT_LEN] {
+        let mut out = [0u8; SEED_INPUT_LEN];
         let id = self.id.to_le_bytes();
         let elapsed = self.elapsed_ms.to_le_bytes();
         let input_tokens = self.input_tokens.to_le_bytes();
@@ -205,6 +222,16 @@ impl SeedSnapshot {
             let mut k = 0;
             while k < 8 {
                 out[134 + k] = bytes[k];
+                k += 1;
+            }
+        }
+        // E4+aon: the brief is identity. Tag 1 carries its digest.
+        out[142] = self.brief_digest.is_some() as u8;
+        if let Some(digest) = self.brief_digest {
+            let bytes = digest.to_le_bytes();
+            let mut k = 0;
+            while k < 8 {
+                out[143 + k] = bytes[k];
                 k += 1;
             }
         }
@@ -277,7 +304,14 @@ impl RunSeed {
         if self.model_turns == 0 {
             return Err("model_turns must grant at least one turn");
         }
-        if let Err(reason) = self.inference.validate() {
+        // A briefed run (E4+aon) may use the larger prompt buffer; a
+        // plain run keeps the E3 cap, so its prompts stay identical.
+        let inference = if self.brief.is_some() {
+            self.inference.validate_briefed()
+        } else {
+            self.inference.validate()
+        };
+        if let Err(reason) = inference {
             return Err(reason);
         }
         let caps = &self.capabilities;
@@ -320,7 +354,7 @@ impl RunSeed {
     /// a journal whose snapshot differs, so budgets and capabilities
     /// can never widen across a reboot.
     #[must_use]
-    pub const fn snapshot(&self) -> SeedSnapshot {
+    pub fn snapshot(&self) -> SeedSnapshot {
         SeedSnapshot {
             id: self.id.get(),
             workflow_version: self.workflow_version,
@@ -341,6 +375,7 @@ impl RunSeed {
             inference: self.inference,
             context_budget_bytes: self.context_budget_bytes,
             parent: self.parent,
+            brief_digest: self.brief.as_ref().map(Brief::digest),
         }
     }
     /// The E0/E1 default seed: 10 turns, 4 mutations, generous token
@@ -375,6 +410,7 @@ impl RunSeed {
             inference: InferenceSettings::default_settings(),
             context_budget_bytes: None,
             parent: None,
+            brief: None,
         }
     }
 
@@ -415,13 +451,15 @@ mod tests {
     }
 
     /// Every identity-bearing field of the seed is bound in the
-    /// 142-byte canonical encoding: changing any one of them changes
+    /// 151-byte canonical encoding: changing any one of them changes
     /// the bytes the Waymaker `RunStarted` record carries.
     #[test]
+    // One variant per bound field: the table grows with the binding.
+    #[allow(clippy::too_many_lines)]
     fn input_bytes_binds_every_field() {
         let base = RunSeed::default_slice().snapshot();
         let base_bytes = base.input_bytes();
-        assert_eq!(base_bytes.len(), 142);
+        assert_eq!(base_bytes.len(), 151);
 
         let variants = [
             SeedSnapshot { id: 1, ..base },
@@ -506,6 +544,14 @@ mod tests {
             },
             SeedSnapshot {
                 context_budget_bytes: Some(2048),
+                ..base
+            },
+            SeedSnapshot {
+                brief_digest: Some(0),
+                ..base
+            },
+            SeedSnapshot {
+                brief_digest: Some(1),
                 ..base
             },
         ];
@@ -612,5 +658,42 @@ mod tests {
         }
         assert!(caps.allow_timer);
         assert!(caps.allow_status);
+    }
+
+    /// E4+aon: the brief is identity. A briefed seed's binding differs
+    /// from the plain one and from a seed with a different brief, and
+    /// only a briefed seed may use the larger prompt buffer.
+    #[test]
+    fn brief_is_bound_and_unlocks_the_briefed_prompt_cap() {
+        use esper_core::brief::Brief;
+        use esper_core::compact::Note;
+        use esper_core::memory::{Memory, recall};
+        let memory = Memory::new();
+        let compose = |text: &[u8]| {
+            let note = Note::from_bytes(text).expect("note");
+            Brief::compose(&note, &recall(&memory, esper_core::goal::GoalId::MIN))
+        };
+        let plain = RunSeed::default_slice();
+        let briefed = RunSeed {
+            brief: Some(compose(b"keep pin 3 low")),
+            inference: InferenceSettings::briefed_settings(),
+            ..plain
+        };
+        let other = RunSeed {
+            brief: Some(compose(b"keep pin 4 low")),
+            ..briefed
+        };
+        let plain_bytes = plain.snapshot().input_bytes();
+        let briefed_bytes = briefed.snapshot().input_bytes();
+        assert_eq!(plain_bytes[142], 0);
+        assert_eq!(briefed_bytes[142], 1);
+        assert_ne!(plain_bytes, briefed_bytes);
+        assert_ne!(briefed_bytes, other.snapshot().input_bytes());
+        briefed.validate().expect("briefed seed");
+        let plain_wide = RunSeed {
+            inference: InferenceSettings::briefed_settings(),
+            ..plain
+        };
+        assert!(plain_wide.validate().is_err(), "a plain run keeps 1024");
     }
 }

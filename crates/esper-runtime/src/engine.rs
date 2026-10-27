@@ -43,12 +43,12 @@ use waymaker_core::{
 };
 
 use crate::backend::{
-    BackendError, ModelBackend, OUTPUT_CAP, PROMPT_CAP, PriorCtx, PromptCtx, RepairHint,
+    BRIEFED_PROMPT_CAP, BackendError, ModelBackend, OUTPUT_CAP, PriorCtx, PromptCtx, RepairHint,
     build_prompt,
 };
 use crate::error::{CrashPoint, Halt, RuntimeError};
 use crate::journal::{DecisionClass, Frame, Journal};
-use crate::seed::{ESPER_WORKFLOW_KIND, RunSeed};
+use crate::seed::{ESPER_WORKFLOW_KIND, RunSeed, SEED_INPUT_LEN};
 use crate::trace::RunTrace;
 use crate::world::{FakeDevice, FaultPlan, InputPlan, WorldError};
 
@@ -241,6 +241,9 @@ impl RolloverHandoff {
             inference: parent.inference,
             context_budget_bytes: parent.context_budget_bytes,
             parent: Some(self.lineage),
+            // E4+aon: the child continues the same goal under the same
+            // brief.
+            brief: parent.brief,
         }
     }
 }
@@ -319,7 +322,7 @@ pub fn drive_segment(
         monitor: Monitor::new(),
         allocator: EffectIdAllocator::for_run(run),
         cursor: ReplayCursor::new(run),
-        seed_input: [0u8; 142],
+        seed_input: [0u8; SEED_INPUT_LEN],
         repair_used: 0,
         turns_used: 0,
         mutations_used: 0,
@@ -480,7 +483,7 @@ struct Driver<'a> {
     cursor: ReplayCursor,
     /// The canonical seed bytes for the `RunStarted` record.
     // HOST-ONLY (E0/E1)
-    seed_input: [u8; 142],
+    seed_input: [u8; SEED_INPUT_LEN],
     /// Invalid lines committed this run.
     repair_used: u8,
     /// Model turns consumed this run.
@@ -1378,7 +1381,10 @@ impl Driver<'_> {
     /// pure, so the re-issued prompt returns the same line.
     fn do_infer(&mut self) -> Result<(), Halt> {
         // HOST-ONLY (E3)
-        let mut pbuf = [0u8; PROMPT_CAP];
+        // E4+aon: the buffer holds a briefed prompt; a plain seed's
+        // `max_prompt_bytes` (<= PROMPT_CAP, by seed validation) slices
+        // it back to the E3 size, so plain prompts are unchanged.
+        let mut pbuf = [0u8; BRIEFED_PROMPT_CAP];
         let ctx = PromptCtx {
             turns_left: self.budget.model_turns,
             mutations_left: self.budget.mutations,
@@ -1387,6 +1393,8 @@ impl Driver<'_> {
             // E4: a continued run names the folded epoch; a root run
             // carries no folded history.
             prior: self.prior_ctx(),
+            // E4+aon: the supervisor's brief, bound into the seed.
+            brief: self.seed.brief.as_ref(),
         };
         let plen = build_prompt(
             &ctx,
@@ -2556,7 +2564,7 @@ mod tests {
             monitor: Monitor::new(),
             allocator: EffectIdAllocator::for_run(run),
             cursor: ReplayCursor::new(run),
-            seed_input: [0u8; 142],
+            seed_input: [0u8; crate::seed::SEED_INPUT_LEN],
             repair_used: 0,
             turns_used: 0,
             mutations_used: 0,

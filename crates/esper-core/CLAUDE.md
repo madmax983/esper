@@ -41,6 +41,12 @@ lineage) for Esper. Authority: `SPEC.md` at the workspace root
 | `compact` | §20.2 | `CompactState`: durable compact state; `compact` folds `FrameSummary` views; failed paths and obligations are never dropped (fail closed); `should_compact` (80% default) |
 | `snapshot` | §20.3 | `encode` / `decode` / `verify`: canonical LE layout, version byte, FNV-1a-64 integrity; `encoded_len` |
 | `lineage` | §20.4 | `Lineage`, `continue_as_new`: parent link, remaining budgets carried never widened (`BudgetWidened` on widen) |
+| `beat` | §21.1 | `Beat` (durable heartbeat counter, `0` = none yet), `BeatSpan` (nonzero), `SchedulePolicy` (failure cap, exponential `backoff`, `overdue_after`); arithmetic fails closed with `BeatOverflow` |
+| `goal` | §21.2 | `GoalId` (ledger-assigned, never reused), `GoalStatus` × `GoalEvent` machine as data (`TRANSITIONS`, 11 edges), `Envelope` / `Remaining` / `Grant` (reserve on spawn, refund on settle, `check_envelope` never-widen proof), `settle` table, `GoalLedger` (`admit` → commit → `insert`, `pick`, `spawn`/`park`/`resume`/`settle`/`control`, `reap`, `from_parts`) |
+| `memory` | §21.3 | `ingest` (mask full input → truncate → strip control bytes), `MemoryKey` (Observation / Outcome / pinned Note), `Memory` (32 slots, 8 pinned max, oldest-unpinned eviction, supersede by key), `recall` (outcome → pinned → own → other, newest first) |
+| `brief` | §21.4 | `Brief::compose`: `GOAL` + `MEM` lines ≤ `BRIEF_CAP` (256), whole lines dropped deterministically; `digest` is the seed binding |
+| `harvest` | §21.3 | `Harvester`: streaming, allocation-free pairing of request → observation → verification (one open effect), verification-gated, masked, newest `MAX_HARVEST − 1` observations + the goal's outcome; `HarvestSet` |
+| `checkpoint` | §21.6 | `AgentCheckpoint` as a 37-byte `Header` + page-sized items (`encode_item`, ≤ `MAX_ITEM_BYTES` = 164); `Restore` rebuilds a caller-owned checkpoint item by item with a running digest; blob `encode`/`decode` for host tooling (§20.3 decode order); `encode_entry`/`decode_entry` |
 
 ## Key invariants (see `docs/invariants.md` for the full list)
 - `End` has no outgoing transitions; only `Finalize`, `Degraded`, `SafeStop` reach it.
@@ -56,6 +62,15 @@ lineage) for Esper. Authority: `SPEC.md` at the workspace root
   `CompactStateFull`); facts/decisions drop oldest-first. Snapshot
   version is checked before the checksum; unknown versions refuse
   loudly. `continue_as_new` never widens budgets.
+- E4+aon (§21): a goal's remaining + reserved never exceeds its
+  envelope (`check_envelope` after every ledger change). Goal ids are
+  never reused. Operator control of a `Running`/`Waiting` goal is
+  `GoalBusy` — obligations are never dropped. Memory masks before it
+  truncates; pinned entries are never evicted; the model has no write
+  path. `reap` and `forget` keep slot storage canonical (no holes), so
+  a checkpoint decodes to exactly the state it encodes. Every
+  checkpoint record (header, item) fits one 512-byte Waymaker scratch
+  page; `Restore` never holds a second copy of the state.
 
 ## The two JSON bounds (read before touching)
 

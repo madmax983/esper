@@ -1,0 +1,55 @@
+# Esper — workspace rules
+
+Esper is a durable agent harness **for firmware**: the ReAct loop as a
+Waymaker workflow, shipped on the device (target: ESP32-S3,
+`xtensa-esp32s3-none-elf`). Read `README.md` for the field guide and
+`SPEC.md` for the contract; each crate has its own `CLAUDE.md`.
+
+## Firmware-first (non-negotiable)
+
+- **New runtime behavior ships on the device.** It must compile under
+  `cargo check -p esper-runtime --no-default-features`, with no `alloc`
+  and no `std`. If a feature only exists behind the `host` feature, it
+  does not exist.
+- **Build on Waymaker's primitives, not beside them.** Workflows are
+  `async fn`s over `waymaker_embassy::Ctx`: effects are `ctx.activity`,
+  waits are `ctx.timer` (durable deadlines; `AtPersistentTime` needs an
+  RTC, `AfterBoot` restarts after a reset), history is bounded with
+  `ctx.continue_as_new`. Waymaker's journal is the durable store — do
+  not invent a second one.
+- **Every record fits a scratch page.** Waymaker states device RAM with
+  a 512-byte scratch page (`waymaker_core::budget::SCRATCH_PAGE_BYTES`).
+  Activity inputs, activity answers, and `continue_as_new` inputs must
+  each fit one page; large state is split into page-sized items. Pin
+  every encoder's maximum with a test.
+- **Bounded RAM, measured.** Fixed capacities, no heap. Large state is
+  caller-owned (so it can live in a `static`), not hidden inside a
+  future. Pin the size of new public state types with a test.
+- **No async runtime in product code.** Embassy's executor polls plain
+  `core::future::Future`s. Tokio is allowed only in host-only drivers
+  and tests.
+- **`host` is for doubles and harnesses only.** Scripted models, the
+  fake device, fault injectors, in-memory journals, fixture runners —
+  each allocation site marked `// HOST-ONLY`. Product logic never
+  lives behind `host`.
+- **Existing host-only code is migration debt, not precedent.** The run
+  engine loop (`engine.rs`), its `Journal`, and `world.rs` are host-only
+  today; the firmware port retires that. Do not copy the pattern.
+
+## Engineering law
+
+SPEC → proof/tests (RED) → implementation (GREEN) → refactor. No
+`unwrap`/`expect` outside tests; strong newtypes; `thiserror`; doc
+comments on every public item; `const fn` where possible.
+
+## Gates (all must pass before a push)
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings      # pedantic + nursery
+cargo test --workspace
+cargo check -p esper-runtime --no-default-features         # the firmware build
+RUSTDOCFLAGS="-D missing-docs" cargo doc --workspace --no-deps
+```
+
+Do not publish any crate (Mark's call).

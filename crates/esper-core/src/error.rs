@@ -349,6 +349,63 @@ pub enum Error {
     /// valid state.
     #[error("snapshot payload invalid")]
     SnapshotCorrupt,
+
+    // --- Always-on primitives (E4+aon, SPEC §21) ---
+    /// The beat counter or a beat deadline would overflow `u64`.
+    #[error("beat counter overflow")]
+    BeatOverflow,
+    /// The goal ledger has no free slot.
+    #[error("goal ledger full")]
+    GoalLedgerFull,
+    /// Every goal id has been assigned; ids are never reused.
+    #[error("goal ids exhausted")]
+    GoalIdsExhausted,
+    /// No goal in the ledger has this id.
+    #[error("unknown goal {goal}")]
+    GoalUnknown {
+        /// The rejected goal id.
+        goal: u16,
+    },
+    /// The goal status machine has no such edge (SPEC §21.2).
+    #[error("illegal goal transition: {from} cannot take {event}")]
+    GoalIllegalTransition {
+        /// The status the goal was in.
+        from: crate::goal::GoalStatus,
+        /// The event it tried to apply.
+        event: crate::goal::GoalEvent,
+    },
+    /// The goal has a run in flight or parked; operator control would
+    /// drop an open obligation.
+    #[error("goal is busy with a run")]
+    GoalBusy,
+    /// A goal spec failed validation.
+    #[error("goal spec invalid: {0}")]
+    GoalSpecInvalid(&'static str),
+    /// A committed goal record does not match the ledger's allocator.
+    #[error("goal record out of order")]
+    GoalOutOfOrder,
+    /// A settlement refund is larger than the run's reservation.
+    #[error("refund exceeds the reservation")]
+    RefundExceedsReservation,
+    /// A goal's remaining plus reserved units exceed its granted
+    /// envelope: the envelope would widen.
+    #[error("goal envelope would widen")]
+    EnvelopeWidened,
+    /// The memory store cannot take the entry without dropping a
+    /// pinned (operator) entry.
+    #[error("memory full")]
+    MemoryFull,
+    /// A memory or objective input exceeds `MEMORY_INPUT_MAX` bytes.
+    #[error("memory input exceeds its bound")]
+    MemoryInputTooLong,
+    /// The memory write stamp space is exhausted.
+    #[error("memory stamps exhausted")]
+    MemoryStampsExhausted,
+    /// Brief bytes are not a well-formed brief: over `BRIEF_CAP`, not
+    /// opening with a `GOAL` line, a line without its newline, or a
+    /// control byte inside a line.
+    #[error("brief bytes are malformed")]
+    BriefInvalid,
 }
 
 impl Error {

@@ -26,7 +26,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long any single socket read or write may take. The live API
 /// answers in about a second (SPEC §19.9); sixty seconds is the
 /// fail-closed backstop, matching the Python reference client.
-const IO_TIMEOUT: Duration = Duration::from_secs(60);
+const IO_TIMEOUT: Duration = Duration::from_mins(1);
 /// The largest response head the client will parse: 64 KiB.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// The largest response body the client will keep: 1 MiB. A System

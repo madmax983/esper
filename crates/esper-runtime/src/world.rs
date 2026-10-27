@@ -151,6 +151,20 @@ impl InputPlan {
         Self { inputs, next: 0 }
     }
 
+    /// Queue one more input payload behind the ones already queued
+    /// (E4+aon: the supervisor's inbox delivers input after a run
+    /// parked).
+    pub fn push(&mut self, input: Vec<u8>) {
+        // HOST-ONLY (E4+aon)
+        self.inputs.push(input);
+    }
+
+    /// Whether an undelivered input is queued.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.next < self.inputs.len()
+    }
+
     /// Take the next queued input, or `None` when nothing arrived.
     pub fn take(&mut self) -> Option<Vec<u8>> {
         // HOST-ONLY (E0/E1)
